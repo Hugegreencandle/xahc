@@ -3,8 +3,10 @@
 
 mod build;
 mod clean;
+mod doctor;
 mod installtx;
 mod lint;
+mod scaffold;
 mod sim;
 mod test;
 
@@ -77,6 +79,16 @@ enum Cmd {
         #[arg(long, default_value_t = 1)]
         flags: u32,
     },
+    /// Check the local toolchain can build hooks (clang/wasm-ld), with fix hints.
+    Doctor,
+    /// Scaffold a buildable hook project.
+    New {
+        /// Project name (a directory is created)
+        name: String,
+        /// firewall | accept_all | emitter
+        #[arg(long, default_value = "firewall")]
+        archetype: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -120,6 +132,12 @@ fn main() -> Result<()> {
         }
         Cmd::Test { file } => {
             test::run(&file)?;
+        }
+        Cmd::Doctor => {
+            doctor::run()?;
+        }
+        Cmd::New { name, archetype } => {
+            scaffold::run(&name, &archetype)?;
         }
         Cmd::InstallTx { wasm, account, on, namespace, network, flags } => {
             let json = installtx::run(&wasm, &installtx::Opts {
