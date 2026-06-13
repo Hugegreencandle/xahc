@@ -25,7 +25,10 @@
 /* Provided by xahaud. Must be imported by every hook. */
 extern int32_t _g(uint32_t id, uint32_t maxiter);
 
-/* Single loop. `maxiter` = max iterations of THIS loop per hook call. */
+/* Single loop. `maxiter` = max iterations of THIS loop's body per hook call.
+ * XAHC_GUARD(N) budgets a body that runs up to N times; the body running N+1 times
+ * is a guard violation. The `+1` here absorbs the trailing loop-condition crossing
+ * (an N-iteration for-loop checks its guarded condition N+1 times). */
 #define XAHC_GUARD(maxiter) \
     _g((1ULL << 31U) + ((uint32_t)__COUNTER__ + 1U), (uint32_t)(maxiter) + 1U)
 

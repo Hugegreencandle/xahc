@@ -16,6 +16,13 @@ All notable changes to xahc are documented here. Format follows
 - A local-sim trap (a host fn the sim doesn't model) now routes you to `xahc verify`
   for the full-fidelity xahau-mcp VM, instead of a bare trap message.
 
+### Fixed
+- `xahc verify` now forwards the SAME otxn fields the local sim synthesizes
+  (`sfAmount` always, `sfAccount`/`sfDestination` as zero bytes) and treats a VM
+  runtime-error `halted` (guard violation / trap) as a rollback — eliminating
+  false `DISAGREE`s on hooks that read account/destination, zero-amount payments,
+  and guard-violating hooks (incl. the bundled `over_budget.c`).
+
 ## [1.3.0] - 2026-06-13
 
 The loop, wired — `xahc verify` runs the local sim AND the xahau-mcp VM and flags disagreement.
@@ -26,8 +33,9 @@ The loop, wired — `xahc verify` runs the local sim AND the xahau-mcp VM and fl
   fidelity-locked VM), seeding **byte-identical inputs** to both, and flags any
   accept/rollback disagreement (nonzero exit). The local sim is the fast inner
   loop; the MCP VM is the authoritative gate; disagreement is itself a finding.
-  Talks only to the public HTTP surface (`XAHC_SIM_URL` / `--remote`) — never the
-  private MCP, so it runs for any user.
+  Talks over HTTP (`XAHC_SIM_URL` / `--remote`) to an xahau-mcp `/execute` endpoint
+  you supply — never a filesystem import of the private MCP, so any hosted shim works
+  (vs the old bridge that needed a private-repo checkout).
 
 ## [1.2.0] - 2026-06-13
 

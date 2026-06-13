@@ -17,6 +17,8 @@ use std::path::Path;
 use crate::sim;
 
 const SF_AMOUNT_ID: &str = "393217"; // (6 << 16) + 1
+const SF_ACCOUNT_ID: &str = "524289"; // (8 << 16) + 1
+const SF_DESTINATION_ID: &str = "524291"; // (8 << 16) + 3
 
 /// Collapse the two "neither accept nor rollback" labels (local "returned",
 /// remote "no-exit-called") so they compare equal.
@@ -92,10 +94,14 @@ pub fn run(wasm: &Path, tt: &str, drops: u64, remote: Option<&str>) -> Result<Ve
     // --- remote VM (xahau-mcp /execute), byte-identical otxn ---
     let bytes = std::fs::read(wasm).with_context(|| format!("read {}", wasm.display()))?;
     let wasm_hex: String = bytes.iter().map(|b| format!("{:02X}", b)).collect();
+    // Forward the SAME otxn fields the local sim synthesizes: sim.rs serves sfAmount
+    // always, and sfAccount/sfDestination as 20 zero bytes unconditionally. If verify
+    // forwarded fewer, a hook reading those fields would see different inputs in the two
+    // VMs and false-DISAGREE. Byte-identical inputs are the whole premise.
     let mut otxn = serde_json::Map::new();
-    if drops > 0 {
-        otxn.insert(SF_AMOUNT_ID.to_string(), Value::String(native_amount_hex(drops)));
-    }
+    otxn.insert(SF_AMOUNT_ID.to_string(), Value::String(native_amount_hex(drops)));
+    otxn.insert(SF_ACCOUNT_ID.to_string(), Value::String("00".repeat(20)));
+    otxn.insert(SF_DESTINATION_ID.to_string(), Value::String("00".repeat(20)));
     let payload = serde_json::json!({ "wasmHex": wasm_hex, "txType": tt, "otxnFields": Value::Object(otxn) });
     let resp: Value = ureq::post(&endpoint)
         .send_json(payload)
@@ -103,11 +109,21 @@ pub fn run(wasm: &Path, tt: &str, drops: u64, remote: Option<&str>) -> Result<Ve
         .into_json()
         .context("parse /execute response")?;
     let remote = resp["exit"].as_str().unwrap_or("unknown").to_string();
+    let remote_rs = resp["returnString"].as_str().unwrap_or("");
     let remote_degraded = resp["degraded"].as_bool().unwrap_or(false);
     let remote_code = resp["returnCode"].as_str().map(String::from);
 
+    // A runtime rejection in the VM (guard violation / trap) surfaces as exit "halted"
+    // with a "runtime error:" message — on chain that is a rollback, the same as the local
+    // sim's GuardViolation/trap. A "halted" with any other reason is a pre-execution
+    // refusal (oversized module, no hook export, ...), which is NOT a rollback — leave it.
+    let remote_for_agree = if remote == "halted" && remote_rs.starts_with("runtime error") {
+        "rollback"
+    } else {
+        remote.as_str()
+    };
     // "returned" (local) and "no-exit-called" (remote) are the same neither-accept-nor-rollback case.
-    let agree = norm_exit(local) == norm_exit(&remote);
+    let agree = norm_exit(local) == norm_exit(remote_for_agree);
 
     Ok(VerifyResult {
         remote_url: endpoint,

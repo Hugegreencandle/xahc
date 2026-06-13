@@ -85,7 +85,7 @@ xahc new myhook                      # scaffold a project (firewall archetype)
 cd myhook
 xahc build myhook.c -o myhook.wasm   # compile -> clean -> lint
 xahc test myhook.test.toml           # run the assertions
-xahc install-tx myhook.wasm --account rYOURACCT --on Payment   # unsigned SetHook
+xahc install-tx myhook.wasm --account <rYourAccount> --on Payment   # unsigned SetHook
 ```
 
 ## Commands
@@ -100,7 +100,7 @@ xahc install-tx myhook.wasm --account rYOURACCT --on Payment   # unsigned SetHoo
 | `sim <wasm> --tt --drops` | Local wasmtime run → accept/rollback, emits, state |
 | `test <suite.toml>` | Declarative asserted test suite over sim |
 | `install-tx <wasm> --account r…` | Emit an UNSIGNED SetHook (HookOn/namespace/params) |
-| `verify <wasm> [--tt --drops]` | Differential check: local sim vs hosted xahau-mcp VM — flags disagreement |
+| `verify <wasm> [--tt --drops]` | Differential check: local sim vs an xahau-mcp `/execute` VM **you point it at** (`--remote`/`XAHC_SIM_URL`) — flags disagreement |
 
 Add `--json` to `build`/`lint`/`sim`/`test`/`clean` for a stable result envelope on
 stdout (diagnostics stay on stderr) — pipeable into CI, the web funnel, or xahau-mcp:
@@ -112,6 +112,8 @@ Write a hook:
 #include "xahc/xahc.h"
 
 int64_t hook(uint32_t reserved) {
+    XAHC_HOOK_ENTRY();                 // required: declares the guard import
+
     if (otxn_type() != XAHC_ttPAYMENT)
         XAHC_ACCEPT("not a payment");
 
@@ -224,7 +226,7 @@ failing assertion points straight at the line that fired.
 
 ## Status
 
-**v1.0.0.** Self-contained binary (embedded headers), clean clippy + unit tests,
+**v1.4.0.** Self-contained binary (embedded headers), clean clippy + unit tests,
 green CI. Both emit builders are verified: **native XAH** round-trips through
 xahau-mcp's chain-validated codec to exactly `Amount: "1000000"` (1 XAH);
 **issued/IOU** executes in xahau-mcp's VM (real XFL) and emits
