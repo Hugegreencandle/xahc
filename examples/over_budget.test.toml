@@ -1,0 +1,9 @@
+# A loop that crosses its guard more times than its budget allows -> the local
+# sim (and the on-chain validator) reject it. Asserts xahc test FAILS such a hook
+# instead of falsely accepting it.
+build = "over_budget.c"
+
+[[case]]
+name = "loop exceeds its guard budget"
+tt = 0
+expect = "guardviolation"

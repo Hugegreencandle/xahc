@@ -30,6 +30,9 @@ pub enum Outcome {
     Rollback(i64),
     /// hook() returned without calling accept/rollback (unusual)
     Returned(i64),
+    /// A guard `_g(id, maxiter)` was crossed more than `maxiter` times — on-chain
+    /// this rejects the hook (the loop-bound enforcement). Carries the guard id.
+    GuardViolation(i32),
 }
 
 struct Ctx {
@@ -37,6 +40,8 @@ struct Ctx {
     state: HashMap<Vec<u8>, Vec<u8>>,
     emitted: Vec<Vec<u8>>,
     outcome: Option<Outcome>,
+    /// per-guard-id crossing counts, for `_g` budget enforcement
+    guards: HashMap<i32, u32>,
 }
 
 const SF_AMOUNT: u32 = (6 << 16) + 1;
@@ -64,11 +69,21 @@ pub type SimResult = (Outcome, Vec<Vec<u8>>, HashMap<Vec<u8>, Vec<u8>>);
 pub fn run(path: &Path, tx: TxFixture) -> Result<SimResult> {
     let engine = Engine::default();
     let module = Module::from_file(&engine, path).with_context(|| format!("load {}", path.display()))?;
-    let mut store = Store::new(&engine, Ctx { tx, state: HashMap::new(), emitted: vec![], outcome: None });
+    let mut store = Store::new(&engine, Ctx { tx, state: HashMap::new(), emitted: vec![], outcome: None, guards: HashMap::new() });
     let mut linker: Linker<Ctx> = Linker::new(&engine);
 
-    // Guard: always succeeds in sim (budget enforcement is a later feature).
-    linker.func_wrap("env", "_g", |_c: Caller<'_, Ctx>, _id: i32, _max: i32| -> i32 { 1 })?;
+    // Guard: enforce the per-id loop budget. `_g(id, maxiter)` is crossed once per
+    // loop iteration; crossing it more than `maxiter` times rejects the hook on
+    // chain, so we halt with a GuardViolation (catches infinite/over-budget loops
+    // locally instead of falsely accepting them).
+    linker.func_wrap("env", "_g", |mut c: Caller<'_, Ctx>, id: i32, max: i32| -> Result<i32> {
+        let count = { let e = c.data_mut().guards.entry(id).or_insert(0); *e += 1; *e };
+        if max > 0 && count > max as u32 {
+            c.data_mut().outcome = Some(Outcome::GuardViolation(id));
+            return Err(Halt.into());
+        }
+        Ok(1)
+    })?;
 
     // Terminal calls: record outcome, then trap to stop execution (mirrors on-chain).
     linker.func_wrap("env", "accept", |mut c: Caller<'_, Ctx>, _p: i32, _l: i32, code: i64| -> Result<i64> {
@@ -178,7 +193,10 @@ pub fn run(path: &Path, tx: TxFixture) -> Result<SimResult> {
         Some(o) => o,
         None => match call {
             Ok(rc) => Outcome::Returned(rc),
-            Err(e) => return Err(e).context("hook trapped without accept/rollback"),
+            Err(e) => return Err(e).context(
+                "hook trapped without accept/rollback — likely a host fn this local sim doesn't model; \
+                 run `xahc verify` for the full-fidelity xahau-mcp VM",
+            ),
         },
     };
     let emitted = store.data().emitted.clone();

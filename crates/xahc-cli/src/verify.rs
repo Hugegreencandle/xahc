@@ -85,6 +85,8 @@ pub fn run(wasm: &Path, tt: &str, drops: u64, remote: Option<&str>) -> Result<Ve
         sim::Outcome::Accept(_) => "accept",
         sim::Outcome::Rollback(_) => "rollback",
         sim::Outcome::Returned(_) => "returned",
+        // a guard-budget violation is a rejection on chain (the MCP VM enforces it too)
+        sim::Outcome::GuardViolation(_) => "rollback",
     };
 
     // --- remote VM (xahau-mcp /execute), byte-identical otxn ---

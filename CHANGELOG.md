@@ -3,6 +3,19 @@
 All notable changes to xahc are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); versioning is [SemVer](https://semver.org/).
 
+## [1.4.0] - 2026-06-13
+
+`xahc sim`/`test` now enforce the guard budget — over-budget loops are caught locally.
+
+### Added / Changed
+- **`_g` guard-budget enforcement in the local sim.** A guard crossed more than its
+  `maxiter` (`XAHC_GUARD(n)`) now produces a `GUARD_VIOLATION` outcome (exit 2 / test
+  failure) instead of being silently accepted — the same loop bound the on-chain
+  validator enforces. New `Outcome::GuardViolation`; `expect = "guardviolation"` is
+  assertable in test suites. Adds `examples/over_budget.c` + a CI case.
+- A local-sim trap (a host fn the sim doesn't model) now routes you to `xahc verify`
+  for the full-fidelity xahau-mcp VM, instead of a bare trap message.
+
 ## [1.3.0] - 2026-06-13
 
 The loop, wired — `xahc verify` runs the local sim AND the xahau-mcp VM and flags disagreement.

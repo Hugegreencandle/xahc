@@ -211,6 +211,7 @@ fn main() -> Result<()> {
                 sim::Outcome::Accept(c) => ("ACCEPT", *c),
                 sim::Outcome::Rollback(c) => ("ROLLBACK", *c),
                 sim::Outcome::Returned(c) => ("RETURNED", *c),
+                sim::Outcome::GuardViolation(id) => ("GUARD_VIOLATION", *id as u32 as i64),
             };
             if cli.json {
                 print_json(&SimJson {
@@ -224,6 +225,7 @@ fn main() -> Result<()> {
                     sim::Outcome::Accept(c) => format!("{} (code {})", "ACCEPT".green().bold(), c),
                     sim::Outcome::Rollback(c) => format!("{} (code {})", "ROLLBACK".red().bold(), c),
                     sim::Outcome::Returned(c) => format!("{} (rc {})", "RETURNED".yellow().bold(), c),
+                    sim::Outcome::GuardViolation(id) => format!("{} (guard {})", "GUARD_VIOLATION".red().bold(), *id as u32),
                 };
                 println!("outcome:  {}", label);
                 println!("emitted:  {} txn(s)", emitted.len());
@@ -232,7 +234,7 @@ fn main() -> Result<()> {
                 }
                 println!("state:    {} key(s) written", state.len());
             }
-            if matches!(outcome, sim::Outcome::Rollback(_)) {
+            if matches!(outcome, sim::Outcome::Rollback(_) | sim::Outcome::GuardViolation(_)) {
                 std::process::exit(2);
             }
         }

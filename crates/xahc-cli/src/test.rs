@@ -111,6 +111,7 @@ fn check(c: &Case, result: Result<sim::SimResult>) -> (bool, String) {
         sim::Outcome::Accept(c) => ("accept", *c),
         sim::Outcome::Rollback(c) => ("rollback", *c),
         sim::Outcome::Returned(c) => ("returned", *c),
+        sim::Outcome::GuardViolation(id) => ("guardviolation", *id as u32 as i64),
     };
     let want = c.expect.to_lowercase();
     if got != want {
