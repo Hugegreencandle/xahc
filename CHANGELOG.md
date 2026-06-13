@@ -3,6 +3,26 @@
 All notable changes to xahc are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); versioning is [SemVer](https://semver.org/).
 
+## [1.5.0] - 2026-06-13
+
+Agentic payments — the layer-1 safety rail for autonomous agents on Xahau.
+
+### Added
+- **`agent_guardrail` archetype + `examples/agent_guardrail.c`** — a Hook that
+  policies OUTGOING payments: per-tx spend cap (HookParameter `LIM`) and optional
+  destination lock (`DST`). The protocol-enforced agent spending limit that
+  x402/app-layer flows lack. Tested both sides of the cap (over-limit → rollback).
+- **`xahc-guardrail` skill** (`skills/xahc-guardrail/SKILL.md`) — Claude-driven
+  scaffold → build → test → `install-tx`, producing an UNSIGNED SetHook (no key
+  custody) so an agent installs its own on-chain budget.
+- **`hook_param` in the local sim**; test suites gain a `hook_params` table
+  (ASCII name → hex value), so guardrail policy is unit-testable offline.
+- **Docs:** `docs/AGENTIC.md` (why Hooks beat escrow/multisign for agent controls;
+  how xahc / xahau-mcp / xrpl-mcp split the agent safety layer) and
+  `docs/X402-XAHAU.md` (proposed `exact-xahau` x402 scheme with the guardrail Hook
+  as the L1 spending authority at `/verify` and `/settle`).
+- CI runs the guardrail test suite.
+
 ## [1.4.0] - 2026-06-13
 
 `xahc sim`/`test` now enforce the guard budget — over-budget loops are caught locally.

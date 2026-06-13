@@ -1,0 +1,18 @@
+{
+  "name": "x402-xahau-facilitator",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Reference x402 facilitator for the proposed exact-xahau scheme: /verify offline, /settle on Xahau. The payer's xahc guardrail Hook is the L1 spending authority.",
+  "bin": { "x402-xahau": "./server.mjs" },
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "node test.mjs"
+  },
+  "dependencies": {
+    "xrpl-binary-codec-prerelease": "*"
+  },
+  "optionalDependencies": {
+    "xrpl": "^4"
+  }
+}
