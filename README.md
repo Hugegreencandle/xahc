@@ -100,13 +100,29 @@ xahau-mcp; xahc does not chase it.
 - **M0** ✅ scaffold: build/clean/lint pipeline, safe headers
 - **M1** ✅ guard auto-numbering (`__COUNTER__`) + checked returns (`XAHC_TRY`/`REQUIRE`)
 - **M2** ✅ lint preflight: export + import allowlists (synced to `extern.h`), `_g` presence
-- **M3** typed emit builders — **Payment ✅ codec-verified**; IOU/trustline next
+- **M3** typed emit builders — **native Payment ✅ codec-verified**, **IOU/issued ✅
+  VM-verified** (1.5 USD round-trips through xahau-mcp's VM as `{value:"1.5",currency:"USD",...}`)
 - **sim** ✅ thin wasmtime preflight (accept/rollback + emit/state); not a substitute
   for xahau-mcp's `execute_hook`
-- **emit-verify** ✅ offline codec round-trip via `scripts/verify-emit.mjs`
-- **next** — IOU/trustline emit builder + verify it the same way; more typed `otxn`/`state`
-  accessors; richer scaffolds. Loop-guard *dominance* and full VM fidelity are
-  **xahau-mcp's** lane — not duplicated here.
+- **emit-verify** ✅ two paths: offline codec round-trip (`scripts/verify-emit.mjs`, native)
+  and VM round-trip (`scripts/verify-emit-vm.mjs`, needs a xahau-mcp checkout — for XFL/IOU)
+- **next** — more typed `otxn`/`state` accessors; richer scaffolds; publish to a
+  registry. Loop-guard *dominance* and full VM fidelity are **xahau-mcp's** lane —
+  not duplicated here.
+
+### Emit verification
+
+Two complementary checks that xahc's hand-built transaction bytes are correct:
+
+```sh
+# native XAH — pure codec round-trip, no checkout needed
+xahc sim emit_payment.wasm --tt 0 --drops 50000000   # prints emit[0] hex
+node scripts/verify-emit.mjs <hex>                     # -> Amount "1000000" (1 XAH)
+
+# issued / IOU — needs the float host fns, so run through xahau-mcp's VM
+XAHAU_MCP=/path/to/xahau-mcp node scripts/verify-emit-vm.mjs emit_iou.wasm Payment
+#   -> Amount {"value":"1.5","currency":"USD","issuer":"r..."}
+```
 
 ### Simulator
 
@@ -122,10 +138,10 @@ failing assertion points straight at the line that fired.
 ## Status
 
 Pre-alpha. Verified end-to-end on macOS (Homebrew LLVM+lld, Rust) and in CI:
-examples compile, clean, lint, and simulate correctly. `emit/payment.h`'s
-native-XAH serialization is **codec-verified** — round-tripped through xahau-mcp's
-chain-validated binary codec to exactly `Amount: "1000000"` (1 XAH) with valid
-r-addresses, offline. IOU/issued-amount emits are **not yet** verified. Not audited;
+examples compile, clean, lint, and simulate correctly. Both emit builders are
+verified: **native XAH** round-trips through xahau-mcp's chain-validated codec to
+exactly `Amount: "1000000"` (1 XAH); **issued/IOU** executes in xahau-mcp's VM
+(real XFL) and emits `{value:"1.5",currency:"USD",...}` — non-degraded. Not audited;
 always confirm financial hooks on testnet before mainnet.
 
 ## License

@@ -8,14 +8,18 @@
  *   - Manual canonical field ordering in ENCODE_* calls. Here ordering is fixed
  *     inside the builder; you can't misorder it.
  *
- * This is a focused MVP: simple XAH (drops) payment, no paths, no IOU. IOU /
- * trustline variant lands next.
+ * Two builders:
+ *   - XAHC_EMIT_PAYMENT      — native XAH (drops). Serialization codec-verified.
+ *   - XAHC_EMIT_PAYMENT_IOU  — issued (trustline) amount. Uses the float_sto host
+ *     fn so the 48-byte STAmount (XFL value + currency + issuer) is encoded by
+ *     xahaud itself — correct by construction, no hand XFL math.
  */
 #ifndef XAHC_EMIT_PAYMENT_H
 #define XAHC_EMIT_PAYMENT_H 1
 
 #include <stdint.h>
 #include "../check.h"
+#include "../sfcodes.h"
 
 extern int64_t hook_account(uint32_t write_ptr, uint32_t write_len);
 extern int64_t ledger_seq(void);
@@ -23,6 +27,13 @@ extern int64_t etxn_details(uint32_t write_ptr, uint32_t write_len);
 extern int64_t etxn_fee_base(uint32_t read_ptr, uint32_t read_len);
 extern int64_t etxn_reserve(uint32_t count);
 extern int64_t emit(uint32_t write_ptr, uint32_t write_len, uint32_t read_ptr, uint32_t read_len);
+
+/* XFL (issued-amount) host fns. */
+extern int64_t float_set(int32_t exponent, int64_t mantissa);
+extern int64_t float_sto(uint32_t write_ptr, uint32_t write_len,
+                         uint32_t cread_ptr, uint32_t cread_len,
+                         uint32_t iread_ptr, uint32_t iread_len,
+                         int64_t float1, uint32_t field_code);
 
 /* Worst-case serialized size of a simple XAH payment with emit details.
  * Without a callback. Matches stock PREPARE_PAYMENT_SIMPLE_SIZE. */
@@ -83,6 +94,70 @@ static inline uint32_t xahc_build_payment(
         _Static_assert(sizeof(_xahc_tx) >= XAHC_PAYMENT_SIZE, "tx buf too small"); \
         etxn_reserve(1);                                                    \
         uint32_t _xahc_len = xahc_build_payment(_xahc_tx, (to20), (drops), (dtag), (stag)); \
+        XAHC_TRY(emit(0, 0, (uint32_t)_xahc_tx, _xahc_len));                \
+    } while (0)
+
+/* ---- Issued (IOU / trustline) payment -------------------------------------
+ * Worst-case size: the native builder + 40 extra bytes of amount (48-byte
+ * issued STAmount vs 8-byte native). Matches stock PREPARE_PAYMENT_SIMPLE_TRUSTLINE_SIZE. */
+#define XAHC_PAYMENT_IOU_SIZE 287U
+
+/* Build an issued-amount payment. The Amount field is serialized by the
+ * float_sto host fn from (xfl, currency20, issuer20) — xahaud does the STAmount
+ * encoding, so there is no hand XFL/currency math to get wrong.
+ *
+ * xfl        : XFL value, e.g. from float_set(exponent, mantissa)
+ * currency20 : 20-byte currency code (160-bit)
+ * issuer20   : 20-byte issuer account id
+ */
+static inline uint32_t xahc_build_payment_iou(
+    uint8_t* buf, const uint8_t* to20,
+    int64_t xfl, const uint8_t* currency20, const uint8_t* issuer20,
+    uint32_t dtag, uint32_t stag)
+{
+    uint8_t* p = buf;
+    uint8_t acc[20];
+    hook_account((uint32_t)acc, 20);
+    uint32_t cls = (uint32_t)ledger_seq();
+
+    *p++ = 0x12; *p++ = 0x00; *p++ = 0x00;                          /* Payment */
+    *p++ = 0x22; *p++ = 0x80; *p++ = 0x00; *p++ = 0x00; *p++ = 0x00;/* tfCanonical */
+    *p++ = 0x23; *p++ = (stag>>24); *p++ = (stag>>16); *p++ = (stag>>8); *p++ = stag;
+    *p++ = 0x24; *p++ = 0; *p++ = 0; *p++ = 0; *p++ = 0;            /* Sequence 0 */
+    *p++ = 0x2E; *p++ = (dtag>>24); *p++ = (dtag>>16); *p++ = (dtag>>8); *p++ = dtag;
+    *p++ = 0x20; *p++ = 0x1A; *p++ = (cls+1)>>24; *p++ = (cls+1)>>16; *p++ = (cls+1)>>8; *p++ = (cls+1);
+    *p++ = 0x20; *p++ = 0x1B; *p++ = (cls+5)>>24; *p++ = (cls+5)>>16; *p++ = (cls+5)>>8; *p++ = (cls+5);
+
+    /* Amount (issued, 49 bytes incl. 0x61 prefix) — host-serialized. */
+    int64_t alen = float_sto((uint32_t)p, XAHC_PAYMENT_IOU_SIZE - (uint32_t)(p - buf),
+                             (uint32_t)currency20, 20, (uint32_t)issuer20, 20,
+                             xfl, sfAmount);
+    p += alen;
+
+    uint8_t* fee_ptr = p;
+    *p++ = 0x68; *p++ = 0x40; for (int i=0;i<7;++i) *p++ = 0;       /* Fee */
+    *p++ = 0x73; *p++ = 0x21; for (int i=0;i<33;++i) *p++ = 0;      /* SigningPubKey null */
+    *p++ = 0x81; *p++ = 0x14; for (int i=0;i<20;++i) *p++ = acc[i]; /* Account */
+    *p++ = 0x83; *p++ = 0x14; for (int i=0;i<20;++i) *p++ = to20[i];/* Destination */
+
+    int64_t edlen = etxn_details((uint32_t)p, XAHC_PAYMENT_IOU_SIZE - (uint32_t)(p - buf));
+    p += edlen;
+
+    uint32_t len = (uint32_t)(p - buf);
+    int64_t fee = etxn_fee_base((uint32_t)buf, len);
+    fee_ptr[1] = 0x40 | ((fee>>56)&0x3F);
+    fee_ptr[2] = fee>>48; fee_ptr[3] = fee>>40; fee_ptr[4] = fee>>32; fee_ptr[5] = fee>>24;
+    fee_ptr[6] = fee>>16; fee_ptr[7] = fee>>8; fee_ptr[8] = fee;
+    return len;
+}
+
+#define XAHC_EMIT_PAYMENT_IOU(to20, xfl, currency20, issuer20, dtag, stag)  \
+    do {                                                                    \
+        uint8_t _xahc_tx[XAHC_PAYMENT_IOU_SIZE];                            \
+        _Static_assert(sizeof(_xahc_tx) >= XAHC_PAYMENT_IOU_SIZE, "tx buf too small"); \
+        etxn_reserve(1);                                                    \
+        uint32_t _xahc_len = xahc_build_payment_iou(                        \
+            _xahc_tx, (to20), (xfl), (currency20), (issuer20), (dtag), (stag)); \
         XAHC_TRY(emit(0, 0, (uint32_t)_xahc_tx, _xahc_len));                \
     } while (0)
 

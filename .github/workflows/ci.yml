@@ -27,8 +27,12 @@ jobs:
         run: cargo clippy --release -- -D warnings
         continue-on-error: true
 
-      - name: Build example hook (compile -> clean -> lint)
-        run: ./target/release/xahc build examples/firewall.c -o /tmp/firewall.wasm
+      - name: Build all examples (compile -> clean -> lint)
+        run: |
+          for f in examples/*.c; do
+            echo "== $f =="
+            ./target/release/xahc build "$f" -o "/tmp/$(basename "${f%.c}").wasm"
+          done
 
       - name: Simulate — below floor must ROLLBACK (exit 2)
         run: |
