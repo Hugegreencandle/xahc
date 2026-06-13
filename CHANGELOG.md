@@ -16,6 +16,12 @@ All notable changes to xahc are documented here. Format follows
 - A local-sim trap (a host fn the sim doesn't model) now routes you to `xahc verify`
   for the full-fidelity xahau-mcp VM, instead of a bare trap message.
 
+### Security
+- Bumped **wasmtime 27 → 45**, clearing 15 RUSTSEC advisories (`cargo audit` now
+  clean, exit 0). `sim.rs` migrated to wasmtime 45's forked `Error` type (kept the
+  VM work in `run_inner`, converted to anyhow once at the boundary). VM behavior is
+  unchanged — every example sim and test suite produces identical outcomes.
+
 ### Fixed
 - `xahc verify` now forwards the SAME otxn fields the local sim synthesizes
   (`sfAmount` always, `sfAccount`/`sfDestination` as zero bytes) and treats a VM

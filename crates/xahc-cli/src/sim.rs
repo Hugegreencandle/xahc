@@ -7,9 +7,10 @@
 //! in-memory state). Unknown imports trap if called, so you find out exactly
 //! which host fn a hook needs next.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::path::Path;
+use wasmtime::error::Context as _; // wasmtime 45 forked Error from anyhow; brings its .context()
 use wasmtime::*;
 
 /// A synthetic originating transaction to feed the hook.
@@ -56,17 +57,24 @@ impl std::fmt::Display for Halt {
 }
 impl std::error::Error for Halt {}
 
-fn mem_of(caller: &mut Caller<'_, Ctx>) -> Result<Memory> {
+fn mem_of(caller: &mut Caller<'_, Ctx>) -> wasmtime::Result<Memory> {
     caller
         .get_export("memory")
         .and_then(Extern::into_memory)
-        .ok_or_else(|| anyhow!("hook exports no memory"))
+        .ok_or_else(|| wasmtime::format_err!("hook exports no memory"))
 }
 
 /// (outcome, emitted txn blobs, state writes key->value).
 pub type SimResult = (Outcome, Vec<Vec<u8>>, HashMap<Vec<u8>, Vec<u8>>);
 
 pub fn run(path: &Path, tx: TxFixture) -> Result<SimResult> {
+    // wasmtime 45's Error doesn't impl std::error::Error, so it can't cross into
+    // anyhow via `?`. Keep the wasmtime work in run_inner (wasmtime::Result) and
+    // convert once here.
+    run_inner(path, tx).map_err(|e| anyhow!("{e}"))
+}
+
+fn run_inner(path: &Path, tx: TxFixture) -> wasmtime::Result<SimResult> {
     let engine = Engine::default();
     let module = Module::from_file(&engine, path).with_context(|| format!("load {}", path.display()))?;
     let mut store = Store::new(&engine, Ctx { tx, state: HashMap::new(), emitted: vec![], outcome: None, guards: HashMap::new() });
@@ -76,7 +84,7 @@ pub fn run(path: &Path, tx: TxFixture) -> Result<SimResult> {
     // loop iteration; crossing it more than `maxiter` times rejects the hook on
     // chain, so we halt with a GuardViolation (catches infinite/over-budget loops
     // locally instead of falsely accepting them).
-    linker.func_wrap("env", "_g", |mut c: Caller<'_, Ctx>, id: i32, max: i32| -> Result<i32> {
+    linker.func_wrap("env", "_g", |mut c: Caller<'_, Ctx>, id: i32, max: i32| -> wasmtime::Result<i32> {
         let count = { let e = c.data_mut().guards.entry(id).or_insert(0); *e += 1; *e };
         if max > 0 && count > max as u32 {
             c.data_mut().outcome = Some(Outcome::GuardViolation(id));
@@ -86,18 +94,18 @@ pub fn run(path: &Path, tx: TxFixture) -> Result<SimResult> {
     })?;
 
     // Terminal calls: record outcome, then trap to stop execution (mirrors on-chain).
-    linker.func_wrap("env", "accept", |mut c: Caller<'_, Ctx>, _p: i32, _l: i32, code: i64| -> Result<i64> {
+    linker.func_wrap("env", "accept", |mut c: Caller<'_, Ctx>, _p: i32, _l: i32, code: i64| -> wasmtime::Result<i64> {
         c.data_mut().outcome = Some(Outcome::Accept(code));
         Err(Halt.into())
     })?;
-    linker.func_wrap("env", "rollback", |mut c: Caller<'_, Ctx>, _p: i32, _l: i32, code: i64| -> Result<i64> {
+    linker.func_wrap("env", "rollback", |mut c: Caller<'_, Ctx>, _p: i32, _l: i32, code: i64| -> wasmtime::Result<i64> {
         c.data_mut().outcome = Some(Outcome::Rollback(code));
         Err(Halt.into())
     })?;
 
     // Originating-transaction reads.
     linker.func_wrap("env", "otxn_type", |c: Caller<'_, Ctx>| -> i64 { c.data().tx.tt })?;
-    linker.func_wrap("env", "otxn_field", |mut c: Caller<'_, Ctx>, wptr: i32, wlen: i32, fid: i32| -> Result<i64> {
+    linker.func_wrap("env", "otxn_field", |mut c: Caller<'_, Ctx>, wptr: i32, wlen: i32, fid: i32| -> wasmtime::Result<i64> {
         let fid = fid as u32;
         // Explicit override wins.
         if let Some(bytes) = c.data().tx.fields.get(&fid).cloned() {
@@ -128,7 +136,7 @@ pub fn run(path: &Path, tx: TxFixture) -> Result<SimResult> {
     })?;
 
     // Hook account + ledger basics (stubs sufficient for emit builders).
-    linker.func_wrap("env", "hook_account", |mut c: Caller<'_, Ctx>, wptr: i32, wlen: i32| -> Result<i64> {
+    linker.func_wrap("env", "hook_account", |mut c: Caller<'_, Ctx>, wptr: i32, wlen: i32| -> wasmtime::Result<i64> {
         if (wlen as usize) < 20 { return Ok(-4); }
         let acc = [0xAAu8; 20];
         let mem = mem_of(&mut c)?;
@@ -138,7 +146,7 @@ pub fn run(path: &Path, tx: TxFixture) -> Result<SimResult> {
     linker.func_wrap("env", "ledger_seq", |_c: Caller<'_, Ctx>| -> i64 { 1_000_000 })?;
 
     // In-memory hook state.
-    linker.func_wrap("env", "state_set", |mut c: Caller<'_, Ctx>, rptr: i32, rlen: i32, kptr: i32, klen: i32| -> Result<i64> {
+    linker.func_wrap("env", "state_set", |mut c: Caller<'_, Ctx>, rptr: i32, rlen: i32, kptr: i32, klen: i32| -> wasmtime::Result<i64> {
         let mem = mem_of(&mut c)?;
         let mut val = vec![0u8; rlen as usize];
         let mut key = vec![0u8; klen as usize];
@@ -147,7 +155,7 @@ pub fn run(path: &Path, tx: TxFixture) -> Result<SimResult> {
         c.data_mut().state.insert(key, val);
         Ok(rlen as i64)
     })?;
-    linker.func_wrap("env", "state", |mut c: Caller<'_, Ctx>, wptr: i32, wlen: i32, kptr: i32, klen: i32| -> Result<i64> {
+    linker.func_wrap("env", "state", |mut c: Caller<'_, Ctx>, wptr: i32, wlen: i32, kptr: i32, klen: i32| -> wasmtime::Result<i64> {
         let mem = mem_of(&mut c)?;
         let mut key = vec![0u8; klen as usize];
         mem.read(&c, kptr as usize, &mut key)?;
@@ -158,7 +166,7 @@ pub fn run(path: &Path, tx: TxFixture) -> Result<SimResult> {
     })?;
 
     // Emit: capture the serialized txn blob.
-    linker.func_wrap("env", "emit", |mut c: Caller<'_, Ctx>, _wp: i32, _wl: i32, rptr: i32, rlen: i32| -> Result<i64> {
+    linker.func_wrap("env", "emit", |mut c: Caller<'_, Ctx>, _wp: i32, _wl: i32, rptr: i32, rlen: i32| -> wasmtime::Result<i64> {
         let mem = mem_of(&mut c)?;
         let mut blob = vec![0u8; rlen as usize];
         mem.read(&c, rptr as usize, &mut blob)?;
@@ -169,7 +177,7 @@ pub fn run(path: &Path, tx: TxFixture) -> Result<SimResult> {
     linker.func_wrap("env", "etxn_reserve", |_c: Caller<'_, Ctx>, _n: i32| -> i64 { 1 })?;
     // Zero-fill the emit-details region so the blob is deterministic (the real
     // EmitDetails STObject is injected by xahaud; we only verify OUR fields).
-    linker.func_wrap("env", "etxn_details", |mut c: Caller<'_, Ctx>, ptr: i32, len: i32| -> Result<i64> {
+    linker.func_wrap("env", "etxn_details", |mut c: Caller<'_, Ctx>, ptr: i32, len: i32| -> wasmtime::Result<i64> {
         let n = (116).min(len.max(0)) as usize;
         let mem = mem_of(&mut c)?;
         let zeros = vec![0u8; n];
