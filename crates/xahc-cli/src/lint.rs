@@ -4,7 +4,8 @@
 use anyhow::{Context, Result};
 use owo_colors::OwoColorize;
 use std::path::Path;
-use walrus::{ExportItem, Module};
+use walrus::ir::{Instr, InstrSeqId};
+use walrus::{ExportItem, FunctionId, FunctionKind, ImportKind, LocalFunction, Module};
 
 /// Functions a hook is allowed to export. Anything else => on-chain rejection.
 pub const ALLOWED_EXPORT_FNS: &[&str] = &["hook", "cbak"];
@@ -96,11 +97,69 @@ pub fn lint(wasm: &[u8]) -> Result<Vec<Finding>> {
         f.push(Finding::error("no `_g` import — hook declares no guards, will be rejected"));
     }
 
-    // 4. Heuristic: loops should be guarded. Phase-1.5 turns this into CFG dominance
-    //    proof; for now warn if loops exist but `_g` is never called.
-    // (Left as a warn-stub so the surface is visible in output.)
+    // 4. Guard-presence per loop: every wasm `loop` must call `_g` directly in
+    //    its body, or the on-chain validator rejects the hook.
+    if let Some(g) = find_g(&m) {
+        f.extend(check_guards(&m, g));
+    }
 
     Ok(f)
+}
+
+/// FunctionId of the imported guard function `env._g`, if present.
+fn find_g(m: &Module) -> Option<FunctionId> {
+    m.imports.iter().find_map(|imp| {
+        if imp.module == "env" && imp.name == "_g" {
+            if let ImportKind::Function(fid) = imp.kind {
+                return Some(fid);
+            }
+        }
+        None
+    })
+}
+
+/// Walk every local function; flag any `loop` whose body has no direct call to `_g`.
+fn check_guards(m: &Module, g: FunctionId) -> Vec<Finding> {
+    let mut out = Vec::new();
+    for func in m.funcs.iter() {
+        if let FunctionKind::Local(lf) = &func.kind {
+            let label = func.name.clone().unwrap_or_else(|| format!("#{:?}", func.id()));
+            walk_seq(lf, lf.entry_block(), g, &label, &mut out);
+        }
+    }
+    out
+}
+
+/// Does this instruction sequence directly (not in a nested seq) call `_g`?
+fn directly_guards(lf: &LocalFunction, seq: InstrSeqId, g: FunctionId) -> bool {
+    lf.block(seq)
+        .instrs
+        .iter()
+        .any(|(instr, _)| matches!(instr, Instr::Call(c) if c.func == g))
+}
+
+/// Recurse the structured IR. On each `loop`, require a direct `_g` call.
+fn walk_seq(lf: &LocalFunction, seq: InstrSeqId, g: FunctionId, label: &str, out: &mut Vec<Finding>) {
+    for (instr, _) in lf.block(seq).instrs.iter() {
+        match instr {
+            Instr::Loop(l) => {
+                if !directly_guards(lf, l.seq, g) {
+                    out.push(Finding::warn(format!(
+                        "unguarded loop in `{}` — add XAHC_GUARD(max) at the top of the loop \
+                         (heuristic: looks for a direct `_g` call in the loop body)",
+                        label
+                    )));
+                }
+                walk_seq(lf, l.seq, g, label, out);
+            }
+            Instr::Block(b) => walk_seq(lf, b.seq, g, label, out),
+            Instr::IfElse(ie) => {
+                walk_seq(lf, ie.consequent, g, label, out);
+                walk_seq(lf, ie.alternative, g, label, out);
+            }
+            _ => {}
+        }
+    }
 }
 
 pub fn report(findings: &[Finding]) {

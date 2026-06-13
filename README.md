@@ -69,8 +69,10 @@ int64_t hook(uint32_t reserved) {
 - **M3** typed emit builders (Payment done; IOU/trustline next) + typed otxn/state
 - **Phase 2** ✅ local simulator (MVP): `xahc sim` runs a hook in wasmtime with
   mocked host fns and reports accept/rollback + emitted txns + state writes — no testnet
-- **M1.5** *(moat, next)* CFG dominance proof — statically prove every `loop` is guarded
-- **Phase 2+** sim: JSON tx fixtures, IOU amounts, assertion DSL, `#[test]` harness
+- **M1.5** ✅ guard check: walks the wasm IR and warns on any `loop` with no direct
+  `_g` call in its body (unguarded loops are rejected on-chain)
+- **next** promote guard check warn→error once dominance (not just presence) is proven;
+  JSON tx fixtures, IOU amounts, assertion DSL, `#[test]` harness
 
 ### Simulator
 
