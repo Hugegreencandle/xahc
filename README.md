@@ -100,6 +100,7 @@ xahc install-tx myhook.wasm --account rYOURACCT --on Payment   # unsigned SetHoo
 | `sim <wasm> --tt --drops` | Local wasmtime run → accept/rollback, emits, state |
 | `test <suite.toml>` | Declarative asserted test suite over sim |
 | `install-tx <wasm> --account r…` | Emit an UNSIGNED SetHook (HookOn/namespace/params) |
+| `verify <wasm> [--tt --drops]` | Differential check: local sim vs hosted xahau-mcp VM — flags disagreement |
 
 Add `--json` to `build`/`lint`/`sim`/`test`/`clean` for a stable result envelope on
 stdout (diagnostics stay on stderr) — pipeable into CI, the web funnel, or xahau-mcp:

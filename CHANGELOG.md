@@ -3,6 +3,19 @@
 All notable changes to xahc are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); versioning is [SemVer](https://semver.org/).
 
+## [1.3.0] - 2026-06-13
+
+The loop, wired — `xahc verify` runs the local sim AND the xahau-mcp VM and flags disagreement.
+
+### Added
+- **`xahc verify <wasm> [--tt --drops --remote]`** — differential gate: runs the
+  built wasm through the fast local sim AND a hosted xahau-mcp `/execute` (the
+  fidelity-locked VM), seeding **byte-identical inputs** to both, and flags any
+  accept/rollback disagreement (nonzero exit). The local sim is the fast inner
+  loop; the MCP VM is the authoritative gate; disagreement is itself a finding.
+  Talks only to the public HTTP surface (`XAHC_SIM_URL` / `--remote`) — never the
+  private MCP, so it runs for any user.
+
 ## [1.2.0] - 2026-06-13
 
 Machine-readable output — xahc can now be driven by CI, the web funnel, and xahau-mcp.

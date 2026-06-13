@@ -9,6 +9,7 @@ mod lint;
 mod scaffold;
 mod sim;
 mod test;
+mod verify;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -135,6 +136,21 @@ enum Cmd {
         #[arg(long, default_value_t = 1)]
         flags: u32,
     },
+    /// Differential check: run a built .wasm through the local sim AND a hosted
+    /// xahau-mcp /execute, and flag any accept/rollback disagreement.
+    Verify {
+        /// The built hook .wasm
+        wasm: PathBuf,
+        /// Originating tx type name or number (seeded identically to both VMs)
+        #[arg(long, default_value = "Payment")]
+        tt: String,
+        /// Native amount in drops (sfAmount), seeded identically to both VMs
+        #[arg(long, default_value_t = 0)]
+        drops: u64,
+        /// Simulator base URL (else XAHC_SIM_URL), e.g. http://localhost:8787
+        #[arg(long)]
+        remote: Option<String>,
+    },
     /// Check the local toolchain can build hooks (clang/wasm-ld), with fix hints.
     Doctor,
     /// Scaffold a buildable hook project.
@@ -236,6 +252,24 @@ fn main() -> Result<()> {
                 println!("{} passed, {} failed", s.passed, if s.failed > 0 { s.failed.to_string() } else { "0".to_string() });
             }
             if s.failed > 0 {
+                std::process::exit(1);
+            }
+        }
+        Cmd::Verify { wasm, tt, drops, remote } => {
+            let v = verify::run(&wasm, &tt, drops, remote.as_deref())?;
+            if cli.json {
+                print_json(&v);
+            } else {
+                let mark = if v.agree {
+                    "✓ AGREE".green().bold().to_string()
+                } else {
+                    "✗ DISAGREE".red().bold().to_string()
+                };
+                let deg = if v.remote_degraded { " (remote DEGRADED — fidelity not guaranteed)" } else { "" };
+                println!("{}  local={} remote={}{}", mark, v.local, v.remote, deg);
+                println!("  tx={} drops={} via {}", v.tx_type, v.drops, v.remote_url);
+            }
+            if !v.agree {
                 std::process::exit(1);
             }
         }
