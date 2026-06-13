@@ -48,9 +48,9 @@ intentionally thin local preflights, not a competing analysis engine.
 
 ```
 include/xahc/      Layer 0 — header-only safe C lib (guard, check, otxn, state, emit, sfcodes)
-crates/xahc-cli/   Layer 1 — Rust CLI: build · clean · lint · sim (thin preflights)
-scripts/           verify-emit.mjs — codec round-trip vs xahau-mcp's binary codec
-examples/          firewall · guarded_loop · unguarded_loop · emit_payment
+crates/xahc-cli/   Layer 1 — Rust CLI: build · clean · lint · sim · test
+scripts/           verify-emit.mjs · verify-emit-vm.mjs — codec/VM round-trips
+examples/          *.c hooks + *.test.toml suites
 ```
 
 The CLI's job is **build + clean** (the part nothing else does). `lint` and `sim`
@@ -104,11 +104,43 @@ xahau-mcp; xahc does not chase it.
   VM-verified** (1.5 USD round-trips through xahau-mcp's VM as `{value:"1.5",currency:"USD",...}`)
 - **sim** ✅ thin wasmtime preflight (accept/rollback + emit/state); not a substitute
   for xahau-mcp's `execute_hook`
+- **test** ✅ `xahc test x.toml` — declarative, asserted suites over sim (outcome +
+  emit/state-count assertions), nonzero exit on failure, CI-wired
 - **emit-verify** ✅ two paths: offline codec round-trip (`scripts/verify-emit.mjs`, native)
   and VM round-trip (`scripts/verify-emit-vm.mjs`, needs a xahau-mcp checkout — for XFL/IOU)
 - **next** — more typed `otxn`/`state` accessors; richer scaffolds; publish to a
   registry. Loop-guard *dominance* and full VM fidelity are **xahau-mcp's** lane —
   not duplicated here.
+
+### Testing
+
+Define cases in TOML and assert outcomes — TDD for hooks, CI-friendly:
+
+```toml
+# firewall.test.toml
+build = "firewall.c"          # compile first (or wasm = "x.wasm")
+
+[[case]]
+name = "below 10 XAH rejects"
+tt = 0
+drops = 5000000
+expect = "rollback"
+
+[[case]]
+name = "above floor accepts"
+tt = 0
+drops = 20000000
+expect = "accept"
+emits = 0                      # optional: assert emitted-txn count
+# fields = { "2.14" = "0000000A" }   # optional: arbitrary otxn fields (type.field or sfName)
+```
+
+```sh
+$ xahc test firewall.test.toml
+  ✓ below 10 XAH rejects      ROLLBACK code=24
+  ✓ above floor accepts       ACCEPT code=25 emits=0
+4 passed, 0 failed
+```
 
 ### Emit verification
 

@@ -1877,6 +1877,8 @@ dependencies = [
  "anyhow",
  "clap",
  "owo-colors",
+ "serde",
+ "toml",
  "walrus",
  "wasmtime",
 ]

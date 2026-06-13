@@ -19,6 +19,9 @@ pub struct TxFixture {
     pub drops: u64,       // native amount, for sfAmount reads
     pub account: [u8; 20],
     pub destination: [u8; 20],
+    /// Explicit field overrides: sfcode (field-id) -> raw serialized value bytes.
+    /// Takes priority over the convenience fields above.
+    pub fields: std::collections::HashMap<u32, Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -78,6 +81,13 @@ pub fn run(path: &Path, tx: TxFixture) -> Result<(Outcome, Vec<Vec<u8>>, HashMap
     linker.func_wrap("env", "otxn_type", |c: Caller<'_, Ctx>| -> i64 { c.data().tx.tt })?;
     linker.func_wrap("env", "otxn_field", |mut c: Caller<'_, Ctx>, wptr: i32, wlen: i32, fid: i32| -> Result<i64> {
         let fid = fid as u32;
+        // Explicit override wins.
+        if let Some(bytes) = c.data().tx.fields.get(&fid).cloned() {
+            if (wlen as usize) < bytes.len() { return Ok(-4); }
+            let mem = mem_of(&mut c)?;
+            mem.write(&mut c, wptr as usize, &bytes)?;
+            return Ok(bytes.len() as i64);
+        }
         let bytes: Vec<u8> = match fid {
             SF_AMOUNT => {
                 let d = c.data().tx.drops;

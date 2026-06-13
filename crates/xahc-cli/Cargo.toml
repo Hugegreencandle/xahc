@@ -15,3 +15,5 @@ clap = { version = "4", features = ["derive"] }
 walrus = "0.23"
 owo-colors = "4"
 wasmtime = "27"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"

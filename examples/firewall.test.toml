@@ -1,0 +1,26 @@
+# xahc test suite for firewall.c — run: xahc test examples/firewall.test.toml
+build = "firewall.c"
+
+[[case]]
+name   = "below 10 XAH rejects"
+tt     = 0
+drops  = 5000000
+expect = "rollback"
+
+[[case]]
+name   = "exactly 10 XAH accepts"
+tt     = 0
+drops  = 10000000
+expect = "accept"
+
+[[case]]
+name   = "above floor accepts"
+tt     = 0
+drops  = 20000000
+expect = "accept"
+emits  = 0
+
+[[case]]
+name   = "non-payment passes"
+tt     = 99
+expect = "accept"

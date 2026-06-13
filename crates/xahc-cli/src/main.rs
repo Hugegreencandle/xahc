@@ -5,6 +5,7 @@ mod build;
 mod clean;
 mod lint;
 mod sim;
+mod test;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -52,6 +53,8 @@ enum Cmd {
         #[arg(long, default_value_t = 0)]
         drops: u64,
     },
+    /// Run a declarative TOML test suite against a hook (sim-based).
+    Test { file: PathBuf },
 }
 
 fn main() -> Result<()> {
@@ -92,6 +95,9 @@ fn main() -> Result<()> {
             if matches!(outcome, sim::Outcome::Rollback(_)) {
                 std::process::exit(2);
             }
+        }
+        Cmd::Test { file } => {
+            test::run(&file)?;
         }
     }
     Ok(())

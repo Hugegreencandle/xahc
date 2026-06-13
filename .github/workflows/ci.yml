@@ -34,17 +34,10 @@ jobs:
             ./target/release/xahc build "$f" -o "/tmp/$(basename "${f%.c}").wasm"
           done
 
-      - name: Simulate — below floor must ROLLBACK (exit 2)
+      - name: Test suites (declarative, sim-based)
         run: |
-          set +e
-          ./target/release/xahc sim /tmp/firewall.wasm --tt 0 --drops 5000000
-          [ $? -eq 2 ] || { echo "expected rollback (exit 2)"; exit 1; }
-
-      - name: Simulate — above floor must ACCEPT (exit 0)
-        run: ./target/release/xahc sim /tmp/firewall.wasm --tt 0 --drops 20000000
-
-      - name: Simulate — non-payment must ACCEPT (exit 0)
-        run: ./target/release/xahc sim /tmp/firewall.wasm --tt 99
+          ./target/release/xahc test examples/firewall.test.toml
+          ./target/release/xahc test examples/emit_payment.test.toml
 
       - name: Setup Node (for emit codec verification)
         uses: actions/setup-node@v4

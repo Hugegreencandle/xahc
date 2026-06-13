@@ -1,0 +1,15 @@
+# xahc test suite for emit_payment.c — asserts the emit happens.
+build = "emit_payment.c"
+
+[[case]]
+name   = "incoming payment emits 1 txn"
+tt     = 0
+drops  = 50000000
+expect = "accept"
+emits  = 1
+
+[[case]]
+name   = "non-payment emits nothing"
+tt     = 99
+expect = "accept"
+emits  = 0
