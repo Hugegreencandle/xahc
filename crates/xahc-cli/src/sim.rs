@@ -137,7 +137,15 @@ pub fn run(path: &Path, tx: TxFixture) -> Result<(Outcome, Vec<Vec<u8>>, HashMap
     })?;
     // Emit-prep stubs (return plausible values so builders proceed).
     linker.func_wrap("env", "etxn_reserve", |_c: Caller<'_, Ctx>, _n: i32| -> i64 { 1 })?;
-    linker.func_wrap("env", "etxn_details", |_c: Caller<'_, Ctx>, _p: i32, _l: i32| -> i64 { 138 })?;
+    // Zero-fill the emit-details region so the blob is deterministic (the real
+    // EmitDetails STObject is injected by xahaud; we only verify OUR fields).
+    linker.func_wrap("env", "etxn_details", |mut c: Caller<'_, Ctx>, ptr: i32, len: i32| -> Result<i64> {
+        let n = (116).min(len.max(0)) as usize;
+        let mem = mem_of(&mut c)?;
+        let zeros = vec![0u8; n];
+        mem.write(&mut c, ptr as usize, &zeros)?;
+        Ok(n as i64)
+    })?;
     linker.func_wrap("env", "etxn_fee_base", |_c: Caller<'_, Ctx>, _p: i32, _l: i32| -> i64 { 10 })?;
 
     // Trace: no-op (could be wired to stdout later).

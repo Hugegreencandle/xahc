@@ -84,6 +84,10 @@ fn main() -> Result<()> {
             };
             println!("outcome:  {}", label);
             println!("emitted:  {} txn(s)", emitted.len());
+            for (i, blob) in emitted.iter().enumerate() {
+                let hex: String = blob.iter().map(|b| format!("{:02X}", b)).collect();
+                println!("  emit[{}] ({} bytes): {}", i, blob.len(), hex);
+            }
             println!("state:    {} key(s) written", state.len());
             if matches!(outcome, sim::Outcome::Rollback(_)) {
                 std::process::exit(2);

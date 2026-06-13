@@ -1,11 +1,37 @@
 # xahc — Xahau Hooks, Checked
 
-A safety layer for writing **C Hooks** on the [Xahau Network](https://xahau.network/docs/hooks/).
+The **authoring + compile** companion for **C Hooks** on the
+[Xahau Network](https://xahau.network/docs/hooks/): write safely, build, clean,
+and hand off a correct `.wasm` for deep analysis.
 
 Hooks are layer-1 WASM smart contracts that fire before/after every transaction on
 an account. The stock toolchain (`XRPLF/hook-macros`) is raw C preprocessor macros —
 powerful, but every guarantee lives in the developer's head. `xahc` moves those
-guarantees into the type system, the compiler, and a static linter.
+guarantees into the type system, the compiler, and the build step.
+
+## Where xahc fits — it pairs with [xahau-mcp](https://github.com/Hugegreencandle/xahau-mcp)
+
+The two tools are halves of one loop. xahau-mcp is **read-only**: it analyzes,
+simulates (real WASM in a local VM, 78-fn Hook API, fidelity-locked to chain) and
+audits hooks that *already exist as WASM*. It does **not** compile C, strip WASM,
+or give you a safe write-time library. xahc does exactly that:
+
+```
+  AUTHOR + BUILD                 ANALYZE + SIMULATE + VERIFY
+  ── xahc ──                     ── xahau-mcp ──
+  safe headers ─► xahc build ─►  .wasm ─► execute_hook / analyze_hook / inspect_emitted_tx
+       ▲                                              │
+       └───────────────  findings feed back  ─────────┘
+```
+
+Write & compile with xahc → analyze & simulate with xahau-mcp. For deep static
+analysis and VM execution, **use xahau-mcp** — xahc's own `lint`/`sim` are
+intentionally thin local preflights, not a competing analysis engine.
+
+> **Emit builders are codec-verified.** `emit/payment.h` output is round-tripped
+> through xahau-mcp's chain-validated binary codec — a 1 XAH payment decodes to
+> exactly `Amount: "1000000"`, valid `Account`/`Destination` r-addresses, offline.
+> See [`scripts/verify-emit.mjs`](scripts/verify-emit.mjs).
 
 ## What it removes (real footguns, from the stock macros)
 
@@ -21,10 +47,15 @@ guarantees into the type system, the compiler, and a static linter.
 ## Layout
 
 ```
-include/xahc/      Layer 0 — header-only safe C lib (guard, check, otxn, state, emit)
-crates/xahc-cli/   Layer 1 — Rust CLI: build · clean · lint
-examples/          firewall.c (ported)
+include/xahc/      Layer 0 — header-only safe C lib (guard, check, otxn, state, emit, sfcodes)
+crates/xahc-cli/   Layer 1 — Rust CLI: build · clean · lint · sim (thin preflights)
+scripts/           verify-emit.mjs — codec round-trip vs xahau-mcp's binary codec
+examples/          firewall · guarded_loop · unguarded_loop · emit_payment
 ```
+
+The CLI's job is **build + clean** (the part nothing else does). `lint` and `sim`
+are convenience preflights for fast local feedback; for authoritative analysis and
+VM execution, pipe the `.wasm` to [xahau-mcp](https://github.com/Hugegreencandle/xahau-mcp).
 
 ## Prerequisites
 
@@ -54,7 +85,7 @@ int64_t hook(uint32_t reserved) {
         XAHC_ACCEPT("not a payment");
 
     uint8_t amt[8];
-    XAHC_REQUIRE(otxn_field(XAHC_SBUF(amt), XAHC_sfAmount) == 8, "amount read");
+    XAHC_REQUIRE(otxn_field(XAHC_SBUF(amt), sfAmount) == 8, "amount read");
     // ...
     XAHC_ACCEPT("ok");
     return 0;
@@ -63,16 +94,19 @@ int64_t hook(uint32_t reserved) {
 
 ## Roadmap
 
+Scope is deliberately the **authoring/compile half**. Deep analysis lives in
+xahau-mcp; xahc does not chase it.
+
 - **M0** ✅ scaffold: build/clean/lint pipeline, safe headers
-- **M1** guard auto-numbering + checked returns (done in headers; needs on-chain test)
-- **M2** lint: export + import allowlists, guard-presence
-- **M3** typed emit builders (Payment done; IOU/trustline next) + typed otxn/state
-- **Phase 2** ✅ local simulator (MVP): `xahc sim` runs a hook in wasmtime with
-  mocked host fns and reports accept/rollback + emitted txns + state writes — no testnet
-- **M1.5** ✅ guard check: walks the wasm IR and warns on any `loop` with no direct
-  `_g` call in its body (unguarded loops are rejected on-chain)
-- **next** promote guard check warn→error once dominance (not just presence) is proven;
-  JSON tx fixtures, IOU amounts, assertion DSL, `#[test]` harness
+- **M1** ✅ guard auto-numbering (`__COUNTER__`) + checked returns (`XAHC_TRY`/`REQUIRE`)
+- **M2** ✅ lint preflight: export + import allowlists (synced to `extern.h`), `_g` presence
+- **M3** typed emit builders — **Payment ✅ codec-verified**; IOU/trustline next
+- **sim** ✅ thin wasmtime preflight (accept/rollback + emit/state); not a substitute
+  for xahau-mcp's `execute_hook`
+- **emit-verify** ✅ offline codec round-trip via `scripts/verify-emit.mjs`
+- **next** — IOU/trustline emit builder + verify it the same way; more typed `otxn`/`state`
+  accessors; richer scaffolds. Loop-guard *dominance* and full VM fidelity are
+  **xahau-mcp's** lane — not duplicated here.
 
 ### Simulator
 
@@ -87,10 +121,12 @@ failing assertion points straight at the line that fired.
 
 ## Status
 
-Pre-alpha. Verified end-to-end on macOS (Homebrew LLVM+lld, Rust): firewall
-example compiles, cleans, lints, and simulates correctly both sides of its
-threshold. The emit serialization offsets (`emit/payment.h`) still need a diff
-against a live `xahaud` emit before mainnet use. Not audited.
+Pre-alpha. Verified end-to-end on macOS (Homebrew LLVM+lld, Rust) and in CI:
+examples compile, clean, lint, and simulate correctly. `emit/payment.h`'s
+native-XAH serialization is **codec-verified** — round-tripped through xahau-mcp's
+chain-validated binary codec to exactly `Amount: "1000000"` (1 XAH) with valid
+r-addresses, offline. IOU/issued-amount emits are **not yet** verified. Not audited;
+always confirm financial hooks on testnet before mainnet.
 
 ## License
 

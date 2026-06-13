@@ -1,0 +1,11 @@
+{
+  "name": "xahc-scripts",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "Offline verification helpers for xahc (codec round-trip via Xahau binary codec).",
+  "bin": { "verify-emit": "./verify-emit.mjs" },
+  "dependencies": {
+    "xrpl-binary-codec-prerelease": "*"
+  }
+}
