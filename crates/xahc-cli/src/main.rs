@@ -13,13 +13,63 @@ mod test;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use owo_colors::OwoColorize;
+use serde::Serialize;
 use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "xahc", version, about = "Xahau Hooks, Checked")]
 struct Cli {
+    /// Emit machine-readable JSON on stdout (diagnostics stay on stderr). Lets
+    /// CI, the web funnel, and xahau-mcp consume xahc results without parsing prose.
+    #[arg(long, global = true)]
+    json: bool,
     #[command(subcommand)]
     cmd: Cmd,
+}
+
+// ---- stable --json result envelopes (consumed by CI / xahau-mcp / the web tool) ----
+
+#[derive(Serialize)]
+struct LintJson<'a> {
+    ok: bool,
+    error_count: usize,
+    findings: &'a [lint::Finding],
+}
+
+#[derive(Serialize)]
+struct BuildJson<'a> {
+    wasm_path: String,
+    wasm_hex: String,
+    bytes: usize,
+    lint: LintJson<'a>,
+}
+
+#[derive(Serialize)]
+struct EmitJson {
+    bytes: usize,
+    hex: String,
+}
+
+#[derive(Serialize)]
+struct SimJson {
+    outcome: String,
+    return_code: i64,
+    emitted: Vec<EmitJson>,
+    state_keys: usize,
+}
+
+#[derive(Serialize)]
+struct CleanJson {
+    out_path: String,
+    removed: usize,
+}
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{:02X}", x)).collect()
+}
+
+fn print_json<T: Serialize>(v: &T) {
+    println!("{}", serde_json::to_string_pretty(v).expect("serialize json"));
 }
 
 #[derive(Subcommand)]
@@ -103,41 +153,91 @@ fn main() -> Result<()> {
         Cmd::Build { input, out, includes, no_lint } => {
             let out = out.unwrap_or_else(|| input.with_extension("wasm"));
             build::run(&input, &out, &includes, !no_lint)?;
-            println!("{} {}", "built".green().bold(), out.display());
+            if cli.json {
+                let bytes = std::fs::read(&out)?;
+                let findings = lint::lint(&bytes)?;
+                let error_count = findings.iter().filter(|f| f.level == lint::Level::Error).count();
+                print_json(&BuildJson {
+                    wasm_path: out.display().to_string(),
+                    wasm_hex: hex(&bytes),
+                    bytes: bytes.len(),
+                    lint: LintJson { ok: error_count == 0, error_count, findings: &findings },
+                });
+            } else {
+                println!("{} {}", "built".green().bold(), out.display());
+            }
         }
         Cmd::Clean { input, out } => {
             let out = out.unwrap_or_else(|| input.clone());
             let removed = clean::run(&input, &out)?;
-            println!("{} stripped {} stray export(s) -> {}", "clean".green().bold(), removed, out.display());
+            if cli.json {
+                print_json(&CleanJson { out_path: out.display().to_string(), removed });
+            } else {
+                println!("{} stripped {} stray export(s) -> {}", "clean".green().bold(), removed, out.display());
+            }
         }
         Cmd::Lint { input } => {
             let findings = lint::lint_file(&input)?;
-            lint::report(&findings);
-            if findings.iter().any(|f| f.level == lint::Level::Error) {
+            let error_count = findings.iter().filter(|f| f.level == lint::Level::Error).count();
+            if cli.json {
+                print_json(&LintJson { ok: error_count == 0, error_count, findings: &findings });
+            } else {
+                lint::report(&findings);
+            }
+            if error_count > 0 {
                 std::process::exit(1);
             }
         }
         Cmd::Sim { input, tt, drops } => {
             let tx = sim::TxFixture { tt, drops, ..Default::default() };
             let (outcome, emitted, state) = sim::run(&input, tx)?;
-            let label = match &outcome {
-                sim::Outcome::Accept(c) => format!("{} (code {})", "ACCEPT".green().bold(), c),
-                sim::Outcome::Rollback(c) => format!("{} (code {})", "ROLLBACK".red().bold(), c),
-                sim::Outcome::Returned(c) => format!("{} (rc {})", "RETURNED".yellow().bold(), c),
+            let (name, code) = match &outcome {
+                sim::Outcome::Accept(c) => ("ACCEPT", *c),
+                sim::Outcome::Rollback(c) => ("ROLLBACK", *c),
+                sim::Outcome::Returned(c) => ("RETURNED", *c),
             };
-            println!("outcome:  {}", label);
-            println!("emitted:  {} txn(s)", emitted.len());
-            for (i, blob) in emitted.iter().enumerate() {
-                let hex: String = blob.iter().map(|b| format!("{:02X}", b)).collect();
-                println!("  emit[{}] ({} bytes): {}", i, blob.len(), hex);
+            if cli.json {
+                print_json(&SimJson {
+                    outcome: name.to_string(),
+                    return_code: code,
+                    emitted: emitted.iter().map(|b| EmitJson { bytes: b.len(), hex: hex(b) }).collect(),
+                    state_keys: state.len(),
+                });
+            } else {
+                let label = match &outcome {
+                    sim::Outcome::Accept(c) => format!("{} (code {})", "ACCEPT".green().bold(), c),
+                    sim::Outcome::Rollback(c) => format!("{} (code {})", "ROLLBACK".red().bold(), c),
+                    sim::Outcome::Returned(c) => format!("{} (rc {})", "RETURNED".yellow().bold(), c),
+                };
+                println!("outcome:  {}", label);
+                println!("emitted:  {} txn(s)", emitted.len());
+                for (i, blob) in emitted.iter().enumerate() {
+                    println!("  emit[{}] ({} bytes): {}", i, blob.len(), hex(blob));
+                }
+                println!("state:    {} key(s) written", state.len());
             }
-            println!("state:    {} key(s) written", state.len());
             if matches!(outcome, sim::Outcome::Rollback(_)) {
                 std::process::exit(2);
             }
         }
         Cmd::Test { file } => {
-            test::run(&file)?;
+            let s = test::run(&file)?;
+            if cli.json {
+                print_json(&s);
+            } else {
+                println!("{} {}  ({} case(s))", "test".bold(), s.wasm, s.cases.len());
+                for c in &s.cases {
+                    if c.ok {
+                        println!("  {} {:<32} {}", "✓".green().bold(), c.name, c.detail.dimmed());
+                    } else {
+                        println!("  {} {:<32} {}", "✗".red().bold(), c.name, c.detail.red());
+                    }
+                }
+                println!("{} passed, {} failed", s.passed, if s.failed > 0 { s.failed.to_string() } else { "0".to_string() });
+            }
+            if s.failed > 0 {
+                std::process::exit(1);
+            }
         }
         Cmd::Doctor => {
             doctor::run()?;

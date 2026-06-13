@@ -44,7 +44,8 @@ pub fn run(input: &Path, output: &Path, extra_includes: &[PathBuf], do_lint: boo
     let wasm = std::fs::read(&raw)?;
     let (cleaned, removed) = clean::clean_bytes(&wasm)?;
     if removed > 0 {
-        println!("{} stripped {} stray export(s)", "clean".green(), removed);
+        // Diagnostic, not data — stderr keeps `xahc build --json` stdout clean.
+        eprintln!("{} stripped {} stray export(s)", "clean".green(), removed);
     }
     std::fs::write(output, &cleaned)?;
     let _ = std::fs::remove_file(&raw);
@@ -52,7 +53,7 @@ pub fn run(input: &Path, output: &Path, extra_includes: &[PathBuf], do_lint: boo
     // lint
     if do_lint {
         let findings = lint::lint(&cleaned)?;
-        lint::report(&findings);
+        lint::report_stderr(&findings);
         if findings.iter().any(|f| f.level == lint::Level::Error) {
             bail!("lint failed — fix errors above before deploying");
         }

@@ -3,6 +3,24 @@
 All notable changes to xahc are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); versioning is [SemVer](https://semver.org/).
 
+## [1.2.0] - 2026-06-13
+
+Machine-readable output — xahc can now be driven by CI, the web funnel, and xahau-mcp.
+
+### Added
+- **Global `--json` flag** on `build` / `lint` / `sim` / `test` / `clean`. Emits a
+  stable result envelope on **stdout**; all human/diagnostic output goes to **stderr**,
+  so `xahc build --json | jq` is clean. Exit codes are unchanged (lint error = 1,
+  rollback = 2), so structured and exit-code consumers both work.
+  - `BuildResult{wasm_path, wasm_hex, bytes, lint}` — `wasm_hex` removes the manual
+    file→hex bridge when handing a build to xahau-mcp.
+  - `LintResult{ok, error_count, findings:[{level, rule_id, msg}]}`.
+  - `SimResult{outcome, return_code, emitted:[{bytes, hex}], state_keys}`.
+  - `TestResult{wasm, passed, failed, cases:[{name, ok, detail}]}`.
+- **Stable `rule_id`s on lint findings** (ILLEGAL_EXPORT, NO_HOOK_EXPORT, NO_G_IMPORT,
+  UNGUARDED_LOOP, STACK_OVERFLOW, …) — a compatibility contract for machine consumers,
+  independent of the human message wording.
+
 ## [1.1.0] - 2026-06-13
 
 Safety hardening of `install-tx` (pre-launch audit).

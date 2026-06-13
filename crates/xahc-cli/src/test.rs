@@ -5,12 +5,26 @@
 //! counts). Nonzero exit on any failure → drop straight into CI.
 
 use anyhow::{bail, Context, Result};
-use owo_colors::OwoColorize;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::{build, sim};
+
+#[derive(Serialize)]
+pub struct CaseResult {
+    pub name: String,
+    pub ok: bool,
+    pub detail: String,
+}
+
+#[derive(Serialize)]
+pub struct TestSummary {
+    pub wasm: String,
+    pub passed: usize,
+    pub failed: usize,
+    pub cases: Vec<CaseResult>,
+}
 
 #[derive(Deserialize)]
 struct TestFile {
@@ -40,7 +54,9 @@ struct Case {
     fields: HashMap<String, String>,
 }
 
-pub fn run(path: &Path) -> Result<()> {
+/// Run the suite and collect results. Printing + exit code live in the caller
+/// (main) so both prose and `--json` output share one code path.
+pub fn run(path: &Path) -> Result<TestSummary> {
     let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     let tf: TestFile = toml::from_str(&text).context("parse test TOML")?;
     let base = path.parent().unwrap_or_else(|| Path::new("."));
@@ -64,7 +80,7 @@ pub fn run(path: &Path) -> Result<()> {
         bail!("no [[case]] entries in {}", path.display());
     }
 
-    println!("{} {}  ({} case(s))", "test".bold(), wasm_path.display(), tf.cases.len());
+    let mut cases = Vec::with_capacity(tf.cases.len());
     let mut passed = 0usize;
     let mut failed = 0usize;
 
@@ -78,20 +94,11 @@ pub fn run(path: &Path) -> Result<()> {
 
         let result = sim::run(&wasm_path, fixture);
         let (ok, detail) = check(c, result);
-        if ok {
-            passed += 1;
-            println!("  {} {:<32} {}", "✓".green().bold(), c.name, detail.dimmed());
-        } else {
-            failed += 1;
-            println!("  {} {:<32} {}", "✗".red().bold(), c.name, detail.red());
-        }
+        if ok { passed += 1; } else { failed += 1; }
+        cases.push(CaseResult { name: c.name.clone(), ok, detail });
     }
 
-    println!("{} passed, {} failed", passed, if failed > 0 { failed.to_string() } else { "0".to_string() });
-    if failed > 0 {
-        std::process::exit(1);
-    }
-    Ok(())
+    Ok(TestSummary { wasm: wasm_path.display().to_string(), passed, failed, cases })
 }
 
 /// Returns (passed, human-readable detail).

@@ -3,6 +3,7 @@
 
 use anyhow::{Context, Result};
 use owo_colors::OwoColorize;
+use serde::Serialize;
 use std::path::Path;
 use walrus::ir::{Instr, InstrSeqId};
 use walrus::{ExportItem, FunctionId, FunctionKind, ImportKind, LocalFunction, Module};
@@ -35,17 +36,27 @@ pub const HOOK_API: &[&str] = &[
     "util_accid", "util_keylet", "util_raddr", "util_sha512h", "util_verify",
 ];
 
-#[derive(PartialEq, Eq, Clone, Copy)]
+#[derive(PartialEq, Eq, Clone, Copy, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Level { Error, Warn }
 
+/// Stable machine-routable rule identifiers. Treat these as a COMPATIBILITY
+/// CONTRACT — xahau-mcp, CI gates, and any `--json` consumer key on them, so do
+/// not rename casually. The human `msg` may change freely; the `rule_id` is fixed.
+#[derive(Serialize)]
 pub struct Finding {
     pub level: Level,
+    pub rule_id: &'static str,
     pub msg: String,
 }
 
 impl Finding {
-    pub fn error(msg: impl Into<String>) -> Self { Finding { level: Level::Error, msg: msg.into() } }
-    pub fn warn(msg: impl Into<String>) -> Self { Finding { level: Level::Warn, msg: msg.into() } }
+    pub fn error(rule_id: &'static str, msg: impl Into<String>) -> Self {
+        Finding { level: Level::Error, rule_id, msg: msg.into() }
+    }
+    pub fn warn(rule_id: &'static str, msg: impl Into<String>) -> Self {
+        Finding { level: Level::Warn, rule_id, msg: msg.into() }
+    }
 }
 
 pub fn lint_file(path: &Path) -> Result<Vec<Finding>> {
@@ -64,37 +75,37 @@ pub fn lint(wasm: &[u8]) -> Result<Vec<Finding>> {
             ExportItem::Function(_) => {
                 if e.name == "hook" { has_hook = true; }
                 if !ALLOWED_EXPORT_FNS.contains(&e.name.as_str()) {
-                    f.push(Finding::error(format!(
+                    f.push(Finding::error("ILLEGAL_EXPORT", format!(
                         "illegal export `{}` — run `xahc clean` or it will be rejected on-chain", e.name)));
                 }
             }
             ExportItem::Memory(_) => { /* `memory` export is fine */ }
-            _ => f.push(Finding::error(format!(
+            _ => f.push(Finding::error("ILLEGAL_NONFN_EXPORT", format!(
                 "illegal export `{}` (non-function/memory) — will be rejected", e.name))),
         }
     }
     if !has_hook {
-        f.push(Finding::error("no `hook` export — every hook must export `hook`"));
+        f.push(Finding::error("NO_HOOK_EXPORT", "no `hook` export — every hook must export `hook`"));
     }
 
     // 2. Every host import must be a real Hook API function.
     let mut imports_g = false;
     for imp in m.imports.iter() {
         if imp.module != "env" {
-            f.push(Finding::error(format!(
+            f.push(Finding::error("NON_ENV_IMPORT", format!(
                 "import from `{}` — only `env` (Hook API) imports allowed", imp.module)));
             continue;
         }
         if imp.name == "_g" { imports_g = true; }
         if !HOOK_API.contains(&imp.name.as_str()) {
-            f.push(Finding::error(format!(
+            f.push(Finding::error("UNKNOWN_HOST_IMPORT", format!(
                 "unknown host import `env.{}` — not in the Hook API", imp.name)));
         }
     }
 
     // 3. Guard function must be imported. No `_g` => no guards => rejected.
     if !imports_g {
-        f.push(Finding::error("no `_g` import — hook declares no guards, will be rejected"));
+        f.push(Finding::error("NO_G_IMPORT", "no `_g` import — hook declares no guards, will be rejected"));
     }
 
     // 4. Guard-presence per loop: every wasm `loop` must call `_g` directly in
@@ -147,7 +158,7 @@ fn walk_seq(lf: &LocalFunction, seq: InstrSeqId, g: FunctionId, label: &str, out
         match instr {
             Instr::Loop(l) => {
                 if !directly_guards(lf, l.seq, g) {
-                    out.push(Finding::warn(format!(
+                    out.push(Finding::warn("UNGUARDED_LOOP", format!(
                         "unguarded loop in `{}` — add XAHC_GUARD(max) at the top of the loop \
                          (heuristic: looks for a direct `_g` call in the loop body)",
                         label
@@ -261,18 +272,18 @@ fn check_stack(m: &Module) -> Vec<Finding> {
     }
 
     if recursion {
-        out.push(Finding::warn(
+        out.push(Finding::warn("RECURSION",
             "recursion detected in call graph — stack-budget analysis is unbounded; hooks should not recurse",
         ));
     }
     let pct = (deepest as f64 / available as f64) * 100.0;
     if deepest as i64 > available {
-        out.push(Finding::warn(format!(
+        out.push(Finding::warn("STACK_OVERFLOW", format!(
             "stack may overflow: deepest call chain ~{} bytes > available stack {} bytes (sp_init {} - data {})",
             deepest, available, sp_init, data_end
         )));
     } else if pct >= 80.0 {
-        out.push(Finding::warn(format!(
+        out.push(Finding::warn("STACK_HIGH", format!(
             "stack usage high: deepest call chain ~{} bytes is {:.0}% of {} available",
             deepest, pct, available
         )));
@@ -340,4 +351,22 @@ pub fn report(findings: &[Finding]) {
     let errs = findings.iter().filter(|f| f.level == Level::Error).count();
     let warns = findings.len() - errs;
     println!("{} error(s), {} warning(s)", errs, warns);
+}
+
+/// Same as `report` but to stderr — used by `build` (whose lint is a diagnostic
+/// sub-step), so `xahc build --json` keeps machine output clean on stdout.
+pub fn report_stderr(findings: &[Finding]) {
+    if findings.is_empty() {
+        eprintln!("{} no issues", "lint".green().bold());
+        return;
+    }
+    for fd in findings {
+        match fd.level {
+            Level::Error => eprintln!("{} {}", "error".red().bold(), fd.msg),
+            Level::Warn => eprintln!("{} {}", "warn".yellow().bold(), fd.msg),
+        }
+    }
+    let errs = findings.iter().filter(|f| f.level == Level::Error).count();
+    let warns = findings.len() - errs;
+    eprintln!("{} error(s), {} warning(s)", errs, warns);
 }

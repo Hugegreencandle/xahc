@@ -101,6 +101,10 @@ xahc install-tx myhook.wasm --account rYOURACCT --on Payment   # unsigned SetHoo
 | `test <suite.toml>` | Declarative asserted test suite over sim |
 | `install-tx <wasm> --account r…` | Emit an UNSIGNED SetHook (HookOn/namespace/params) |
 
+Add `--json` to `build`/`lint`/`sim`/`test`/`clean` for a stable result envelope on
+stdout (diagnostics stay on stderr) — pipeable into CI, the web funnel, or xahau-mcp:
+`xahc build hook.c --json | jq .wasm_hex`. Lint findings carry stable `rule_id`s.
+
 Write a hook:
 
 ```c
