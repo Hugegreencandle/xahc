@@ -20,11 +20,24 @@ pub fn run(input: &Path, output: &Path, extra_includes: &[PathBuf], do_lint: boo
     let mut cmd = Command::new("clang");
     cmd.args([
         "--target=wasm32",
-        "-O2",
+        // -Oz, not -O2: aggressive opt (loop rotation) repositions the `_g` guard
+        // out of where xahaud's guard verifier requires it, so -O2 hooks are
+        // rejected (temMALFORMED) even though they're structurally guarded. -Oz
+        // keeps guards in place AND yields smaller hooks (lower SetHook fee).
+        // Verified on Xahau testnet. (A wasm guard-injection pass is the robust
+        // long-term fix; -Oz is the validated interim.)
+        "-Oz",
         "-nostdlib",
         "-fno-builtin",
         "-Wl,--no-entry",
-        "-Wl,--export-all",      // export hook/cbak regardless of visibility; clean strips the rest
+        // Export ONLY hook (required) + cbak (if present), and garbage-collect
+        // everything else. Without --gc-sections, lld leaves dead functions like
+        // __wasm_call_ctors in the module; xahaud validates EVERY function and
+        // rejects the unguarded dead one (temMALFORMED on SetHook). Verified on
+        // Xahau testnet: hooks only install once these dead functions are GC'd.
+        "-Wl,--gc-sections",
+        "-Wl,--export=hook",
+        "-Wl,--export-if-defined=cbak",
         "-Wl,--allow-undefined", // host (env) imports resolved by xahaud
     ]);
     // Headers are embedded in the binary; materialize them and point clang there.

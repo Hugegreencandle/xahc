@@ -76,9 +76,28 @@ pub fn run(path: &Path, tx: TxFixture) -> Result<SimResult> {
     run_inner(path, tx).map_err(|e| anyhow!("{e}"))
 }
 
+/// Deployable hooks don't export `memory` (xahaud rejects that), but the sim
+/// needs a handle to linear memory. Re-add a `memory` export in-memory before
+/// instantiating — the on-disk/deploy wasm is untouched.
+fn ensure_memory_export(wasm: &[u8]) -> wasmtime::Result<Vec<u8>> {
+    let mut m = walrus::Module::from_buffer(wasm).map_err(|e| wasmtime::format_err!("{e}"))?;
+    let has_mem = m
+        .exports
+        .iter()
+        .any(|e| e.name == "memory" && matches!(e.item, walrus::ExportItem::Memory(_)));
+    if !has_mem {
+        if let Some(mem_id) = m.memories.iter().next().map(|x| x.id()) {
+            m.exports.add("memory", mem_id);
+        }
+    }
+    Ok(m.emit_wasm())
+}
+
 fn run_inner(path: &Path, tx: TxFixture) -> wasmtime::Result<SimResult> {
     let engine = Engine::default();
-    let module = Module::from_file(&engine, path).with_context(|| format!("load {}", path.display()))?;
+    let raw = std::fs::read(path).map_err(|e| wasmtime::format_err!("read {}: {e}", path.display()))?;
+    let bytes = ensure_memory_export(&raw)?;
+    let module = Module::from_binary(&engine, &bytes).with_context(|| format!("load {}", path.display()))?;
     let mut store = Store::new(&engine, Ctx { tx, state: HashMap::new(), emitted: vec![], outcome: None, guards: HashMap::new() });
     let mut linker: Linker<Ctx> = Linker::new(&engine);
 

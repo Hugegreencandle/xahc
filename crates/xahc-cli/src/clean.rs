@@ -1,10 +1,16 @@
-//! Rust reimplementation of hook-cleaner: drop exports a hook may not have.
-//! Keeps `hook`, `cbak`, and the `memory` export; strips the rest
-//! (compiler linking artifacts like __wasm_call_ctors, __heap_base, etc).
+//! Rust reimplementation of hook-cleaner: make a clang-produced wasm acceptable
+//! to xahaud's SetHook validator.
+//!
+//! xahaud rejects (temMALFORMED) a hook module that exports anything other than
+//! the `hook`/`cbak` FUNCTIONS — in particular it must NOT export `memory`
+//! (the host provides memory) or the compiler's globals. It also wants the
+//! compiler's custom sections (`name`, `producers`, `target_features`) gone.
+//! This was verified on Xahau testnet: a known-good mainnet hook installs, and
+//! our output only installs once these are stripped.
 
 use anyhow::{Context, Result};
 use std::path::Path;
-use walrus::{ExportItem, Module};
+use walrus::{ExportItem, ModuleConfig};
 
 use crate::lint::ALLOWED_EXPORT_FNS as ALLOWED;
 
@@ -16,23 +22,28 @@ pub fn run(input: &Path, output: &Path) -> Result<usize> {
 }
 
 pub fn clean_bytes(wasm: &[u8]) -> Result<(Vec<u8>, usize)> {
-    let mut m = Module::from_buffer(wasm).context("parse wasm")?;
+    // Don't let walrus regenerate the name/producers custom sections on emit.
+    let mut cfg = ModuleConfig::new();
+    cfg.generate_name_section(false);
+    cfg.generate_producers_section(false);
+    let mut m = cfg.parse(wasm).context("parse wasm")?;
 
-    // Collect export ids to remove (can't mutate while iterating).
+    // Keep ONLY the hook/cbak function exports. Everything else — `memory`,
+    // exported globals/tables, linker artifacts — is stripped (xahaud rejects them).
     let to_remove: Vec<_> = m
         .exports
         .iter()
-        .filter(|e| match &e.item {
-            ExportItem::Function(_) => !ALLOWED.contains(&e.name.as_str()),
-            ExportItem::Memory(_) => false, // keep memory
-            _ => true,                       // strip globals/tables exports
-        })
+        .filter(|e| !matches!(&e.item, ExportItem::Function(_)) || !ALLOWED.contains(&e.name.as_str()))
         .map(|e| e.id())
         .collect();
-
     let removed = to_remove.len();
     for id in to_remove {
         m.exports.delete(id);
+    }
+
+    // Drop leftover compiler custom sections (target_features etc.).
+    for name in ["target_features", "producers", "name"] {
+        m.customs.remove_raw(name);
     }
 
     Ok((m.emit_wasm(), removed))

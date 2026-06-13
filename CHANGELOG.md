@@ -3,6 +3,28 @@
 All notable changes to xahc are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); versioning is [SemVer](https://semver.org/).
 
+## [1.5.1] - 2026-06-14
+
+**Critical:** every prior xahc-built hook was rejected on-chain (`temMALFORMED`).
+Found via the first real Xahau testnet deploy; the `agent_guardrail` hook now
+installs and enforces a spending cap on-ledger (see [docs/TESTNET-PROOF.md](docs/TESTNET-PROOF.md)).
+
+### Fixed — SetHook validator acceptance
+- **`build`: `--gc-sections` + export only `hook`/`cbak`** (was `--export-all`).
+  lld left dead functions (e.g. `__wasm_call_ctors`); xahaud validates every
+  function and rejects an unguarded dead one.
+- **`build`: `-Oz` instead of `-O2`.** `-O2` loop rotation moves the `_g` guard
+  out of the position xahaud's guard verifier requires (our lint's presence check
+  passed it; the chain's is position-sensitive). `-Oz` keeps guards in place and
+  yields smaller hooks (lower SetHook fee). A wasm guard-injection pass is the
+  robust long-term fix; `-Oz` is the validated interim.
+- **`clean`: strip the `memory` export and compiler custom sections**
+  (`name`/`producers`/`target_features`). xahaud rejects a hook that exports
+  `memory`.
+- **`sim`: re-add a `memory` export in-memory** before instantiating, since the
+  deployable wasm no longer exports it (the on-disk artifact is untouched).
+- CI: assert built hooks have the on-chain shape (no `memory` export / custom sections).
+
 ## [1.5.0] - 2026-06-13
 
 Agentic payments — the layer-1 safety rail for autonomous agents on Xahau.

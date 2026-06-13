@@ -43,6 +43,16 @@ jobs:
           ./target/release/xahc test examples/over_budget.test.toml
           ./target/release/xahc test examples/agent_guardrail.test.toml
 
+      - name: Built hooks have on-chain shape (no memory export / custom sections)
+        run: |
+          ./target/release/xahc build examples/agent_guardrail.c -o /tmp/shape.wasm
+          for s in memory target_features producers; do
+            if grep -qa "$s" /tmp/shape.wasm; then
+              echo "FAIL: built hook still contains '$s' — xahaud would reject (temMALFORMED)"; exit 1
+            fi
+          done
+          echo "ok: clean on-chain shape"
+
       - name: install-tx HookOn regression (fire-on-Payment)
         run: |
           HO=$(./target/release/xahc install-tx /tmp/firewall.wasm \
