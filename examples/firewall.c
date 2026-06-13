@@ -18,18 +18,10 @@ int64_t hook(uint32_t reserved)
     if (otxn_type() != XAHC_ttPAYMENT)
         XAHC_ACCEPT("not a payment");
 
-    /* Read the amount field (native drops: 8-byte serialized amount). */
-    uint8_t amt[8];
-    XAHC_REQUIRE(otxn_field(XAHC_SBUF(amt), sfAmount) == 8, "amount read");
-
-    /* Decode native drops (clear the sign/native flag bits in byte 0). */
-    uint64_t drops = ((uint64_t)(amt[0] & 0x3F) << 56) |
-                     ((uint64_t)amt[1] << 48) | ((uint64_t)amt[2] << 40) |
-                     ((uint64_t)amt[3] << 32) | ((uint64_t)amt[4] << 24) |
-                     ((uint64_t)amt[5] << 16) | ((uint64_t)amt[6] << 8) |
-                     ((uint64_t)amt[7]);
-
-    XAHC_REQUIRE(drops >= MIN_DROPS, "below minimum");
+    /* Native XAH amount in drops (helper handles the 8-byte STAmount decode). */
+    int64_t drops = xahc_otxn_drops();
+    XAHC_REQUIRE(drops >= 0, "native amount read");
+    XAHC_REQUIRE(drops >= (int64_t)MIN_DROPS, "below minimum");
     XAHC_ACCEPT("ok");
     return 0;
 }
