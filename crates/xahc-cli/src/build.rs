@@ -3,11 +3,16 @@
 //! output matches what xahaud expects (freestanding, no builtins, wasm32).
 
 use anyhow::{bail, Context, Result};
+use include_dir::{include_dir, Dir};
 use owo_colors::OwoColorize;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::{clean, lint};
+
+/// The safe-header library, embedded in the binary so an installed `xahc`
+/// (cargo install / release tarball) is fully self-contained — no repo checkout.
+static HEADERS: Dir = include_dir!("$CARGO_MANIFEST_DIR/../../include");
 
 pub fn run(input: &Path, output: &Path, extra_includes: &[PathBuf], do_lint: bool) -> Result<()> {
     let raw = output.with_extension("raw.wasm");
@@ -22,10 +27,9 @@ pub fn run(input: &Path, output: &Path, extra_includes: &[PathBuf], do_lint: boo
         "-Wl,--export-all",      // export hook/cbak regardless of visibility; clean strips the rest
         "-Wl,--allow-undefined", // host (env) imports resolved by xahaud
     ]);
-    // Bundle our headers automatically if present next to the binary / repo.
-    if let Some(inc) = locate_xahc_include() {
-        cmd.arg(format!("-I{}", inc.display()));
-    }
+    // Headers are embedded in the binary; materialize them and point clang there.
+    let inc = materialize_headers().context("materialize xahc headers")?;
+    cmd.arg(format!("-I{}", inc.display()));
     for inc in extra_includes {
         cmd.arg(format!("-I{}", inc.display()));
     }
@@ -56,15 +60,35 @@ pub fn run(input: &Path, output: &Path, extra_includes: &[PathBuf], do_lint: boo
     Ok(())
 }
 
-/// Look for the include/ dir: env override, then ./include, then ../../include.
-fn locate_xahc_include() -> Option<PathBuf> {
+/// Materialize the embedded headers to a versioned cache dir and return the
+/// include root (so `#include "xahc/xahc.h"` resolves). `XAHC_INCLUDE` overrides
+/// (for developing the headers against a working tree).
+pub fn materialize_headers() -> Result<PathBuf> {
     if let Ok(p) = std::env::var("XAHC_INCLUDE") {
         let p = PathBuf::from(p);
-        if p.is_dir() { return Some(p); }
+        if p.join("xahc/xahc.h").exists() {
+            return Ok(p);
+        }
     }
-    for cand in ["include", "../include", "../../include"] {
-        let p = Path::new(cand).join("xahc");
-        if p.is_dir() { return Some(Path::new(cand).to_path_buf()); }
+    let root = cache_root()
+        .join("xahc")
+        .join(concat!("v", env!("CARGO_PKG_VERSION")))
+        .join("include");
+    if !root.join("xahc/xahc.h").exists() {
+        std::fs::create_dir_all(&root).with_context(|| format!("create {}", root.display()))?;
+        HEADERS.extract(&root).context("extract embedded headers")?;
     }
-    None
+    Ok(root)
+}
+
+fn cache_root() -> PathBuf {
+    if let Ok(x) = std::env::var("XDG_CACHE_HOME") {
+        if !x.is_empty() {
+            return PathBuf::from(x);
+        }
+    }
+    if let Ok(h) = std::env::var("HOME") {
+        return PathBuf::from(h).join(".cache");
+    }
+    std::env::temp_dir()
 }
