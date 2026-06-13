@@ -1,0 +1,16 @@
+[package]
+name = "xahc-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Xahau Hooks, Checked — safe build/clean/lint toolchain for C Hooks"
+
+[[bin]]
+name = "xahc"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+walrus = "0.23"
+owo-colors = "4"
