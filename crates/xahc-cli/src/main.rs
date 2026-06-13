@@ -72,6 +72,12 @@ enum Cmd {
         /// HookNamespace, 64 hex. Default: all-zeros.
         #[arg(long)]
         namespace: Option<String>,
+        /// Derive HookNamespace as sha256(label) instead of raw hex.
+        #[arg(long)]
+        namespace_label: Option<String>,
+        /// HookParameter as nameHex=valueHex (repeatable).
+        #[arg(long = "param")]
+        params: Vec<String>,
         /// testnet | mainnet
         #[arg(long, default_value = "testnet")]
         network: String,
@@ -139,13 +145,15 @@ fn main() -> Result<()> {
         Cmd::New { name, archetype } => {
             scaffold::run(&name, &archetype)?;
         }
-        Cmd::InstallTx { wasm, account, on, namespace, network, flags } => {
+        Cmd::InstallTx { wasm, account, on, namespace, namespace_label, params, network, flags } => {
             let json = installtx::run(&wasm, &installtx::Opts {
                 account: &account,
                 on: on.as_deref(),
                 namespace: namespace.as_deref(),
+                namespace_label: namespace_label.as_deref(),
                 network: &network,
                 flags,
+                params: &params,
             })?;
             println!("{}", json);
             eprintln!("{} UNSIGNED — sign offline (xaman / xrpl-accountlib). Set Fee/Sequence at signing.",

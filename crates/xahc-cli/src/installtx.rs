@@ -82,10 +82,22 @@ fn norm_hex_namespace(s: &str) -> Result<String> {
 
 pub struct Opts<'a> {
     pub account: &'a str,
-    pub on: Option<&'a str>,        // comma list; None = fire on all known types
-    pub namespace: Option<&'a str>, // 64 hex; None = all-zeros
-    pub network: &'a str,           // "testnet" | "mainnet"
-    pub flags: u32,                 // hsfOverride = 1
+    pub on: Option<&'a str>,             // comma list; None = fire on all known types
+    pub namespace: Option<&'a str>,      // 64 hex; None = all-zeros
+    pub namespace_label: Option<&'a str>, // convenience: sha256(label) as namespace
+    pub network: &'a str,                // "testnet" | "mainnet"
+    pub flags: u32,                      // hsfOverride = 1
+    pub params: &'a [String],            // "nameHex=valueHex" pairs -> HookParameters
+}
+
+fn sha256_hex(s: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let d = Sha256::digest(s.as_bytes());
+    d.iter().map(|b| format!("{:02X}", b)).collect()
+}
+
+fn is_hex(s: &str) -> bool {
+    !s.is_empty() && s.len().is_multiple_of(2) && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 pub fn run(wasm: &Path, o: &Opts) -> Result<String> {
@@ -98,10 +110,29 @@ pub fn run(wasm: &Path, o: &Opts) -> Result<String> {
     };
     let hook_on = encode_hook_on(&want);
 
-    let namespace = match o.namespace {
-        Some(ns) => norm_hex_namespace(ns)?,
-        None => "0".repeat(64),
+    let namespace = match (o.namespace, o.namespace_label) {
+        (Some(_), Some(_)) => bail!("pass either --namespace or --namespace-label, not both"),
+        (Some(ns), None) => norm_hex_namespace(ns)?,
+        (None, Some(label)) => sha256_hex(label),
+        (None, None) => "0".repeat(64),
     };
+
+    // HookParameters from "nameHex=valueHex" pairs.
+    let mut params_json = Vec::new();
+    for p in o.params {
+        let (name, value) = p
+            .split_once('=')
+            .with_context(|| format!("--param must be nameHex=valueHex (got `{}`)", p))?;
+        if !is_hex(name) || !is_hex(value) {
+            bail!("--param name and value must be hex (got `{}`)", p);
+        }
+        params_json.push(serde_json::json!({
+            "HookParameter": {
+                "HookParameterName": name.to_uppercase(),
+                "HookParameterValue": value.to_uppercase(),
+            }
+        }));
+    }
 
     let network_id = match o.network {
         "mainnet" => 21337u32,
@@ -109,19 +140,22 @@ pub fn run(wasm: &Path, o: &Opts) -> Result<String> {
         other => bail!("network must be testnet or mainnet (got `{}`)", other),
     };
 
+    let mut hook = serde_json::json!({
+        "CreateCode": create_code,
+        "HookOn": hook_on,
+        "HookNamespace": namespace,
+        "HookApiVersion": 0,
+        "Flags": o.flags,
+    });
+    if !params_json.is_empty() {
+        hook["HookParameters"] = serde_json::Value::Array(params_json);
+    }
+
     let tx = serde_json::json!({
         "TransactionType": "SetHook",
         "Account": o.account,
         "NetworkID": network_id,
-        "Hooks": [{
-            "Hook": {
-                "CreateCode": create_code,
-                "HookOn": hook_on,
-                "HookNamespace": namespace,
-                "HookApiVersion": 0,
-                "Flags": o.flags,
-            }
-        }]
+        "Hooks": [{ "Hook": hook }]
     });
 
     Ok(serde_json::to_string_pretty(&tx)?)

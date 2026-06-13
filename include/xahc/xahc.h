@@ -17,6 +17,7 @@
 #include "guard.h"
 #include "check.h"
 #include "otxn.h"
+#include "param.h"
 #include "state.h"
 #include "emit/payment.h"
 
