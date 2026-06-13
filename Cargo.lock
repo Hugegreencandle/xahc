@@ -1878,6 +1878,7 @@ dependencies = [
  "clap",
  "owo-colors",
  "serde",
+ "serde_json",
  "toml",
  "walrus",
  "wasmtime",

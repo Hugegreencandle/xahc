@@ -48,7 +48,7 @@ intentionally thin local preflights, not a competing analysis engine.
 
 ```
 include/xahc/      Layer 0 — header-only safe C lib (guard, check, otxn, state, emit, sfcodes)
-crates/xahc-cli/   Layer 1 — Rust CLI: build · clean · lint · sim · test
+crates/xahc-cli/   Layer 1 — Rust CLI: build · clean · lint · sim · test · install-tx
 scripts/           verify-emit.mjs · verify-emit-vm.mjs — codec/VM round-trips
 examples/          *.c hooks + *.test.toml suites
 ```
@@ -106,6 +106,12 @@ xahau-mcp; xahc does not chase it.
   for xahau-mcp's `execute_hook`
 - **test** ✅ `xahc test x.toml` — declarative, asserted suites over sim (outcome +
   emit/state-count assertions), nonzero exit on failure, CI-wired
+- **install-tx** ✅ `xahc install-tx x.wasm --account r... [--on Payment,Invoke]` — emits
+  an UNSIGNED SetHook. HookOn (the inverted active-low mask) is computed and **verified
+  byte-for-byte against xahau-mcp's encoder** across all type sets
+- **lint: stack budget** ✅ reads each function's frame size, walks the call graph, warns
+  if the deepest chain exceeds the available stack (hooks have no heap) — catches the
+  "big array on the stack" overflow before deploy
 - **emit-verify** ✅ two paths: offline codec round-trip (`scripts/verify-emit.mjs`, native)
   and VM round-trip (`scripts/verify-emit-vm.mjs`, needs a xahau-mcp checkout — for XFL/IOU)
 - **next** — more typed `otxn`/`state` accessors; richer scaffolds; publish to a
@@ -141,6 +147,23 @@ $ xahc test firewall.test.toml
   ✓ above floor accepts       ACCEPT code=25 emits=0
 4 passed, 0 failed
 ```
+
+### Deploying a hook
+
+`install-tx` turns a built `.wasm` into a ready-to-sign **SetHook** transaction —
+including the correct `HookOn` bitmap, which is notoriously easy to get wrong:
+
+```sh
+xahc install-tx firewall.wasm \
+  --account rEXAMPLE... \
+  --on Payment,Invoke         # default: fire on all types
+# -> unsigned SetHook JSON (CreateCode, HookOn, HookNamespace, NetworkID)
+```
+
+Output is **unsigned** — sign offline (xaman / `xrpl-accountlib`); set `Fee`/`Sequence`
+at signing. `HookOn` is verified byte-for-byte against xahau-mcp's encoder. For a
+pre-flight security audit of the hook before you install it, run the wasm through
+xahau-mcp's `analyze_hook`.
 
 ### Emit verification
 

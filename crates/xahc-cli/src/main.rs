@@ -3,6 +3,7 @@
 
 mod build;
 mod clean;
+mod installtx;
 mod lint;
 mod sim;
 mod test;
@@ -55,6 +56,27 @@ enum Cmd {
     },
     /// Run a declarative TOML test suite against a hook (sim-based).
     Test { file: PathBuf },
+    /// Emit an UNSIGNED SetHook tx to install a built .wasm on an account.
+    #[command(name = "install-tx")]
+    InstallTx {
+        /// The built hook .wasm
+        wasm: PathBuf,
+        /// Account the hook installs on (r-address)
+        #[arg(long)]
+        account: String,
+        /// Comma list of tx types to fire on (names or numbers). Default: all.
+        #[arg(long)]
+        on: Option<String>,
+        /// HookNamespace, 64 hex. Default: all-zeros.
+        #[arg(long)]
+        namespace: Option<String>,
+        /// testnet | mainnet
+        #[arg(long, default_value = "testnet")]
+        network: String,
+        /// Hook Flags (1 = hsfOverride, replace existing hook in slot)
+        #[arg(long, default_value_t = 1)]
+        flags: u32,
+    },
 }
 
 fn main() -> Result<()> {
@@ -98,6 +120,18 @@ fn main() -> Result<()> {
         }
         Cmd::Test { file } => {
             test::run(&file)?;
+        }
+        Cmd::InstallTx { wasm, account, on, namespace, network, flags } => {
+            let json = installtx::run(&wasm, &installtx::Opts {
+                account: &account,
+                on: on.as_deref(),
+                namespace: namespace.as_deref(),
+                network: &network,
+                flags,
+            })?;
+            println!("{}", json);
+            eprintln!("{} UNSIGNED — sign offline (xaman / xrpl-accountlib). Set Fee/Sequence at signing.",
+                "note:".yellow().bold());
         }
     }
     Ok(())

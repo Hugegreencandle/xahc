@@ -103,6 +103,9 @@ pub fn lint(wasm: &[u8]) -> Result<Vec<Finding>> {
         f.extend(check_guards(&m, g));
     }
 
+    // 5. Stack budget: hooks have no heap; deep/large stack frames overflow.
+    f.extend(check_stack(&m));
+
     Ok(f)
 }
 
@@ -160,6 +163,165 @@ fn walk_seq(lf: &LocalFunction, seq: InstrSeqId, g: FunctionId, label: &str, out
             _ => {}
         }
     }
+}
+
+/// Heuristic stack-budget analysis: hooks get no heap, so a deep call chain of
+/// large stack frames overflows into data/heap and corrupts execution. We read
+/// each function's frame size from its prologue (sp = sp - N), walk the call
+/// graph for the deepest cumulative frame, and compare to the available stack
+/// region (stack-pointer init - end of data).
+fn check_stack(m: &Module) -> Vec<Finding> {
+    use walrus::ConstExpr;
+    use walrus::ir::Value;
+
+    let mut out = Vec::new();
+
+    // Stack pointer = the mutable i32 global with the largest constant init.
+    let mut sp: Option<(walrus::GlobalId, i64)> = None;
+    for g in m.globals.iter() {
+        if g.ty == walrus::ValType::I32 && g.mutable {
+            if let walrus::GlobalKind::Local(ConstExpr::Value(Value::I32(v))) = &g.kind {
+                let v = *v as i64;
+                if sp.map_or(true, |(_, cur)| v > cur) {
+                    sp = Some((g.id(), v));
+                }
+            }
+        }
+    }
+    let (sp_id, sp_init) = match sp {
+        Some(x) => x,
+        None => return out, // no detectable stack pointer; skip silently
+    };
+
+    // End of static data = max(offset + len) over active data segments.
+    let mut data_end: i64 = 0;
+    for d in m.data.iter() {
+        if let walrus::DataKind::Active { offset: ConstExpr::Value(Value::I32(off)), .. } = &d.kind {
+            data_end = data_end.max(*off as i64 + d.value.len() as i64);
+        }
+    }
+    let available = (sp_init - data_end).max(0);
+    if available == 0 {
+        return out;
+    }
+
+    // Per-function frame size from prologue: sp_init pattern global.get(sp) ...
+    // i32.const N ... i32.sub ... global.set(sp). Take the const feeding the sub.
+    let frame_size = |lf: &LocalFunction| -> u32 {
+        let seq = lf.block(lf.entry_block());
+        let mut saw_sp_get = false;
+        let mut last_const: i64 = 0;
+        let mut candidate: u32 = 0;
+        for (instr, _) in seq.instrs.iter() {
+            match instr {
+                Instr::GlobalGet(gg) if gg.global == sp_id => saw_sp_get = true,
+                Instr::Const(c) => {
+                    if let Value::I32(n) = c.value { last_const = n as i64; }
+                }
+                Instr::Binop(b) if matches!(b.op, walrus::ir::BinaryOp::I32Sub) => {
+                    if saw_sp_get && last_const > 0 {
+                        candidate = candidate.max(last_const as u32);
+                    }
+                }
+                _ => {}
+            }
+        }
+        candidate
+    };
+
+    // Build frame map + call edges (local callees only).
+    let mut frames: std::collections::HashMap<FunctionId, u32> = Default::default();
+    let mut edges: std::collections::HashMap<FunctionId, Vec<FunctionId>> = Default::default();
+    for func in m.funcs.iter() {
+        if let FunctionKind::Local(lf) = &func.kind {
+            frames.insert(func.id(), frame_size(lf));
+            let mut callees = Vec::new();
+            collect_calls(lf, lf.entry_block(), &mut callees);
+            edges.insert(func.id(), callees);
+        }
+    }
+
+    // Deepest cumulative frame from each root, with cycle (recursion) detection.
+    let mut recursion = false;
+    let mut memo: std::collections::HashMap<FunctionId, u32> = Default::default();
+    let mut deepest = 0u32;
+    let roots: Vec<FunctionId> = m
+        .exports
+        .iter()
+        .filter_map(|e| match e.item {
+            ExportItem::Function(fid) if e.name == "hook" || e.name == "cbak" => Some(fid),
+            _ => None,
+        })
+        .collect();
+    for r in roots {
+        let mut stack = std::collections::HashSet::new();
+        deepest = deepest.max(deepest_chain(r, &frames, &edges, &mut memo, &mut stack, &mut recursion));
+    }
+
+    if recursion {
+        out.push(Finding::warn(
+            "recursion detected in call graph — stack-budget analysis is unbounded; hooks should not recurse",
+        ));
+    }
+    let pct = (deepest as f64 / available as f64) * 100.0;
+    if deepest as i64 > available {
+        out.push(Finding::warn(format!(
+            "stack may overflow: deepest call chain ~{} bytes > available stack {} bytes (sp_init {} - data {})",
+            deepest, available, sp_init, data_end
+        )));
+    } else if pct >= 80.0 {
+        out.push(Finding::warn(format!(
+            "stack usage high: deepest call chain ~{} bytes is {:.0}% of {} available",
+            deepest, pct, available
+        )));
+    }
+    out
+}
+
+fn collect_calls(lf: &LocalFunction, seq: InstrSeqId, out: &mut Vec<FunctionId>) {
+    for (instr, _) in lf.block(seq).instrs.iter() {
+        match instr {
+            Instr::Call(c) => out.push(c.func),
+            Instr::Loop(l) => collect_calls(lf, l.seq, out),
+            Instr::Block(b) => collect_calls(lf, b.seq, out),
+            Instr::IfElse(ie) => {
+                collect_calls(lf, ie.consequent, out);
+                collect_calls(lf, ie.alternative, out);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn deepest_chain(
+    f: FunctionId,
+    frames: &std::collections::HashMap<FunctionId, u32>,
+    edges: &std::collections::HashMap<FunctionId, Vec<FunctionId>>,
+    memo: &mut std::collections::HashMap<FunctionId, u32>,
+    on_stack: &mut std::collections::HashSet<FunctionId>,
+    recursion: &mut bool,
+) -> u32 {
+    let own = *frames.get(&f).unwrap_or(&0);
+    if on_stack.contains(&f) {
+        *recursion = true;
+        return own; // break the cycle
+    }
+    if let Some(&v) = memo.get(&f) {
+        return v;
+    }
+    on_stack.insert(f);
+    let mut max_child = 0u32;
+    if let Some(cs) = edges.get(&f) {
+        for &c in cs {
+            if frames.contains_key(&c) {
+                max_child = max_child.max(deepest_chain(c, frames, edges, memo, on_stack, recursion));
+            }
+        }
+    }
+    on_stack.remove(&f);
+    let total = own.saturating_add(max_child);
+    memo.insert(f, total);
+    total
 }
 
 pub fn report(findings: &[Finding]) {
