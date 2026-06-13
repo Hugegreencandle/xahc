@@ -246,6 +246,24 @@ mod tests {
         assert!(parse_types("NotAType").is_err());
     }
 
+    /// Shared cross-repo contract: every vector's HookOn hex must be exactly what
+    /// our encoder produces for its tx-type set. xahau-mcp runs the mirror test
+    /// (decode(hex).firesOn == names) over the SAME file, so the two independent
+    /// implementations stay coupled without either importing the other.
+    #[test]
+    fn hookon_shared_vectors() {
+        let raw = include_str!("../../../hookon-vectors.json");
+        let v: serde_json::Value = serde_json::from_str(raw).expect("parse hookon-vectors.json");
+        let vectors = v["vectors"].as_array().expect("vectors array");
+        assert!(!vectors.is_empty());
+        for vec in vectors {
+            let names: Vec<&str> = vec["names"].as_array().unwrap().iter().map(|n| n.as_str().unwrap()).collect();
+            let hex = vec["hex"].as_str().unwrap();
+            let want = parse_types(&names.join(",")).unwrap();
+            assert_eq!(encode_hook_on(&want), hex, "HookOn encode mismatch for {:?}", names);
+        }
+    }
+
     #[test]
     fn namespace_validation() {
         assert!(norm_hex_namespace(&"0".repeat(64)).is_ok());
