@@ -1,4 +1,7 @@
 # xahc v0.1.0 demo — render with: vhs scripts/demo.tape
+# Produces the launch GIF. Pairs with the plain-English opener:
+#   "What this actually does, minus the jargon: a Hook is a tiny program
+#    that controls money on Xahau — xahc checks it before a cent moves."
 Output "/Users/danebrown/Desktop/xahc-demo.gif"
 
 Set Shell zsh
