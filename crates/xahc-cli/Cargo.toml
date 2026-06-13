@@ -3,7 +3,11 @@ name = "xahc-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Xahau Hooks, Checked — safe build/clean/lint toolchain for C Hooks"
+repository.workspace = true
+description = "Xahau Hooks, Checked — authoring/compile toolchain for C Hooks (build, lint, sim, test, install-tx)"
+keywords = ["xahau", "hooks", "xrpl", "wasm", "blockchain"]
+categories = ["command-line-utilities", "development-tools", "cryptography::cryptocurrencies"]
+readme = "../../README.md"
 
 [[bin]]
 name = "xahc"

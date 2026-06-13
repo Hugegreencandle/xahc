@@ -47,8 +47,8 @@ intentionally thin local preflights, not a competing analysis engine.
 ## Layout
 
 ```
-include/xahc/      Layer 0 — header-only safe C lib (guard, check, otxn, state, emit, sfcodes)
-crates/xahc-cli/   Layer 1 — Rust CLI: build · clean · lint · sim · test · install-tx
+include/xahc/      Layer 0 — header-only safe C lib (guard, check, otxn, param, state, emit, sfcodes)
+crates/xahc-cli/   Layer 1 — Rust CLI (headers embedded): build · clean · lint · sim · test · install-tx · doctor · new
 scripts/           verify-emit.mjs · verify-emit-vm.mjs — codec/VM round-trips
 examples/          *.c hooks + *.test.toml suites
 ```
@@ -57,23 +57,49 @@ The CLI's job is **build + clean** (the part nothing else does). `lint` and `sim
 are convenience preflights for fast local feedback; for authoritative analysis and
 VM execution, pipe the `.wasm` to [xahau-mcp](https://github.com/Hugegreencandle/xahau-mcp).
 
-## Prerequisites
+## Install
 
-- **Rust** (for the CLI): `curl https://sh.rustup.rs -sSf | sh`
-- **wasm-capable LLVM** (for compiling hooks): LLVM with `wasm-ld`.
-  Apple's `/usr/bin/clang` won't work. Install: `brew install llvm` then ensure
-  `/opt/homebrew/opt/llvm/bin` is on PATH, or use the Xahau Hooks Builder docker image.
-
-## Usage
+Download a binary from [Releases](https://github.com/Hugegreencandle/xahc/releases)
+(macOS arm64 / Linux x86_64) and drop it on your PATH:
 
 ```sh
-cargo build --release                       # builds the `xahc` binary
-export PATH="$PWD/target/release:$PATH"
-
-xahc build examples/firewall.c -o firewall.wasm   # clang -> clean -> lint
-xahc lint  firewall.wasm                            # static checks only
-xahc clean some.wasm -o some.clean.wasm             # strip stray exports
+tar -xzf xahc-<platform>.tar.gz && sudo mv xahc /usr/local/bin/
 ```
+
+or build from source: `cargo build --release` (binary at `target/release/xahc`).
+
+The headers are **embedded in the binary** — no repo checkout needed. Compiling
+hooks also needs a wasm-capable LLVM:
+
+```sh
+brew install llvm lld      # macOS  (add their bin dirs to PATH)
+apt install clang lld      # Debian/Ubuntu
+xahc doctor                # verify the toolchain
+```
+
+## Quick start
+
+```sh
+xahc doctor                          # check clang/wasm-ld
+xahc new myhook                      # scaffold a project (firewall archetype)
+cd myhook
+xahc build myhook.c -o myhook.wasm   # compile -> clean -> lint
+xahc test myhook.test.toml           # run the assertions
+xahc install-tx myhook.wasm --account rYOURACCT --on Payment   # unsigned SetHook
+```
+
+## Commands
+
+| Command | Does |
+|---|---|
+| `doctor` | Verify clang + wasm-ld; compile a hook end-to-end |
+| `new <name> [--archetype]` | Scaffold a buildable project (firewall / accept_all / emitter) |
+| `build <in.c> -o <out.wasm>` | clang→wasm → clean → lint |
+| `clean <wasm>` | Strip stray exports (Rust hook-cleaner) |
+| `lint <wasm>` | Exports + Hook-API imports + per-loop guards + stack budget |
+| `sim <wasm> --tt --drops` | Local wasmtime run → accept/rollback, emits, state |
+| `test <suite.toml>` | Declarative asserted test suite over sim |
+| `install-tx <wasm> --account r…` | Emit an UNSIGNED SetHook (HookOn/namespace/params) |
 
 Write a hook:
 
@@ -192,12 +218,13 @@ failing assertion points straight at the line that fired.
 
 ## Status
 
-Pre-alpha. Verified end-to-end on macOS (Homebrew LLVM+lld, Rust) and in CI:
-examples compile, clean, lint, and simulate correctly. Both emit builders are
-verified: **native XAH** round-trips through xahau-mcp's chain-validated codec to
-exactly `Amount: "1000000"` (1 XAH); **issued/IOU** executes in xahau-mcp's VM
-(real XFL) and emits `{value:"1.5",currency:"USD",...}` — non-degraded. Not audited;
-always confirm financial hooks on testnet before mainnet.
+**v1.0.0.** Self-contained binary (embedded headers), clean clippy + unit tests,
+green CI. Both emit builders are verified: **native XAH** round-trips through
+xahau-mcp's chain-validated codec to exactly `Amount: "1000000"` (1 XAH);
+**issued/IOU** executes in xahau-mcp's VM (real XFL) and emits
+`{value:"1.5",currency:"USD",...}` — non-degraded. `install-tx`'s HookOn is verified
+byte-for-byte against xahau-mcp's encoder. Not audited; always confirm financial
+hooks on testnet before mainnet. See [CHANGELOG](CHANGELOG.md).
 
 ## License
 
