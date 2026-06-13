@@ -58,7 +58,10 @@ fn mem_of(caller: &mut Caller<'_, Ctx>) -> Result<Memory> {
         .ok_or_else(|| anyhow!("hook exports no memory"))
 }
 
-pub fn run(path: &Path, tx: TxFixture) -> Result<(Outcome, Vec<Vec<u8>>, HashMap<Vec<u8>, Vec<u8>>)> {
+/// (outcome, emitted txn blobs, state writes key->value).
+pub type SimResult = (Outcome, Vec<Vec<u8>>, HashMap<Vec<u8>, Vec<u8>>);
+
+pub fn run(path: &Path, tx: TxFixture) -> Result<SimResult> {
     let engine = Engine::default();
     let module = Module::from_file(&engine, path).with_context(|| format!("load {}", path.display()))?;
     let mut store = Store::new(&engine, Ctx { tx, state: HashMap::new(), emitted: vec![], outcome: None });
@@ -94,7 +97,9 @@ pub fn run(path: &Path, tx: TxFixture) -> Result<(Outcome, Vec<Vec<u8>>, HashMap
                 // native amount, 8 bytes, positive (0x40 bit), "not-XRP" bit (0x80) cleared
                 let mut b = [0u8; 8];
                 b[0] = 0x40 | (((d >> 56) & 0x3F) as u8);
-                for i in 1..8 { b[i] = (d >> (56 - 8 * i)) as u8; }
+                for (i, slot) in b.iter_mut().enumerate().skip(1) {
+                    *slot = (d >> (56 - 8 * i)) as u8;
+                }
                 b.to_vec()
             }
             SF_ACCOUNT => c.data().tx.account.to_vec(),

@@ -23,9 +23,11 @@ jobs:
       - name: Build CLI
         run: cargo build --release
 
-      - name: Clippy
+      - name: Clippy (blocking)
         run: cargo clippy --release -- -D warnings
-        continue-on-error: true
+
+      - name: Unit tests
+        run: cargo test --release
 
       - name: Build all examples (compile -> clean -> lint)
         run: |

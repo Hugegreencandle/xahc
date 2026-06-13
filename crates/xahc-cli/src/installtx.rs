@@ -126,3 +126,59 @@ pub fn run(wasm: &Path, o: &Opts) -> Result<String> {
 
     Ok(serde_json::to_string_pretty(&tx)?)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn want(names: &[&str]) -> HashSet<u32> {
+        names
+            .iter()
+            .map(|n| TX_TYPES.iter().find(|(x, _)| x == n).unwrap().1)
+            .collect()
+    }
+
+    // Derivation: start all-ones; clear bit N to fire (active-low), except SetHook
+    // (bit 22) which is active-high. Bit 22 lives in byte 29 (from MSB), bit 6 ->
+    // 0xFF & !0x40 = 0xBF. Bit 0 (Payment) is byte 31 bit 0 -> 0xFE.
+    #[test]
+    fn hookon_empty_fires_nothing() {
+        // nothing wanted -> all set, SetHook cleared -> ...BFFFFF
+        assert_eq!(encode_hook_on(&HashSet::new()), format!("{}BFFFFF", "F".repeat(58)));
+    }
+
+    #[test]
+    fn hookon_payment() {
+        assert_eq!(encode_hook_on(&want(&["Payment"])), format!("{}BFFFFE", "F".repeat(58)));
+    }
+
+    #[test]
+    fn hookon_sethook_only() {
+        // SetHook wanted (bit stays set, active-high) and nothing else -> all F
+        assert_eq!(encode_hook_on(&want(&["SetHook"])), "F".repeat(64));
+    }
+
+    #[test]
+    fn hookon_is_64_hex() {
+        assert_eq!(encode_hook_on(&all_type_values()).len(), 64);
+    }
+
+    #[test]
+    fn parse_types_names_and_numbers() {
+        let got = parse_types("Payment, 99").unwrap();
+        let exp: HashSet<u32> = [0u32, 99].into_iter().collect();
+        assert_eq!(got, exp);
+    }
+
+    #[test]
+    fn parse_types_unknown_errs() {
+        assert!(parse_types("NotAType").is_err());
+    }
+
+    #[test]
+    fn namespace_validation() {
+        assert!(norm_hex_namespace(&"0".repeat(64)).is_ok());
+        assert!(norm_hex_namespace("zz").is_err());
+        assert!(norm_hex_namespace(&"0".repeat(63)).is_err());
+    }
+}

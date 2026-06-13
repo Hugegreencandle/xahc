@@ -182,7 +182,7 @@ fn check_stack(m: &Module) -> Vec<Finding> {
         if g.ty == walrus::ValType::I32 && g.mutable {
             if let walrus::GlobalKind::Local(ConstExpr::Value(Value::I32(v))) = &g.kind {
                 let v = *v as i64;
-                if sp.map_or(true, |(_, cur)| v > cur) {
+                if sp.is_none_or(|(_, cur)| v > cur) {
                     sp = Some((g.id(), v));
                 }
             }
@@ -218,10 +218,12 @@ fn check_stack(m: &Module) -> Vec<Finding> {
                 Instr::Const(c) => {
                     if let Value::I32(n) = c.value { last_const = n as i64; }
                 }
-                Instr::Binop(b) if matches!(b.op, walrus::ir::BinaryOp::I32Sub) => {
-                    if saw_sp_get && last_const > 0 {
-                        candidate = candidate.max(last_const as u32);
-                    }
+                Instr::Binop(b)
+                    if matches!(b.op, walrus::ir::BinaryOp::I32Sub)
+                        && saw_sp_get
+                        && last_const > 0 =>
+                {
+                    candidate = candidate.max(last_const as u32);
                 }
                 _ => {}
             }

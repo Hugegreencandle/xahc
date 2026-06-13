@@ -95,10 +95,7 @@ pub fn run(path: &Path) -> Result<()> {
 }
 
 /// Returns (passed, human-readable detail).
-fn check(
-    c: &Case,
-    result: Result<(sim::Outcome, Vec<Vec<u8>>, HashMap<Vec<u8>, Vec<u8>>)>,
-) -> (bool, String) {
+fn check(c: &Case, result: Result<sim::SimResult>) -> (bool, String) {
     let (outcome, emitted, state) = match result {
         Ok(t) => t,
         Err(e) => return (false, format!("sim error: {}", e)),
@@ -154,11 +151,44 @@ fn parse_field_id(key: &str) -> Result<u32> {
 
 fn parse_hex(s: &str) -> Result<Vec<u8>> {
     let s = s.trim().trim_start_matches("0x");
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         bail!("odd-length hex");
     }
     (0..s.len())
         .step_by(2)
         .map(|i| u8::from_str_radix(&s[i..i + 2], 16).context("hex byte"))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn field_id_numeric() {
+        assert_eq!(parse_field_id("2.14").unwrap(), (2 << 16) + 14);
+        assert_eq!(parse_field_id("6.1").unwrap(), (6 << 16) + 1);
+    }
+
+    #[test]
+    fn field_id_alias() {
+        assert_eq!(parse_field_id("sfAmount").unwrap(), (6 << 16) + 1);
+        assert_eq!(parse_field_id("sfDestinationTag").unwrap(), (2 << 16) + 14);
+    }
+
+    #[test]
+    fn field_id_unknown_errs() {
+        assert!(parse_field_id("nope").is_err());
+    }
+
+    #[test]
+    fn hex_roundtrip() {
+        assert_eq!(parse_hex("0AfF").unwrap(), vec![0x0a, 0xff]);
+        assert_eq!(parse_hex("0x00").unwrap(), vec![0]);
+    }
+
+    #[test]
+    fn hex_odd_errs() {
+        assert!(parse_hex("abc").is_err());
+    }
 }
