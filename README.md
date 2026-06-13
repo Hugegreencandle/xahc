@@ -67,14 +67,28 @@ int64_t hook(uint32_t reserved) {
 - **M1** guard auto-numbering + checked returns (done in headers; needs on-chain test)
 - **M2** lint: export + import allowlists, guard-presence
 - **M3** typed emit builders (Payment done; IOU/trustline next) + typed otxn/state
-- **M1.5** *(moat)* CFG dominance proof — statically prove every `loop` is guarded
-- **Phase 2** local simulator: run hooks in wasmtime with mocked host fns, unit-test
-  emitted txns + state without testnet
+- **Phase 2** ✅ local simulator (MVP): `xahc sim` runs a hook in wasmtime with
+  mocked host fns and reports accept/rollback + emitted txns + state writes — no testnet
+- **M1.5** *(moat, next)* CFG dominance proof — statically prove every `loop` is guarded
+- **Phase 2+** sim: JSON tx fixtures, IOU amounts, assertion DSL, `#[test]` harness
+
+### Simulator
+
+```sh
+xahc sim firewall.wasm --tt 0 --drops 5000000    # -> ROLLBACK (below 10 XAH floor)
+xahc sim firewall.wasm --tt 0 --drops 20000000   # -> ACCEPT
+xahc sim firewall.wasm --tt 99                     # -> ACCEPT (not a payment)
+```
+
+Rollback/accept codes are the source line numbers (from `__LINE__`), so a
+failing assertion points straight at the line that fired.
 
 ## Status
 
-Pre-alpha scaffold. The emit serialization offsets and the Hook API import list
-need verification against a live `xahaud` before trusting on mainnet. Not audited.
+Pre-alpha. Verified end-to-end on macOS (Homebrew LLVM+lld, Rust): firewall
+example compiles, cleans, lints, and simulates correctly both sides of its
+threshold. The emit serialization offsets (`emit/payment.h`) still need a diff
+against a live `xahaud` emit before mainnet use. Not audited.
 
 ## License
 

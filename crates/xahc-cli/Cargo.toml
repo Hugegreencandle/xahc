@@ -14,3 +14,4 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 walrus = "0.23"
 owo-colors = "4"
+wasmtime = "27"

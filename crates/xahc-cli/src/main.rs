@@ -4,6 +4,7 @@
 mod build;
 mod clean;
 mod lint;
+mod sim;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -41,6 +42,16 @@ enum Cmd {
     },
     /// Static-check a .wasm: export allowlist, import allowlist, guard presence.
     Lint { input: PathBuf },
+    /// Simulate a hook against a synthetic transaction (no testnet).
+    Sim {
+        input: PathBuf,
+        /// Transaction type (0 = Payment)
+        #[arg(long, default_value_t = 0)]
+        tt: i64,
+        /// Native amount in drops (sfAmount)
+        #[arg(long, default_value_t = 0)]
+        drops: u64,
+    },
 }
 
 fn main() -> Result<()> {
@@ -61,6 +72,21 @@ fn main() -> Result<()> {
             lint::report(&findings);
             if findings.iter().any(|f| f.level == lint::Level::Error) {
                 std::process::exit(1);
+            }
+        }
+        Cmd::Sim { input, tt, drops } => {
+            let tx = sim::TxFixture { tt, drops, ..Default::default() };
+            let (outcome, emitted, state) = sim::run(&input, tx)?;
+            let label = match &outcome {
+                sim::Outcome::Accept(c) => format!("{} (code {})", "ACCEPT".green().bold(), c),
+                sim::Outcome::Rollback(c) => format!("{} (code {})", "ROLLBACK".red().bold(), c),
+                sim::Outcome::Returned(c) => format!("{} (rc {})", "RETURNED".yellow().bold(), c),
+            };
+            println!("outcome:  {}", label);
+            println!("emitted:  {} txn(s)", emitted.len());
+            println!("state:    {} key(s) written", state.len());
+            if matches!(outcome, sim::Outcome::Rollback(_)) {
+                std::process::exit(2);
             }
         }
     }
