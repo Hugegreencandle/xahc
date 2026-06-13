@@ -33,6 +33,15 @@ intentionally thin local preflights, not a competing analysis engine.
 > exactly `Amount: "1000000"`, valid `Account`/`Destination` r-addresses, offline.
 > See [`scripts/verify-emit.mjs`](scripts/verify-emit.mjs).
 
+## Agentic payments
+
+AI agents are starting to settle value autonomously. xahc builds the **layer-1
+safety rail**: a Hook that caps an agent's per-tx spend and locks its
+destinations, enforced by the ledger — the control x402/app-layer flows lack.
+`xahc new x --archetype agent_guardrail`, or use the
+[`xahc-guardrail` skill](skills/xahc-guardrail/SKILL.md). See
+[docs/AGENTIC.md](docs/AGENTIC.md) and [docs/X402-XAHAU.md](docs/X402-XAHAU.md).
+
 ## What it removes (real footguns, from the stock macros)
 
 | Footgun | Stock | xahc |
@@ -93,7 +102,7 @@ xahc install-tx myhook.wasm --account <rYourAccount> --on Payment   # unsigned S
 | Command | Does |
 |---|---|
 | `doctor` | Verify clang + wasm-ld; compile a hook end-to-end |
-| `new <name> [--archetype]` | Scaffold a buildable project (firewall / accept_all / emitter) |
+| `new <name> [--archetype]` | Scaffold a buildable project (firewall / accept_all / emitter / agent_guardrail) |
 | `build <in.c> -o <out.wasm>` | clang→wasm → clean → lint |
 | `clean <wasm>` | Strip stray exports (Rust hook-cleaner) |
 | `lint <wasm>` | Exports + Hook-API imports + per-loop guards + stack budget |

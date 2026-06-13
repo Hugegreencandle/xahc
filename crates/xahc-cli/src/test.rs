@@ -52,6 +52,9 @@ struct Case {
     /// Optional explicit otxn fields: "sfName" or "type.field" -> hex value.
     #[serde(default)]
     fields: HashMap<String, String>,
+    /// Optional install-time hook parameters: ASCII name -> hex value.
+    #[serde(default)]
+    hook_params: HashMap<String, String>,
 }
 
 /// Run the suite and collect results. Printing + exit code live in the caller
@@ -90,6 +93,12 @@ pub fn run(path: &Path) -> Result<TestSummary> {
             let fid = parse_field_id(k).with_context(|| format!("case `{}`: bad field key `{}`", c.name, k))?;
             let bytes = parse_hex(v).with_context(|| format!("case `{}`: bad hex for `{}`", c.name, k))?;
             fixture.fields.insert(fid, bytes);
+        }
+        for (k, v) in &c.hook_params {
+            // key is the ASCII parameter name (matches the bytes the hook reads);
+            // value is hex.
+            let bytes = parse_hex(v).with_context(|| format!("case `{}`: bad hex for hook_param `{}`", c.name, k))?;
+            fixture.hook_params.insert(k.as_bytes().to_vec(), bytes);
         }
 
         let result = sim::run(&wasm_path, fixture);

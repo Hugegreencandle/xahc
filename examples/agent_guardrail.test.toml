@@ -1,0 +1,32 @@
+build = "agent_guardrail.c"
+
+# sfAccount AAAA... == the sim's hook_account (0xAA*20) -> marks an OUTGOING payment.
+# LIM = 0x0000000000989680 = 10,000,000 drops (10 XAH) per-tx cap.
+
+[[case]]
+name = "outgoing within limit accepts"
+tt = 0
+drops = 5000000
+fields = { sfAccount = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" }
+hook_params = { LIM = "0000000000989680" }
+expect = "accept"
+
+[[case]]
+name = "outgoing over limit rolls back"
+tt = 0
+drops = 20000000
+fields = { sfAccount = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" }
+hook_params = { LIM = "0000000000989680" }
+expect = "rollback"
+
+[[case]]
+name = "incoming payment passes (not policed)"
+tt = 0
+drops = 99000000
+fields = { sfAccount = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB" }
+expect = "accept"
+
+[[case]]
+name = "non-payment passes"
+tt = 99
+expect = "accept"

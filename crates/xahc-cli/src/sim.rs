@@ -23,6 +23,8 @@ pub struct TxFixture {
     /// Explicit field overrides: sfcode (field-id) -> raw serialized value bytes.
     /// Takes priority over the convenience fields above.
     pub fields: std::collections::HashMap<u32, Vec<u8>>,
+    /// Install-time hook parameters: name bytes -> value bytes (for hook_param).
+    pub hook_params: std::collections::HashMap<Vec<u8>, Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -144,6 +146,20 @@ fn run_inner(path: &Path, tx: TxFixture) -> wasmtime::Result<SimResult> {
         Ok(20)
     })?;
     linker.func_wrap("env", "ledger_seq", |_c: Caller<'_, Ctx>| -> i64 { 1_000_000 })?;
+
+    // Install-time hook parameters: key bytes -> value bytes.
+    linker.func_wrap("env", "hook_param", |mut c: Caller<'_, Ctx>, wptr: i32, wlen: i32, rptr: i32, rlen: i32| -> wasmtime::Result<i64> {
+        let mem = mem_of(&mut c)?;
+        let mut key = vec![0u8; rlen.max(0) as usize];
+        mem.read(&c, rptr as usize, &mut key)?;
+        let val = match c.data().tx.hook_params.get(&key) {
+            Some(v) => v.clone(),
+            None => return Ok(-29), // DOESNT_EXIST
+        };
+        if (wlen as usize) < val.len() { return Ok(-4); }
+        mem.write(&mut c, wptr as usize, &val)?;
+        Ok(val.len() as i64)
+    })?;
 
     // In-memory hook state.
     linker.func_wrap("env", "state_set", |mut c: Caller<'_, Ctx>, rptr: i32, rlen: i32, kptr: i32, klen: i32| -> wasmtime::Result<i64> {

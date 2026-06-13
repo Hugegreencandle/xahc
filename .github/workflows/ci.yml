@@ -41,6 +41,7 @@ jobs:
           ./target/release/xahc test examples/firewall.test.toml
           ./target/release/xahc test examples/emit_payment.test.toml
           ./target/release/xahc test examples/over_budget.test.toml
+          ./target/release/xahc test examples/agent_guardrail.test.toml
 
       - name: install-tx HookOn regression (fire-on-Payment)
         run: |
