@@ -41,3 +41,18 @@ jobs:
 
       - name: Simulate — non-payment must ACCEPT (exit 0)
         run: ./target/release/xahc sim /tmp/firewall.wasm --tt 99
+
+      - name: Setup Node (for emit codec verification)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Verify emit builder against Xahau binary codec (round-trip)
+        run: |
+          set -e
+          ./target/release/xahc build examples/emit_payment.c -o /tmp/emit.wasm
+          HEX=$(./target/release/xahc sim /tmp/emit.wasm --tt 0 --drops 1000000 \
+            | grep -i 'emit\[0\]' | sed -E 's/.*: *//' | tr -d '[:space:]')
+          echo "emit blob hex: $HEX"
+          [ -n "$HEX" ] || { echo "no emit blob produced by sim"; exit 1; }
+          cd scripts && npm ci && node verify-emit.mjs "$HEX"
