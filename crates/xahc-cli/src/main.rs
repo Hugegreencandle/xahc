@@ -66,9 +66,9 @@ enum Cmd {
         /// Account the hook installs on (r-address)
         #[arg(long)]
         account: String,
-        /// Comma list of tx types to fire on (names or numbers). Default: all.
+        /// Comma list of tx types to fire on, e.g. "Payment" or "Payment,Invoke" (names or numbers). Required — no implicit fire-on-all.
         #[arg(long)]
-        on: Option<String>,
+        on: String,
         /// HookNamespace, 64 hex. Default: all-zeros.
         #[arg(long)]
         namespace: Option<String>,
@@ -148,7 +148,7 @@ fn main() -> Result<()> {
         Cmd::InstallTx { wasm, account, on, namespace, namespace_label, params, network, flags } => {
             let json = installtx::run(&wasm, &installtx::Opts {
                 account: &account,
-                on: on.as_deref(),
+                on: &on,
                 namespace: namespace.as_deref(),
                 namespace_label: namespace_label.as_deref(),
                 network: &network,

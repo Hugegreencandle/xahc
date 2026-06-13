@@ -44,7 +44,7 @@ jobs:
       - name: install-tx HookOn regression (fire-on-Payment)
         run: |
           HO=$(./target/release/xahc install-tx /tmp/firewall.wasm \
-                 --account rEXAMPLE --on Payment 2>/dev/null \
+                 --account rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh --on Payment 2>/dev/null \
                | grep '"HookOn"' | grep -oE '[A-F0-9]{64}' | head -1)
           echo "HookOn(Payment)=$HO"
           [ "$HO" = "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFBFFFFE" ] \

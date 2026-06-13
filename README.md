@@ -132,9 +132,10 @@ xahau-mcp; xahc does not chase it.
   for xahau-mcp's `execute_hook`
 - **test** ✅ `xahc test x.toml` — declarative, asserted suites over sim (outcome +
   emit/state-count assertions), nonzero exit on failure, CI-wired
-- **install-tx** ✅ `xahc install-tx x.wasm --account r... [--on Payment,Invoke]` — emits
-  an UNSIGNED SetHook. HookOn (the inverted active-low mask) is computed and **verified
-  byte-for-byte against xahau-mcp's encoder** across all type sets
+- **install-tx** ✅ `xahc install-tx x.wasm --account r... --on Payment,Invoke` — emits
+  an UNSIGNED SetHook. HookOn (the inverted active-low mask) is computed from the
+  documented Xahau encoding and **regression-tested against golden values** (unit tests +
+  CI). Refuses a wasm that fails lint; validates the r-address; `--on` is required
 - **lint: stack budget** ✅ reads each function's frame size, walks the call graph, warns
   if the deepest chain exceeds the available stack (hooks have no heap) — catches the
   "big array on the stack" overflow before deploy
@@ -181,13 +182,13 @@ including the correct `HookOn` bitmap, which is notoriously easy to get wrong:
 
 ```sh
 xahc install-tx firewall.wasm \
-  --account rEXAMPLE... \
-  --on Payment,Invoke         # default: fire on all types
+  --account rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh \
+  --on Payment,Invoke         # required — the tx types the hook fires on
 # -> unsigned SetHook JSON (CreateCode, HookOn, HookNamespace, NetworkID)
 ```
 
 Output is **unsigned** — sign offline (xaman / `xrpl-accountlib`); set `Fee`/`Sequence`
-at signing. `HookOn` is verified byte-for-byte against xahau-mcp's encoder. For a
+at signing. `HookOn` is regression-tested against golden values (unit tests + CI). For a
 pre-flight security audit of the hook before you install it, run the wasm through
 xahau-mcp's `analyze_hook`.
 
@@ -222,8 +223,8 @@ failing assertion points straight at the line that fired.
 green CI. Both emit builders are verified: **native XAH** round-trips through
 xahau-mcp's chain-validated codec to exactly `Amount: "1000000"` (1 XAH);
 **issued/IOU** executes in xahau-mcp's VM (real XFL) and emits
-`{value:"1.5",currency:"USD",...}` — non-degraded. `install-tx`'s HookOn is verified
-byte-for-byte against xahau-mcp's encoder. Not audited; always confirm financial
+`{value:"1.5",currency:"USD",...}` — non-degraded. `install-tx`'s HookOn is
+regression-tested against golden values. Not audited; always confirm financial
 hooks on testnet before mainnet. See [CHANGELOG](CHANGELOG.md).
 
 ## License

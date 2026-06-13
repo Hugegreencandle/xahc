@@ -3,6 +3,22 @@
 All notable changes to xahc are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); versioning is [SemVer](https://semver.org/).
 
+## [1.1.0] - 2026-06-13
+
+Safety hardening of `install-tx` (pre-launch audit).
+
+### Changed
+- **`install-tx --on` is now required** — no implicit fire-on-all-types default,
+  which was a footgun (a hook firing on every transaction type, incl. SetHook).
+
+### Added / Fixed
+- `install-tx` **refuses a wasm that fails lint** (errors) and **surfaces lint
+  warnings** (unguarded loop, stack budget) instead of packaging them silently —
+  it's no longer an escape hatch around the safety checks.
+- `install-tx` **validates the `--account` r-address** (base58 classic-address
+  shape) before emitting.
+- `install-tx` **caps HookParameter name/value lengths** (32 B / 256 B).
+
 ## [1.0.0] - 2026-06-13
 
 First stable release. xahc is the authoring/compile companion to
@@ -16,7 +32,8 @@ compile it, and emit a ready-to-sign install transaction.
 - **`xahc new <name>`** — scaffolds a buildable project (firewall / accept_all /
   emitter archetypes) with a test suite, justfile, and README.
 - **`xahc install-tx`** — emits an UNSIGNED SetHook: CreateCode, HookOn
-  (verified byte-for-byte against xahau-mcp's encoder), HookNamespace
+  (computed from Xahau's active-low mask, regression-tested against golden values),
+  HookNamespace
   (`--namespace` or `--namespace-label` = sha256), HookParameters (`--param`),
   NetworkID, Flags.
 - **`xahc test`** — declarative TOML test suites over the simulator (outcome +

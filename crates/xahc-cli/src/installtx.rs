@@ -2,8 +2,9 @@
 //! .wasm on an account. Closes the author→deploy gap.
 //!
 //! The hard part is HookOn — the 256-bit, inverted, active-low fire-on mask
-//! (with the active-high SetHook bit). This implementation mirrors xahau-mcp's
-//! verified `hookon.js` exactly and is cross-checked against it in CI-able form.
+//! (with the active-high SetHook bit). The algorithm follows the active-low mask
+//! documented for Xahau (and xahau-mcp's hookon.js); golden HookOn values are
+//! pinned in unit tests plus a CI regression (not a live cross-check).
 //!
 //! Output is UNSIGNED. Sign offline (e.g. xaman / xrpl-accountlib) — xahc never
 //! touches keys.
@@ -68,6 +69,7 @@ fn parse_types(spec: &str) -> Result<HashSet<u32>> {
     Ok(out)
 }
 
+#[cfg(test)]
 fn all_type_values() -> HashSet<u32> {
     TX_TYPES.iter().map(|(_, v)| *v).collect()
 }
@@ -82,7 +84,7 @@ fn norm_hex_namespace(s: &str) -> Result<String> {
 
 pub struct Opts<'a> {
     pub account: &'a str,
-    pub on: Option<&'a str>,             // comma list; None = fire on all known types
+    pub on: &'a str,                     // comma list of tx types to fire on (required — no implicit fire-on-all)
     pub namespace: Option<&'a str>,      // 64 hex; None = all-zeros
     pub namespace_label: Option<&'a str>, // convenience: sha256(label) as namespace
     pub network: &'a str,                // "testnet" | "mainnet"
@@ -100,14 +102,43 @@ fn is_hex(s: &str) -> bool {
     !s.is_empty() && s.len().is_multiple_of(2) && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+/// Surface-level r-address sanity check (no checksum): starts with `r`, base58
+/// ripple alphabet, classic-address length range. Catches typos before a tx is
+/// signed/submitted (the signer's lib does the full checksum).
+fn is_r_address(s: &str) -> bool {
+    const ALPHABET: &[u8] = b"rpshnaf39wBUDNEGHJKLM4PQRST7VWXYZ2bcdeCg65jkm8oFqi1tuvAxyz";
+    s.starts_with('r')
+        && (25..=35).contains(&s.len())
+        && s.bytes().all(|b| ALPHABET.contains(&b))
+}
+
 pub fn run(wasm: &Path, o: &Opts) -> Result<String> {
+    if !is_r_address(o.account) {
+        bail!("--account `{}` is not a valid r-address (expected a base58 classic address starting with `r`)", o.account);
+    }
+
     let bytes = std::fs::read(wasm).with_context(|| format!("read {}", wasm.display()))?;
+
+    // Don't package a wasm that wouldn't pass our own lint — install-tx must not be
+    // an escape hatch around the safety checks. Run `xahc build` (clean+lint) first.
+    let findings = crate::lint::lint(&bytes).with_context(|| format!("lint {}", wasm.display()))?;
+    let errors: Vec<&crate::lint::Finding> = findings.iter().filter(|f| matches!(f.level, crate::lint::Level::Error)).collect();
+    if !errors.is_empty() {
+        let list = errors.iter().map(|f| format!("  - {}", f.msg)).collect::<Vec<_>>().join("\n");
+        bail!("refusing to install-tx: the wasm fails lint ({} error(s)) — run `xahc build` first:\n{}", errors.len(), list);
+    }
+    // Errors block; warnings don't — but surface them so a risky hook (unguarded
+    // loop, stack budget) is never packaged silently.
+    for f in findings.iter().filter(|f| matches!(f.level, crate::lint::Level::Warn)) {
+        eprintln!("warn: {}", f.msg);
+    }
+
     let create_code: String = bytes.iter().map(|b| format!("{:02X}", b)).collect();
 
-    let want = match o.on {
-        Some(spec) => parse_types(spec)?,
-        None => all_type_values(),
-    };
+    let want = parse_types(o.on)?;
+    if want.is_empty() {
+        bail!("--on must name at least one transaction type to fire on (e.g. Payment)");
+    }
     let hook_on = encode_hook_on(&want);
 
     let namespace = match (o.namespace, o.namespace_label) {
@@ -125,6 +156,12 @@ pub fn run(wasm: &Path, o: &Opts) -> Result<String> {
             .with_context(|| format!("--param must be nameHex=valueHex (got `{}`)", p))?;
         if !is_hex(name) || !is_hex(value) {
             bail!("--param name and value must be hex (got `{}`)", p);
+        }
+        if name.len() > 64 {
+            bail!("--param name too long: {} hex chars (max 32 bytes / 64 hex)", name.len());
+        }
+        if value.len() > 512 {
+            bail!("--param value too long: {} hex chars (max 256 bytes / 512 hex)", value.len());
         }
         params_json.push(serde_json::json!({
             "HookParameter": {
