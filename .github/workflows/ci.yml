@@ -1,0 +1,43 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-lint-sim:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install wasm toolchain (clang + lld/wasm-ld)
+        run: sudo apt-get update && sudo apt-get install -y clang lld
+
+      - name: Build CLI
+        run: cargo build --release
+
+      - name: Clippy
+        run: cargo clippy --release -- -D warnings
+        continue-on-error: true
+
+      - name: Build example hook (compile -> clean -> lint)
+        run: ./target/release/xahc build examples/firewall.c -o /tmp/firewall.wasm
+
+      - name: Simulate — below floor must ROLLBACK (exit 2)
+        run: |
+          set +e
+          ./target/release/xahc sim /tmp/firewall.wasm --tt 0 --drops 5000000
+          [ $? -eq 2 ] || { echo "expected rollback (exit 2)"; exit 1; }
+
+      - name: Simulate — above floor must ACCEPT (exit 0)
+        run: ./target/release/xahc sim /tmp/firewall.wasm --tt 0 --drops 20000000
+
+      - name: Simulate — non-payment must ACCEPT (exit 0)
+        run: ./target/release/xahc sim /tmp/firewall.wasm --tt 99
