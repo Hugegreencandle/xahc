@@ -3,6 +3,23 @@
 All notable changes to xahc are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); versioning is [SemVer](https://semver.org/).
 
+## [1.6.0] - 2026-06-14
+
+Guard-reposition pass — hooks build at `-O2` again, no `-Oz` dependency.
+
+### Added / Changed
+- **Guard-reposition pass** (`guardpass`): after compile, hoists each loop's
+  guard — the developer's `const id; const maxiter; call _g; (drop)` block — to
+  the loop head, satisfying xahaud's rule that `_g` be the **first branch
+  instruction in a loop**. The optimizer's loop rotation moves the guard to the
+  loop bottom; the pass moves it back. It repositions the *existing* guard and
+  its literal bound — it never invents a `maxiter`. Loops with no `_g` at all are
+  reported, not faked.
+- **`build`: back to `-O2`** (from the v1.5.1 `-Oz` interim). `-O2` hooks now
+  install; re-verified on Xahau testnet (guardrail installs, over-limit
+  `tecHOOK_REJECTED`, under-limit `tesSUCCESS`).
+- `build` prints the repositioned-guard count and warns on any unguarded loop.
+
 ## [1.5.1] - 2026-06-14
 
 **Critical:** every prior xahc-built hook was rejected on-chain (`temMALFORMED`).

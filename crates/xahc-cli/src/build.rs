@@ -20,13 +20,12 @@ pub fn run(input: &Path, output: &Path, extra_includes: &[PathBuf], do_lint: boo
     let mut cmd = Command::new("clang");
     cmd.args([
         "--target=wasm32",
-        // -Oz, not -O2: aggressive opt (loop rotation) repositions the `_g` guard
-        // out of where xahaud's guard verifier requires it, so -O2 hooks are
-        // rejected (temMALFORMED) even though they're structurally guarded. -Oz
-        // keeps guards in place AND yields smaller hooks (lower SetHook fee).
-        // Verified on Xahau testnet. (A wasm guard-injection pass is the robust
-        // long-term fix; -Oz is the validated interim.)
-        "-Oz",
+        // -O2 is fine: the guard-reposition pass (see guardpass) hoists each
+        // loop's `_g` back to the loop head after the optimizer's loop rotation,
+        // satisfying xahaud's guard rule. (A guarded source loop contains the
+        // `_g` call, which blocks loop-idiom recognition, so the optimizer won't
+        // synthesize an unguarded memset/memcpy loop from it.)
+        "-O2",
         "-nostdlib",
         "-fno-builtin",
         "-Wl,--no-entry",
@@ -53,9 +52,22 @@ pub fn run(input: &Path, output: &Path, extra_includes: &[PathBuf], do_lint: boo
         bail!("clang failed");
     }
 
-    // clean
+    // guard-reposition: hoist each loop's `_g` to the loop head (the optimizer
+    // may have rotated it to the bottom), satisfying xahaud's guard rule.
     let wasm = std::fs::read(&raw)?;
-    let (cleaned, removed) = clean::clean_bytes(&wasm)?;
+    let (guarded, grep) = crate::guardpass::reposition(&wasm)?;
+    if grep.repositioned > 0 {
+        println!("{} repositioned {} guard(s) to loop head", "guard".green(), grep.repositioned);
+    }
+    if grep.unguarded_loops > 0 {
+        println!(
+            "{} {} loop(s) without a `_g` guard — xahaud will reject; add XAHC_GUARD()",
+            "warn".yellow(), grep.unguarded_loops
+        );
+    }
+
+    // clean
+    let (cleaned, removed) = clean::clean_bytes(&guarded)?;
     if removed > 0 {
         // Diagnostic, not data — stderr keeps `xahc build --json` stdout clean.
         eprintln!("{} stripped {} stray export(s)", "clean".green(), removed);

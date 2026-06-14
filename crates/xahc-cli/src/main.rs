@@ -4,6 +4,7 @@
 mod build;
 mod clean;
 mod doctor;
+mod guardpass;
 mod installtx;
 mod lint;
 mod scaffold;
