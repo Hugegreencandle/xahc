@@ -9,6 +9,17 @@ an account. The stock toolchain (`XRPLF/hook-macros`) is raw C preprocessor macr
 powerful, but every guarantee lives in the developer's head. `xahc` moves those
 guarantees into the type system, the compiler, and the build step.
 
+## The trifecta — safe Hooks, end to end
+
+Three open-source tools, one workflow: **write → simulate one tx → prove all inputs.**
+xahc is the **write** stage.
+
+| stage | tool | what it does |
+|---|---|---|
+| **write** | [xahc](https://github.com/Hugegreencandle/xahc) | author + compile a safe Hook to clean, lint-passed WASM |
+| **simulate one** | [xahau-mcp](https://github.com/Hugegreencandle/xahau-mcp) | run the real bytecode against one live transaction |
+| **prove all** | [xahc-prover](https://github.com/Hugegreencandle/xahc-prover) | prove an invariant holds for every input in scope — or return the counterexample |
+
 ## Where xahc fits — it pairs with [xahau-mcp](https://github.com/Hugegreencandle/xahau-mcp)
 
 The two tools are halves of one loop. xahau-mcp is **read-only**: it analyzes,
@@ -57,7 +68,7 @@ destinations, enforced by the ledger — the control x402/app-layer flows lack.
 
 ```
 include/xahc/      Layer 0 — header-only safe C lib (guard, check, otxn, param, state, emit, sfcodes)
-crates/xahc-cli/   Layer 1 — Rust CLI (headers embedded): build · clean · lint · sim · test · install-tx · doctor · new
+crates/xahc-cli/   Layer 1 — Rust CLI (headers embedded): build · clean · lint · sim · test · install-tx · prove · doctor · new
 scripts/           verify-emit.mjs · verify-emit-vm.mjs — codec/VM round-trips
 examples/          *.c hooks + *.test.toml suites
 ```
@@ -65,6 +76,22 @@ examples/          *.c hooks + *.test.toml suites
 The CLI's job is **build + clean** (the part nothing else does). `lint` and `sim`
 are convenience preflights for fast local feedback; for authoritative analysis and
 VM execution, pipe the `.wasm` to [xahau-mcp](https://github.com/Hugegreencandle/xahau-mcp).
+
+## Prove an invariant — `xahc prove`
+
+`xahc prove <hook.wasm|.c> --invariant <name>` shells out to
+[xahc-prover](https://github.com/Hugegreencandle/xahc-prover) (symbolic execution + Z3)
+and propagates the verdict as an exit code: **0 PROVEN · 2 COUNTEREXAMPLE · 3
+INCONCLUSIVE** (with `--json`, a `{invariant, input, verdict, exit_code}` envelope). The
+prover is resolved via `XAHC_PROVER_DIR` or a sibling checkout. Invariants (must match the
+prover's drivers):
+
+```
+limit · guardrail · termination · monotonic · nospend · conservation · limit-iou · authz · validate · overflow
+```
+
+A PROVEN verdict is bounded to the prover's modeled scope (it fails closed to INCONCLUSIVE
+otherwise) — see the [xahc-prover scope note](https://github.com/Hugegreencandle/xahc-prover#scope-of-a-proven-verdict-read-this-first).
 
 ## Install
 
