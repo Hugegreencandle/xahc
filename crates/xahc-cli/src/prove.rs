@@ -17,6 +17,8 @@ const INVARIANTS: &[(&str, &str)] = &[
     ("guardrail", "prove_guardrail.py"),
     ("termination", "prove_termination.py"),
     ("monotonic", "prove_monotonic.py"),
+    ("nospend", "prove_nospend.py"),
+    ("conservation", "prove_conservation.py"),
 ];
 
 fn prover_dir() -> Result<PathBuf> {
