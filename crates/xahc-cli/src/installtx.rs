@@ -14,7 +14,9 @@ use std::collections::HashSet;
 use std::path::Path;
 
 /// (name, transaction-type value) — from Xahau's hookon tx-type table (47 types).
-const TX_TYPES: &[(&str, u32)] = &[
+/// This is the CANONICAL tx-type table for the whole crate; `verify` resolves its
+/// numeric tx-type from here too, so install-tx and verify never diverge.
+pub const TX_TYPES: &[(&str, u32)] = &[
     ("Payment", 0), ("EscrowCreate", 1), ("EscrowFinish", 2), ("AccountSet", 3),
     ("EscrowCancel", 4), ("SetRegularKey", 5), ("NicknameSet", 6), ("OfferCreate", 7),
     ("OfferCancel", 8), ("Contract", 9), ("TicketCreate", 10), ("SpinalTap", 11),
@@ -53,24 +55,31 @@ fn encode_hook_on(want: &HashSet<u32>) -> String {
     buf.iter().map(|b| format!("{:02X}", b)).collect()
 }
 
+/// Resolve a SINGLE tx-type name (e.g. "Payment") or numeric string (e.g. "0")
+/// to its canonical numeric value, validating it against the full TX_TYPES table.
+/// Shared with `verify` so both sides resolve from the one table (no divergence).
+pub fn resolve_tx_type(spec: &str) -> Result<u32> {
+    let tok = spec.trim();
+    if let Ok(n) = tok.parse::<u32>() {
+        if !TX_TYPES.iter().any(|(_, v)| *v == n) {
+            bail!("transaction-type number {} is not a known Xahau type", n);
+        }
+        return Ok(n);
+    }
+    match TX_TYPES.iter().find(|(name, _)| *name == tok) {
+        Some((_, v)) => Ok(*v),
+        None => bail!("unknown transaction type `{}` (use a name like Payment or a number)", tok),
+    }
+}
+
 /// Resolve a comma list of tx-type names/numbers to their values.
 fn parse_types(spec: &str) -> Result<HashSet<u32>> {
     let mut out = HashSet::new();
     for tok in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-        if let Ok(n) = tok.parse::<u32>() {
-            // Reject a numeric type that isn't a known Xahau tx type — otherwise
-            // it's silently ignored by encode_hook_on and the user thinks the
-            // hook fires on it.
-            if !TX_TYPES.iter().any(|(_, v)| *v == n) {
-                bail!("transaction-type number {} is not a known Xahau type", n);
-            }
-            out.insert(n);
-            continue;
-        }
-        match TX_TYPES.iter().find(|(name, _)| *name == tok) {
-            Some((_, v)) => { out.insert(*v); }
-            None => bail!("unknown transaction type `{}` (use a name like Payment or a number)", tok),
-        }
+        // Resolve each token through the canonical table. This rejects an unknown
+        // numeric type (otherwise silently ignored by encode_hook_on, so the user
+        // thinks the hook fires on it) and unknown names alike.
+        out.insert(resolve_tx_type(tok)?);
     }
     Ok(out)
 }

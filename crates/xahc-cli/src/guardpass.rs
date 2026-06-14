@@ -108,8 +108,65 @@ enum Hoist {
     Skip,
 }
 
+/// True if a `_g` call is ALREADY provably the first branch on entry to `seq`,
+/// descending in execution order through any leading unconditional `block`
+/// (the shape clang -O2 can emit). Mirrors lint::first_branch_is_guard so the
+/// hoist does not "fix" a guard that is already correct (e.g. one nested inside
+/// a leading block) — which would either double-hoist or churn a valid hook.
+///
+/// Conservative on purpose: a `block` body is always entered, so a guard first
+/// inside a leading block is genuinely first; an `if`/`else` or any other branch
+/// reached before the guard is NOT treated as guard-first.
+fn guard_already_first(lf: &walrus::LocalFunction, seq: InstrSeqId, g: FunctionId) -> bool {
+    for (instr, _) in lf.block(seq).instrs.iter() {
+        match instr {
+            Instr::Call(c) if c.func == g => return true,
+            Instr::Block(b) => {
+                // A leading block is always entered. If it contains a branch we
+                // can decide here; if it has no branch, continue scanning after it.
+                if seq_has_branch(lf, b.seq) {
+                    return guard_already_first(lf, b.seq, g);
+                }
+            }
+            _ if is_branch(instr) => return false,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Whether a sequence contains any branch instruction at its top level (used to
+/// decide if a leading `block` is "decisive" for the guard-first check).
+fn seq_has_branch(lf: &walrus::LocalFunction, seq: InstrSeqId) -> bool {
+    lf.block(seq).instrs.iter().any(|(i, _)| is_branch(i))
+}
+
+/// A control-transfer / call instruction (kept in sync with lint::is_branch).
+fn is_branch(instr: &Instr) -> bool {
+    matches!(
+        instr,
+        Instr::Call(_)
+            | Instr::CallIndirect(_)
+            | Instr::Br(_)
+            | Instr::BrIf(_)
+            | Instr::BrTable(_)
+            | Instr::IfElse(_)
+            | Instr::Loop(_)
+            | Instr::Block(_)
+            | Instr::Return(_)
+            | Instr::Unreachable(_)
+    )
+}
+
 /// Within one loop body sequence, hoist the `_g` guard block to the front.
 fn hoist_guard_in_seq(lf: &mut walrus::LocalFunction, seq: InstrSeqId, g: FunctionId) -> Hoist {
+    // If the guard is already provably first on entry — including the case where
+    // it lives inside a leading unconditional `block` — there is nothing to move.
+    // Skipping here prevents churning (or double-hoisting) an already-correct hook.
+    if guard_already_first(lf, seq, g) {
+        return Hoist::AlreadyHead;
+    }
+
     let instrs = &mut lf.block_mut(seq).instrs;
 
     let ci = match instrs

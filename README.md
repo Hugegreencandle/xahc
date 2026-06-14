@@ -119,8 +119,10 @@ Beyond the structural checks (which catch `temMALFORMED`-class on-chain rejectio
 lint also runs **semantic safety** rules — runtime/correctness footguns that deploy
 fine but misbehave: `NO_EXIT_PATH` (no `accept`/`rollback`), `EMIT_WITHOUT_RESERVE`,
 `REENTRANCY_EMIT`, `STATE_FOREIGN_WRITE` (all `warn`), plus advisories (`info`) for `emit`-without-`cbak`,
-XFL use, oversize wasm, and excess memory. These mirror the wasm-tractable rules in
-xahau-mcp's analyzer, so `xahc lint` (author side) and the MCP (verify side) agree.
+XFL use, oversize wasm, and excess memory. This rule set **overlaps / is informed by**
+xahau-mcp's analyzer — but it is **not** a 1:1 mirror: some rules differ in id and/or
+severity between the two repos (e.g. xahc's `NO_EXIT_PATH` is a `warn`; the MCP's
+`HOOK-001` is CRITICAL). Treat the crosswalk as informative, not a parity guarantee.
 
 Write a hook:
 

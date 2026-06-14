@@ -47,9 +47,20 @@ pub fn run(input: &Path, output: &Path, extra_includes: &[PathBuf], do_lint: boo
     }
     cmd.arg(input).arg("-o").arg(&raw);
 
-    let status = cmd.status().context("run clang (is a wasm-capable clang in PATH?)")?;
+    let status = cmd
+        .status()
+        .context("could not run `clang` — is clang installed and on PATH?")?;
     if !status.success() {
-        bail!("clang failed");
+        // The most common build failure on macOS is Apple's system clang, which
+        // lacks the wasm32 target (`--target=wasm32` then errors). Point the user
+        // at a wasm-capable clang explicitly rather than just "clang failed".
+        bail!(
+            "clang failed to compile to wasm32. The most likely cause is a clang \
+             without wasm32 support (Apple's system clang lacks it). Install LLVM \
+             and put its clang first on PATH, e.g.:\n  \
+             brew install llvm && export PATH=\"/opt/homebrew/opt/llvm/bin:$PATH\"\n\
+             Then re-run `xahc build`. (Run `xahc doctor` to check your toolchain.)"
+        );
     }
 
     // guard-reposition: hoist each loop's `_g` to the loop head (the optimizer

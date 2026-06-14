@@ -3,6 +3,63 @@
 All notable changes to xahc are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); versioning is [SemVer](https://semver.org/).
 
+## [1.9.0] - 2026-06-14
+
+Audit fixes — guard-lint false-positive, doc/severity-claim accuracy, and
+verify/test hardening.
+
+### Fixed
+- **Positional guard no longer false-flags a nested-but-first `_g` (HIGH).** The
+  loop guard check (`lint::loop_guard_pos`) and the guard-reposition pass
+  (`guardpass::hoist_guard_in_seq`) only inspected a loop body's TOP-LEVEL
+  instruction sequence, so a `_g` call inside a leading `block` — a shape clang
+  `-O2` emits, e.g. `(loop (block (call _g) ...))` — was wrongly reported
+  `UNGUARDED_LOOP` / `GUARD_NOT_FIRST`, blocking a VALID hook. lint now descends
+  in **execution order** through any leading UNCONDITIONAL `block` (always
+  entered) to find the genuinely-first guard-relevant instruction, mirroring
+  xahaud's flattened-stream view. **Conservative by design:** it does NOT descend
+  into `if`/`else` or a nested `loop` (execution can skip a conditional branch) —
+  a `_g` reachable only inside one `if` branch is STILL flagged. This preserves
+  the safety invariant that an unguarded loop is never accepted (a false-negative
+  would ship a `temMALFORMED` hook on-chain). guardpass mirrors the same descent
+  so it recognizes an already-correct nested guard instead of churning it. New
+  WAT tests cover: nested-block guard (not flagged), truly-unguarded loop (still
+  flagged), conditional-only guard (still flagged), branchless-block-then-guard
+  (compliant).
+- **`NO_EXIT_PATH` message/severity claims corrected (HIGH).** The rule stays a
+  `warn`, but its message and the surrounding comments no longer assert as fact
+  that "xahaud does not reject" a hook importing neither `accept` nor `rollback`
+  — that on-chain behavior is **not** independently confirmed in this repo. The
+  rule now reads as a strong-but-unverified warning. The README and the lint
+  section header no longer claim xahc "mirrors the analyzer, so author and verify
+  sides agree": the rule sets OVERLAP but differ in id and/or severity (xahc's
+  `NO_EXIT_PATH` is `warn`; the MCP's `HOOK-001` is CRITICAL).
+- **Rule-id crosswalk accuracy (MEDIUM).** The `~ HOOK-00X` crosswalk comments are
+  now marked **approximate** (ids and/or semantics differ), `STATE_FOREIGN_WRITE`
+  is documented as xahc-specific (no dedicated MCP foreign-write rule), and the
+  `Finding` doc-comment now describes the ids as **xahc-stable** rather than an
+  MCP-parity "compatibility contract".
+- **`verify` and `test` resolve tx-types from the canonical table (MEDIUM).**
+  `installtx::TX_TYPES` (the full 47-type table) is now `pub`, with a shared
+  `resolve_tx_type`. `verify` resolves its local-sim number AND the canonical name
+  it forwards to the remote VM from that one table (was a partial, divergent
+  16-entry table that could send a name the local side couldn't map). `xahc test`
+  now validates each case's `tt` against the same table (rejects unknown numerics),
+  matching install-tx's `parse_types`.
+- **`verify` requires an http(s) scheme on the remote URL (MEDIUM, SSRF surface).**
+  `--remote` / `XAHC_SIM_URL` must start with `http://` or `https://`; otherwise
+  it errors instead of attempting an ambiguous request.
+- **`build` gives a wasm32-specific hint when clang fails (LOW).** A failed bare
+  `clang` invocation now explains the likely cause (Apple's system clang lacks the
+  wasm32 target) and how to install a wasm-capable clang (brew llvm), instead of a
+  bare "clang failed".
+
+### TODO
+- **Confirm the no-exit on-chain behavior on testnet.** Whether xahaud rejects a
+  hook importing neither `accept` nor `rollback` (temMALFORMED) or accepts the
+  `RETURNED` outcome is not yet independently verified. Once confirmed, align the
+  `NO_EXIT_PATH` severity here with xahau-mcp's `HOOK-001` and update both repos.
+
 ## [1.8.1] - 2026-06-14
 
 Post-release audit fix.
@@ -19,9 +76,14 @@ Post-release audit fix.
 ## [1.8.0] - 2026-06-14
 
 Semantic safety lints — `xahc lint` now catches runtime/correctness footguns, not
-just structural (`temMALFORMED`-class) rejections. These mirror the wasm-tractable
-rules in xahau-mcp's analyzer, so the author side and the verify side agree before
-you ever reach simulation.
+just structural (`temMALFORMED`-class) rejections. These OVERLAP / are informed by
+the wasm-tractable rules in xahau-mcp's analyzer.
+
+> **Correction (see [1.9.0]):** this entry originally claimed the rules "mirror"
+> the analyzer so the author and verify sides "agree." That overstated it — the
+> rule sets are not 1:1 (ids and/or severities differ, e.g. `NO_EXIT_PATH` is a
+> `warn` here vs CRITICAL `HOOK-001` in the MCP). Treat the crosswalk as
+> informative, not a parity guarantee.
 
 ### Added
 - **`NO_EXIT_PATH`** (error) — hook imports neither `accept` nor `rollback`; it

@@ -40,9 +40,12 @@ pub const HOOK_API: &[&str] = &[
 #[serde(rename_all = "lowercase")]
 pub enum Level { Error, Warn, Info }
 
-/// Stable machine-routable rule identifiers. Treat these as a COMPATIBILITY
-/// CONTRACT — xahau-mcp, CI gates, and any `--json` consumer key on them, so do
-/// not rename casually. The human `msg` may change freely; the `rule_id` is fixed.
+/// Stable machine-routable rule identifiers. These are xahc-STABLE `rule_id`s:
+/// CI gates and any `--json` consumer key on them, so do not rename casually. The
+/// human `msg` may change freely; the `rule_id` is fixed. NOTE: these are xahc's
+/// own ids — they do NOT promise id- or severity-parity with xahau-mcp's HOOK-*
+/// rules (the crosswalk comments below are approximate; some rules differ in id
+/// AND semantics).
 #[derive(Serialize)]
 pub struct Finding {
     pub level: Level,
@@ -121,17 +124,22 @@ pub fn lint(wasm: &[u8]) -> Result<Vec<Finding>> {
     f.extend(check_stack(&m));
 
     // 6. Semantic safety lints — runtime/correctness footguns that DEPLOY fine but
-    //    misbehave on-chain. Mirrors the wasm-tractable rules in xahau-mcp's analyzer
-    //    (the canonical verify side) so `xahc lint` and the MCP agree before you ever
-    //    reach simulation. Crosswalk to the MCP rule id is noted on each.
+    //    misbehave on-chain. This rule set OVERLAPS / is informed by xahau-mcp's
+    //    analyzer (the verify side), but it is NOT a severity-parity mirror: some
+    //    rules differ in id and/or severity between the two repos (e.g. xahc's
+    //    NO_EXIT_PATH is `warn`, the MCP's HOOK-001 is CRITICAL). The crosswalk
+    //    comment on each finding is APPROXIMATE — treat ids as informative, not 1:1.
     f.extend(check_semantics(&m, wasm));
 
     Ok(f)
 }
 
 /// Import/size-based safety checks. Zero false positives (you can't call a host fn
-/// you don't import). Each maps to a xahau-mcp analyzer rule (HOOK-*) so the two
-/// halves of the toolchain stay in agreement — see docs crosswalk in the analyzer.
+/// you don't import). Each carries an APPROXIMATE crosswalk to a xahau-mcp analyzer
+/// rule (HOOK-*) — the rule sets OVERLAP but are not a 1:1 mapping: ids and/or
+/// severities differ (the guard rules in particular have different ids AND
+/// semantics, and STATE_FOREIGN_WRITE has no dedicated MCP foreign variant). The
+/// crosswalk is informative, not a compatibility guarantee of MCP id-parity.
 fn check_semantics(m: &Module, wasm: &[u8]) -> Vec<Finding> {
     use std::collections::HashSet;
     let mut out = Vec::new();
@@ -150,19 +158,23 @@ fn check_semantics(m: &Module, wasm: &[u8]) -> Vec<Finding> {
         .collect();
     let imp = |n: &str| imports.contains(n);
 
-    // NO_EXIT_PATH (~ HOOK-001-NO-EXIT): a hook importing neither accept nor rollback
-    // makes no explicit accept/reject decision — it can only fall through to a plain
-    // `return` (the VM reports this as RETURNED, an unusual outcome, almost always a
-    // bug). WARN, not error: xahaud does not reject this as temMALFORMED, so blocking
-    // build/install would refuse an odd-but-deployable hook.
+    // NO_EXIT_PATH (~ HOOK-001-NO-EXIT, approximate — severities DIFFER: the MCP
+    // rates HOOK-001 CRITICAL, here it is `warn`): a hook importing neither accept
+    // nor rollback makes no explicit accept/reject decision and can only fall
+    // through to a plain `return`. xahaud's exact handling of such a hook (does it
+    // reject as temMALFORMED, or accept the RETURNED outcome?) is NOT independently
+    // confirmed in this repo, so we treat it as a STRONG warning rather than a hard
+    // block — blocking build/install on an unconfirmed rejection could refuse an
+    // odd-but-possibly-deployable hook. See the TODO in CHANGELOG: confirm the
+    // on-chain behavior on testnet, then align xahc and xahau-mcp severities.
     if !imp("accept") && !imp("rollback") {
         out.push(Finding::warn(
             "NO_EXIT_PATH",
-            "imports neither `accept` nor `rollback` — the hook makes no explicit accept/reject decision and can only fall through to a plain return (almost always a bug). End every path with accept() or rollback().",
+            "imports neither `accept` nor `rollback` — the hook makes no explicit accept/reject decision and can only fall through to a plain return. This is almost always a bug; xahaud's exact handling of a hook that imports neither is not independently confirmed here — treat as a strong warning and end every path with accept() or rollback().",
         ));
     }
 
-    // EMIT_WITHOUT_RESERVE (~ HOOK-009, MEDIUM): emit() needs a prior etxn_reserve(n);
+    // EMIT_WITHOUT_RESERVE (~ HOOK-009, approximate): emit() needs a prior etxn_reserve(n);
     // without it every emit fails at runtime (PREREQUISITE_NOT_MET).
     if imp("emit") && !imp("etxn_reserve") {
         out.push(Finding::warn(
@@ -171,7 +183,7 @@ fn check_semantics(m: &Module, wasm: &[u8]) -> Vec<Finding> {
         ));
     }
 
-    // REENTRANCY_EMIT (~ HOOK-010, MEDIUM): emit + cbak + hook_again can form an
+    // REENTRANCY_EMIT (~ HOOK-010, approximate): emit + cbak + hook_again can form an
     // unbounded emission / re-execution loop.
     if imp("emit") && imp("hook_again") && exports.contains("cbak") {
         out.push(Finding::warn(
@@ -180,7 +192,7 @@ fn check_semantics(m: &Module, wasm: &[u8]) -> Vec<Finding> {
         ));
     }
 
-    // EMIT_NO_CBAK (~ HOOK-003, INFO): advisory — fine unless you need to react to
+    // EMIT_NO_CBAK (~ HOOK-003, approximate, INFO): advisory — fine unless you need to react to
     // the emitted transaction's result.
     if imp("emit") && !exports.contains("cbak") {
         out.push(Finding::info(
@@ -189,8 +201,10 @@ fn check_semantics(m: &Module, wasm: &[u8]) -> Vec<Finding> {
         ));
     }
 
-    // STATE_FOREIGN_WRITE (~ HOOK-008 foreign, MEDIUM) / STATE_WRITE (LOW): foreign
-    // writes touch ANOTHER account's state (needs a HookGrant) — flag louder.
+    // STATE_FOREIGN_WRITE / STATE_WRITE (LOW): foreign writes touch ANOTHER
+    // account's state (needs a HookGrant) — flag louder. NOTE: the MCP has no
+    // dedicated foreign-write rule (HOOK-008 covers state writes generally), so
+    // STATE_FOREIGN_WRITE is xahc-specific — no MCP crosswalk for the foreign case.
     if imp("state_foreign_set") {
         out.push(Finding::warn(
             "STATE_FOREIGN_WRITE",
@@ -203,7 +217,7 @@ fn check_semantics(m: &Module, wasm: &[u8]) -> Vec<Finding> {
         ));
     }
 
-    // FLOAT_USAGE (~ HOOK-012, INFO): XFL reminder.
+    // FLOAT_USAGE (~ HOOK-012, approximate, INFO): XFL reminder.
     if imports.iter().any(|n| n.starts_with("float_")) {
         out.push(Finding::info(
             "FLOAT_USAGE",
@@ -211,7 +225,7 @@ fn check_semantics(m: &Module, wasm: &[u8]) -> Vec<Finding> {
         ));
     }
 
-    // OVERSIZE_WASM (~ HOOK-011, LOW): SetHook fee scales with CreateCode size.
+    // OVERSIZE_WASM (~ HOOK-011, approximate, LOW): SetHook fee scales with CreateCode size.
     const OVERSIZE_BYTES: usize = 64 * 1024;
     if wasm.len() > OVERSIZE_BYTES {
         out.push(Finding::info(
@@ -224,7 +238,7 @@ fn check_semantics(m: &Module, wasm: &[u8]) -> Vec<Finding> {
         ));
     }
 
-    // MEMORY_EXCESS (~ HOOK-013, LOW): hooks rarely need more than 2 pages.
+    // MEMORY_EXCESS (~ HOOK-013, approximate, LOW): hooks rarely need more than 2 pages.
     const MEMORY_PAGE_CEIL: u64 = 2;
     if let Some(mem) = m.memories.iter().next() {
         if mem.initial > MEMORY_PAGE_CEIL {
@@ -292,23 +306,82 @@ fn is_branch(instr: &Instr) -> bool {
     )
 }
 
-/// xahaud requires the FIRST branch instruction in a loop body to be `call _g`.
-fn loop_guard_pos(lf: &LocalFunction, seq: InstrSeqId, g: FunctionId) -> GuardPos {
-    let instrs = &lf.block(seq).instrs;
-    for (instr, _) in instrs.iter() {
-        if matches!(instr, Instr::Call(c) if c.func == g) {
-            return GuardPos::Compliant; // guard is the first branch reached
+/// True if a `_g` call appears ANYWHERE in `seq` or any nested sequence — used
+/// only to distinguish "mispositioned" (guard present but late/conditional) from
+/// "no guard at all" once we already know the guard is not unconditionally-first.
+fn contains_g_anywhere(lf: &LocalFunction, seq: InstrSeqId, g: FunctionId) -> bool {
+    lf.block(seq).instrs.iter().any(|(i, _)| match i {
+        Instr::Call(c) => c.func == g,
+        Instr::Loop(l) => contains_g_anywhere(lf, l.seq, g),
+        Instr::Block(b) => contains_g_anywhere(lf, b.seq, g),
+        Instr::IfElse(ie) => {
+            contains_g_anywhere(lf, ie.consequent, g)
+                || contains_g_anywhere(lf, ie.alternative, g)
         }
-        if is_branch(instr) {
-            // a non-guard branch came first — is the guard present (just late) or missing?
-            let has_g = instrs
-                .iter()
-                .any(|(i, _)| matches!(i, Instr::Call(c) if c.func == g));
-            return if has_g { GuardPos::Mispositioned } else { GuardPos::NoGuard };
+        _ => false,
+    })
+}
+
+/// Walk a sequence in EXECUTION ORDER looking for the first guard-relevant
+/// instruction reached on the straight-line entry path. Returns:
+///   `Some(true)`  — a `call _g` is provably the first branch on EVERY path here
+///                   (descending only through leading unconditional `block`s);
+///   `Some(false)` — a non-guard branch (or a conditional) is reached first, so a
+///                   guard cannot be proven unconditionally-first via this path;
+///   `None`        — the sequence ran out of instructions with no branch reached
+///                   (caller decides what that means).
+///
+/// SAFETY: we descend into a `block` because a `block` body is ALWAYS entered
+/// (it is straight-line code with a forward-only label) — so `_g` first inside a
+/// leading `block` is genuinely first on entry to the loop, exactly as xahaud
+/// sees the flattened stream. We deliberately do NOT descend into `if`/`else`
+/// (execution can skip a branch) or a nested `loop` (different scope): treating
+/// those as "guard could be first" would be a FALSE-NEGATIVE — accepting a loop
+/// whose only `_g` sits behind a condition — which ships a temMALFORMED hook.
+/// A conditional/other branch reached before any `_g` therefore stops the descent
+/// and is reported as not-unconditionally-first.
+fn first_branch_is_guard(lf: &LocalFunction, seq: InstrSeqId, g: FunctionId) -> Option<bool> {
+    for (instr, _) in lf.block(seq).instrs.iter() {
+        match instr {
+            // The guard itself, reached before any other branch — compliant path.
+            Instr::Call(c) if c.func == g => return Some(true),
+            // A leading unconditional `block` is always entered: recurse in order.
+            // If the guard is first inside it -> compliant; if a branch is first
+            // inside it -> not-first; if the block has no branch, fall through and
+            // keep scanning instructions AFTER the block in this sequence.
+            Instr::Block(b) => match first_branch_is_guard(lf, b.seq, g) {
+                Some(true) => return Some(true),
+                Some(false) => return Some(false),
+                None => { /* block had no branch; continue past it */ }
+            },
+            // Any other branch (call, if/else, br*, nested loop, return, ...) is
+            // reached before a guard -> guard is not unconditionally-first.
+            _ if is_branch(instr) => return Some(false),
+            // non-branch instruction (const/local/arith) — allowed before the guard
+            _ => {}
         }
-        // non-branch instruction (const/local/arith) — allowed before the guard
     }
-    GuardPos::NoGuard
+    None
+}
+
+/// xahaud requires the FIRST branch instruction in a loop body to be `call _g`.
+/// We mirror xahaud's flattened-stream view by descending in execution order
+/// through any leading unconditional `block` (a shape clang -O2 emits when it
+/// wraps the guarded loop head) — but conservatively, never crediting a guard
+/// that sits behind an `if`/`else` or other conditional branch.
+fn loop_guard_pos(lf: &LocalFunction, seq: InstrSeqId, g: FunctionId) -> GuardPos {
+    match first_branch_is_guard(lf, seq, g) {
+        Some(true) => GuardPos::Compliant,
+        // Guard not provably first. Distinguish "present but mispositioned" from
+        // "no guard at all" by scanning the whole (nested) loop body.
+        Some(false) | None => {
+            if contains_g_anywhere(lf, seq, g) {
+                GuardPos::Mispositioned
+            } else {
+                GuardPos::NoGuard
+            }
+        }
+    }
 }
 
 /// Recurse the structured IR. On each `loop`, require a direct `_g` call.
@@ -637,5 +710,74 @@ mod tests {
     fn memory_excess_is_info() {
         let f = lint_wat(&format!("(module {G} {ACCEPT} (memory 3) {HOOK})"));
         assert!(has(&f, "MEMORY_EXCESS"), "got {:?}", ids(&f));
+    }
+
+    // ---- positional-guard tests (Finding #1: false-positive on nested guard) ----
+
+    // A loop body whose guard sits inside a LEADING unconditional `block`:
+    //   (loop (block (call _g) ...) ...)
+    // is a shape clang -O2 emits. xahaud walks the flattened stream and sees `_g`
+    // first, so it must NOT be flagged. Pre-fix this false-flagged UNGUARDED_LOOP.
+    #[test]
+    fn guard_inside_leading_block_is_not_flagged() {
+        let hook = r#"(func (export "hook") (param i32) (result i64)
+            (loop $l
+                (block
+                    (call 0 (i32.const 1) (i32.const 65535))
+                    (drop))
+                (br_if $l (i32.const 0)))
+            (i64.const 0))"#;
+        let f = lint_wat(&format!("(module {G} {ACCEPT} {hook})"));
+        assert!(!has(&f, "UNGUARDED_LOOP"), "nested-block guard wrongly flagged unguarded: {:?}", ids(&f));
+        assert!(!has(&f, "GUARD_NOT_FIRST"), "nested-block guard wrongly flagged mispositioned: {:?}", ids(&f));
+    }
+
+    // A genuinely unguarded loop (no `_g` anywhere in its body) MUST still be
+    // flagged — accepting it would ship a temMALFORMED hook on-chain.
+    #[test]
+    fn truly_unguarded_loop_is_flagged() {
+        let hook = r#"(func (export "hook") (param i32) (result i64)
+            (loop $l
+                (br_if $l (i32.const 0)))
+            (i64.const 0))"#;
+        let f = lint_wat(&format!("(module {G} {ACCEPT} {hook})"));
+        assert!(has(&f, "UNGUARDED_LOOP"), "unguarded loop must be flagged: {:?}", ids(&f));
+    }
+
+    // CONSERVATIVE: a `_g` reachable only inside ONE `if` branch is NOT
+    // unconditionally-first (execution can skip it), so it must STILL be flagged.
+    // Treating it as guarded would be a false-negative -> on-chain temMALFORMED.
+    #[test]
+    fn guard_only_in_one_if_branch_is_flagged() {
+        let hook = r#"(func (export "hook") (param i32) (result i64)
+            (loop $l
+                (if (i32.const 1)
+                    (then
+                        (call 0 (i32.const 1) (i32.const 65535))
+                        (drop)))
+                (br_if $l (i32.const 0)))
+            (i64.const 0))"#;
+        let f = lint_wat(&format!("(module {G} {ACCEPT} {hook})"));
+        // Guard is present but behind a conditional -> mispositioned, NOT compliant.
+        assert!(has(&f, "GUARD_NOT_FIRST"),
+            "conditional-only guard must be flagged GUARD_NOT_FIRST (conservative): {:?}", ids(&f));
+        assert!(!f.iter().any(|x| x.rule_id == "UNGUARDED_LOOP"),
+            "guard IS present (just conditional), so not UNGUARDED_LOOP: {:?}", ids(&f));
+    }
+
+    // A leading `block` with no branch, then the guard at top level afterwards,
+    // is still compliant (the empty/branchless block doesn't displace the guard).
+    #[test]
+    fn branchless_leading_block_then_guard_is_compliant() {
+        let hook = r#"(func (export "hook") (param i32) (result i64)
+            (loop $l
+                (block (drop (i32.const 7)))
+                (call 0 (i32.const 1) (i32.const 65535))
+                (drop)
+                (br_if $l (i32.const 0)))
+            (i64.const 0))"#;
+        let f = lint_wat(&format!("(module {G} {ACCEPT} {hook})"));
+        assert!(!has(&f, "UNGUARDED_LOOP") && !has(&f, "GUARD_NOT_FIRST"),
+            "branchless leading block then guard should be compliant: {:?}", ids(&f));
     }
 }

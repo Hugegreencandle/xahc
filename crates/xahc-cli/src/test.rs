@@ -88,6 +88,11 @@ pub fn run(path: &Path) -> Result<TestSummary> {
     let mut failed = 0usize;
 
     for c in &tf.cases {
+        // Validate the tx-type number against the canonical table (matches
+        // install-tx's parse_types). A bad/typo'd `tt` would otherwise run the
+        // hook against a tx type that does not exist on Xahau, silently producing
+        // a meaningless pass/fail.
+        validate_tt(c.tt).with_context(|| format!("case `{}`", c.name))?;
         let mut fixture = sim::TxFixture { tt: c.tt, drops: c.drops, ..Default::default() };
         for (k, v) in &c.fields {
             let fid = parse_field_id(k).with_context(|| format!("case `{}`: bad field key `{}`", c.name, k))?;
@@ -140,6 +145,17 @@ fn check(c: &Case, result: Result<sim::SimResult>) -> (bool, String) {
     if c.emits.is_some() { d += &format!(" emits={}", emitted.len()); }
     if c.state_keys.is_some() { d += &format!(" state={}", state.len()); }
     (true, d)
+}
+
+/// Reject a `tt` that isn't a known Xahau transaction type, resolving against the
+/// canonical TX_TYPES table (the same source install-tx validates against).
+fn validate_tt(tt: i64) -> Result<()> {
+    let n: u32 = u32::try_from(tt)
+        .map_err(|_| anyhow::anyhow!("transaction-type {} is out of range", tt))?;
+    if !crate::installtx::TX_TYPES.iter().any(|(_, v)| *v == n) {
+        bail!("transaction-type {} is not a known Xahau type", tt);
+    }
+    Ok(())
 }
 
 /// "type.field" (e.g. "2.14") or a known sf alias -> field-id (type<<16)+field.
@@ -207,5 +223,18 @@ mod tests {
     #[test]
     fn hex_odd_errs() {
         assert!(parse_hex("abc").is_err());
+    }
+
+    #[test]
+    fn validate_tt_accepts_known_types() {
+        assert!(validate_tt(0).is_ok());   // Payment
+        assert!(validate_tt(99).is_ok());  // Invoke
+        assert!(validate_tt(22).is_ok());  // SetHook
+    }
+
+    #[test]
+    fn validate_tt_rejects_unknown_and_out_of_range() {
+        assert!(validate_tt(250).is_err());  // not a known type
+        assert!(validate_tt(-1).is_err());   // out of range
     }
 }

@@ -41,19 +41,21 @@ pub struct VerifyResult {
     pub remote_code: Option<String>,
 }
 
-/// Map a tx-type name (or a raw number) to its numeric value for the local sim.
-fn tt_to_num(spec: &str) -> Result<i64> {
-    if let Ok(n) = spec.parse::<i64>() {
-        return Ok(n);
-    }
-    let n = match spec {
-        "Payment" => 0, "EscrowCreate" => 1, "EscrowFinish" => 2, "AccountSet" => 3,
-        "EscrowCancel" => 4, "SetRegularKey" => 5, "OfferCreate" => 7, "OfferCancel" => 8,
-        "TicketCreate" => 10, "SignerListSet" => 12, "TrustSet" => 20, "AccountDelete" => 21,
-        "SetHook" => 22, "ClaimReward" => 98, "Invoke" => 99, "Remit" => 95,
-        _ => bail!("unknown tx type `{}` (use a name like Payment/Invoke or a number)", spec),
-    };
-    Ok(n)
+/// Map a tx-type name (or a raw number) to its numeric value for the local sim,
+/// resolving from installtx's CANONICAL TX_TYPES table so the two sides of the
+/// toolchain never diverge on a tx-type (e.g. install-tx accepting a name that
+/// verify silently can't). Returns the canonical name too, so verify forwards a
+/// normalized name to the remote and the SAME-basis number to the local sim.
+fn tt_to_num(spec: &str) -> Result<(i64, String)> {
+    let n = crate::installtx::resolve_tx_type(spec)?;
+    // Canonical name for the resolved value (so a numeric `--tt 0` still sends a
+    // proper "Payment" to the remote VM, matching the local sim's numeric input).
+    let name = crate::installtx::TX_TYPES
+        .iter()
+        .find(|(_, v)| *v == n)
+        .map(|(name, _)| name.to_string())
+        .unwrap_or_else(|| spec.to_string());
+    Ok((n as i64, name))
 }
 
 /// Native XAH amount as the 8-byte STAmount the local sim builds (sim.rs):
@@ -77,8 +79,18 @@ pub fn run(wasm: &Path, tt: &str, drops: u64, remote: Option<&str>) -> Result<Ve
         .or_else(|| std::env::var("XAHC_SIM_URL").ok())
         .filter(|s| !s.is_empty())
         .context("no simulator URL — pass --remote <url> or set XAHC_SIM_URL (e.g. http://localhost:8787)")?;
+    // Require an explicit http(s) scheme. Without this an attacker-influenced or
+    // typo'd value (e.g. "file://", "localhost:8787" parsed oddly, or a bare host)
+    // could send the request somewhere unintended — and a scheme-less string would
+    // not be a usable URL anyway. Narrow the SSRF surface to deliberate http(s).
+    if !(base.starts_with("http://") || base.starts_with("https://")) {
+        bail!(
+            "simulator URL must start with http:// or https:// (got `{}`) — pass a full URL like http://localhost:8787",
+            base
+        );
+    }
     let endpoint = format!("{}/execute", base.trim_end_matches('/'));
-    let tt_num = tt_to_num(tt)?;
+    let (tt_num, tt_name) = tt_to_num(tt)?;
 
     // --- local sim ---
     let fixture = sim::TxFixture { tt: tt_num, drops, ..Default::default() };
@@ -102,7 +114,10 @@ pub fn run(wasm: &Path, tt: &str, drops: u64, remote: Option<&str>) -> Result<Ve
     otxn.insert(SF_AMOUNT_ID.to_string(), Value::String(native_amount_hex(drops)));
     otxn.insert(SF_ACCOUNT_ID.to_string(), Value::String("00".repeat(20)));
     otxn.insert(SF_DESTINATION_ID.to_string(), Value::String("00".repeat(20)));
-    let payload = serde_json::json!({ "wasmHex": wasm_hex, "txType": tt, "otxnFields": Value::Object(otxn) });
+    // Send the CANONICAL name resolved from the shared table (not the raw `tt`), so
+    // a numeric `--tt 0` and a name `--tt Payment` send the identical "Payment" to
+    // the remote VM, matching the local sim's resolved numeric input exactly.
+    let payload = serde_json::json!({ "wasmHex": wasm_hex, "txType": tt_name, "otxnFields": Value::Object(otxn) });
     let resp: Value = ureq::post(&endpoint)
         .send_json(payload)
         .map_err(|e| anyhow!("POST {} failed: {}", endpoint, e))?
@@ -127,7 +142,7 @@ pub fn run(wasm: &Path, tt: &str, drops: u64, remote: Option<&str>) -> Result<Ve
 
     Ok(VerifyResult {
         remote_url: endpoint,
-        tx_type: tt.to_string(),
+        tx_type: tt_name,
         drops,
         local: local.to_string(),
         remote,
