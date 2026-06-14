@@ -117,8 +117,8 @@ stdout (diagnostics stay on stderr) — pipeable into CI, the web funnel, or xah
 
 Beyond the structural checks (which catch `temMALFORMED`-class on-chain rejections),
 lint also runs **semantic safety** rules — runtime/correctness footguns that deploy
-fine but misbehave: `NO_EXIT_PATH` (no `accept`/`rollback` — error), `EMIT_WITHOUT_RESERVE`,
-`REENTRANCY_EMIT`, `STATE_FOREIGN_WRITE`, plus advisories (`info`) for `emit`-without-`cbak`,
+fine but misbehave: `NO_EXIT_PATH` (no `accept`/`rollback`), `EMIT_WITHOUT_RESERVE`,
+`REENTRANCY_EMIT`, `STATE_FOREIGN_WRITE` (all `warn`), plus advisories (`info`) for `emit`-without-`cbak`,
 XFL use, oversize wasm, and excess memory. These mirror the wasm-tractable rules in
 xahau-mcp's analyzer, so `xahc lint` (author side) and the MCP (verify side) agree.
 

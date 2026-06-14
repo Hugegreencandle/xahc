@@ -150,12 +150,15 @@ fn check_semantics(m: &Module, wasm: &[u8]) -> Vec<Finding> {
         .collect();
     let imp = |n: &str| imports.contains(n);
 
-    // NO_EXIT_PATH (~ HOOK-001-NO-EXIT, CRITICAL): a hook importing neither accept
-    // nor rollback can never terminate a transaction decision — it traps / is rejected.
+    // NO_EXIT_PATH (~ HOOK-001-NO-EXIT): a hook importing neither accept nor rollback
+    // makes no explicit accept/reject decision — it can only fall through to a plain
+    // `return` (the VM reports this as RETURNED, an unusual outcome, almost always a
+    // bug). WARN, not error: xahaud does not reject this as temMALFORMED, so blocking
+    // build/install would refuse an odd-but-deployable hook.
     if !imp("accept") && !imp("rollback") {
-        out.push(Finding::error(
+        out.push(Finding::warn(
             "NO_EXIT_PATH",
-            "imports neither `accept` nor `rollback` — the hook cannot terminate a transaction decision (it will trap or be rejected). End every path with accept() or rollback().",
+            "imports neither `accept` nor `rollback` — the hook makes no explicit accept/reject decision and can only fall through to a plain return (almost always a bug). End every path with accept() or rollback().",
         ));
     }
 
@@ -564,10 +567,13 @@ mod tests {
     }
 
     #[test]
-    fn no_exit_path_is_error() {
+    fn no_exit_path_warns_not_blocks() {
         let f = lint_wat(&format!("(module {G} {HOOK})"));
-        assert!(f.iter().any(|x| x.rule_id == "NO_EXIT_PATH" && x.level == Level::Error),
-            "expected NO_EXIT_PATH error, got {:?}", ids(&f));
+        // WARN, not error — must not gate build/install (xahaud doesn't reject this).
+        assert!(f.iter().any(|x| x.rule_id == "NO_EXIT_PATH" && x.level == Level::Warn),
+            "expected NO_EXIT_PATH warn, got {:?}", ids(&f));
+        assert!(!f.iter().any(|x| x.level == Level::Error),
+            "no rule should hard-block this hook, got {:?}", ids(&f));
     }
 
     #[test]

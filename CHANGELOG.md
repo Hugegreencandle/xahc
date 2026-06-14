@@ -3,6 +3,19 @@
 All notable changes to xahc are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); versioning is [SemVer](https://semver.org/).
 
+## [1.8.1] - 2026-06-14
+
+Post-release audit fix.
+
+### Changed
+- **`NO_EXIT_PATH` downgraded from `error` to `warn`.** A hook importing neither
+  `accept` nor `rollback` falls through to a plain return — unusual and almost
+  always a bug, but xahaud does **not** reject it as `temMALFORMED` (the VM models
+  it as a distinct `RETURNED` outcome). Blocking `build`/`install-tx` on it could
+  refuse an odd-but-deployable hook, so it now warns instead of gating. Message no
+  longer overclaims "will be rejected." (Aligns with the analyzer's finding-not-block
+  semantics and the "don't hard-block valid hooks" rule.)
+
 ## [1.8.0] - 2026-06-14
 
 Semantic safety lints — `xahc lint` now catches runtime/correctness footguns, not
