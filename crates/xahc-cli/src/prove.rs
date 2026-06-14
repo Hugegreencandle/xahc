@@ -5,6 +5,18 @@
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// RAII guard that deletes a temp file on drop — covers the prover-success,
+/// disprove, AND early-return/`?`-error paths so a built `.wasm` is never leaked.
+struct TempFileGuard(PathBuf);
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        // Best-effort: a failed unlink (already gone, permissions) must not panic.
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
 
 pub struct Opts<'a> {
     pub invariant: &'a str,
@@ -21,6 +33,15 @@ const INVARIANTS: &[(&str, &str)] = &[
     ("conservation", "prove_conservation.py"),
 ];
 
+/// Resolve the xahc-prover checkout.
+///
+/// SECURITY: the resolved directory's scripts are executed as TRUSTED CODE
+/// (the host Python runs `src/<invariant>.py`). The auto-discovery fallbacks
+/// (`$HOME/Desktop/xahc-prover`, `$HOME/xahc-prover`, `../xahc-prover`,
+/// `./xahc-prover`) only confirm a `src/` dir exists — they do NOT authenticate
+/// the contents. In CI or any untrusted working directory, set `XAHC_PROVER_DIR`
+/// explicitly to a known-good checkout so a stray sibling/cwd `xahc-prover` can't
+/// be picked up and run.
 fn prover_dir() -> Result<PathBuf> {
     if let Ok(d) = std::env::var("XAHC_PROVER_DIR") {
         let p = PathBuf::from(d);
@@ -74,13 +95,20 @@ pub fn run(input: &Path, opts: &Opts) -> Result<i32> {
     let py = python(&dir);
 
     // A .c input is built to a temporary .wasm first; a .wasm is proven directly.
-    let wasm: PathBuf = if input.extension().is_some_and(|e| e == "c") {
-        let out = std::env::temp_dir().join(format!("xahc_prove_{}.wasm", std::process::id()));
-        crate::build::run(input, &out, &[], true)?;
-        out
-    } else {
-        input.to_path_buf()
-    };
+    // The temp build is wrapped in a drop-guard so it's unlinked on every exit
+    // path — prover success, disprove, or an early `?` error (e.g. a build or
+    // spawn failure). `_guard` is held for the whole fn so cleanup runs last.
+    let (wasm, _guard): (PathBuf, Option<TempFileGuard>) =
+        if input.extension().is_some_and(|e| e == "c") {
+            let out = std::env::temp_dir().join(temp_wasm_name());
+            // Register the guard BEFORE the build so a build that partially wrote
+            // the file (then errored) is still cleaned up.
+            let guard = TempFileGuard(out.clone());
+            crate::build::run(input, &out, &[], true)?;
+            (out, Some(guard))
+        } else {
+            (input.to_path_buf(), None)
+        };
 
     let mut cmd = Command::new(&py);
     cmd.arg(dir.join("src").join(script)).arg(&wasm).args(opts.rest);
@@ -88,4 +116,19 @@ pub fn run(input: &Path, opts: &Opts) -> Result<i32> {
         .status()
         .with_context(|| format!("failed to run the prover ({})", py.display()))?;
     Ok(status.code().unwrap_or(1))
+}
+
+/// A non-predictable temp .wasm filename. PID alone is predictable and reused
+/// across runs/processes; mixing in a nanosecond timestamp and the file count
+/// makes accidental collision / pre-creation by another actor impractical
+/// without pulling in an extra crate.
+fn temp_wasm_name() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    // A relaxed counter disambiguates two builds within the same nanosecond tick.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("xahc_prove_{}_{:x}_{:x}.wasm", std::process::id(), nanos, seq)
 }

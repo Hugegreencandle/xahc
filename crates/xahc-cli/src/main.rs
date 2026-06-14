@@ -67,6 +67,26 @@ struct CleanJson {
     removed: usize,
 }
 
+#[derive(Serialize)]
+struct ProveJson {
+    invariant: String,
+    input: String,
+    /// proven | counterexample | inconclusive | error — derived from exit_code.
+    verdict: &'static str,
+    exit_code: i32,
+}
+
+/// Map the prover's exit code to a stable verdict string.
+/// 0 PROVEN, 2 COUNTEREXAMPLE, 3 INCONCLUSIVE, anything else = prover/tool error.
+fn prove_verdict(code: i32) -> &'static str {
+    match code {
+        0 => "proven",
+        2 => "counterexample",
+        3 => "inconclusive",
+        _ => "error",
+    }
+}
+
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{:02X}", x)).collect()
 }
@@ -154,7 +174,8 @@ enum Cmd {
         remote: Option<String>,
     },
     /// Prove an invariant holds for ALL inputs (xahc-prover, symbolic execution + Z3).
-    /// Exit code: 0 PROVEN, 2 COUNTEREXAMPLE, 3 INCONCLUSIVE.
+    /// Exit code: 0 PROVEN, 2 COUNTEREXAMPLE, 3 INCONCLUSIVE. With --json, also emits
+    /// a {invariant,input,verdict,exit_code} envelope (the prover's own output is prose).
     Prove {
         /// Hook .wasm (or .c, built first)
         input: PathBuf,
@@ -311,6 +332,18 @@ fn main() -> Result<()> {
         }
         Cmd::Prove { input, invariant, rest } => {
             let code = prove::run(&input, &prove::Opts { invariant: &invariant, rest: &rest })?;
+            if cli.json {
+                // Machine signal: the prover only speaks via exit code, so the
+                // envelope derives the verdict from it. The human prose the prover
+                // printed went to stdout above; in --json mode CI should read this
+                // envelope (and exit_code) rather than parse that prose.
+                print_json(&ProveJson {
+                    invariant: invariant.clone(),
+                    input: input.display().to_string(),
+                    verdict: prove_verdict(code),
+                    exit_code: code,
+                });
+            }
             std::process::exit(code);
         }
     }

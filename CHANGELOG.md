@@ -3,6 +3,32 @@
 All notable changes to xahc are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); versioning is [SemVer](https://semver.org/).
 
+## [1.9.1] - 2026-06-14
+
+`xahc prove` CLI integration fixes (residual audit LOW/MED items; the Rust glue
+stays exit-code-only with no shell injection).
+
+### Fixed
+- **Temp `.wasm` leak + predictable name on `prove <file>.c` (LOW).** Building a
+  `.c` input to a temp `.wasm` used a PID-based name (`xahc_prove_<pid>.wasm`,
+  predictable/reused) and never deleted the file. The temp name now mixes PID, a
+  nanosecond timestamp, and an atomic sequence counter, and an RAII drop-guard
+  removes the file on every exit path — prover success, disprove, or an early
+  `?`-error (build/spawn failure). No new dependency added.
+
+### Added
+- **`prove` honors `--json` (MEDIUM).** `xahc --json prove` previously emitted only
+  the prover's human prose despite the global `--json` contract. It now also prints
+  a stable `{invariant, input, verdict, exit_code}` envelope, with `verdict`
+  derived from the prover exit code (`0`=proven, `2`=counterexample,
+  `3`=inconclusive, else `error`). The human (non-`--json`) path is unchanged.
+
+### Docs
+- **`prove` prover discovery (informational).** `prover_dir()` now documents that
+  the resolved checkout is executed as trusted code and that `XAHC_PROVER_DIR`
+  should be set explicitly in CI / untrusted working directories so a stray
+  sibling/cwd `xahc-prover` cannot be auto-discovered and run.
+
 ## [1.9.0] - 2026-06-14
 
 Audit fixes — guard-lint false-positive, doc/severity-claim accuracy, and
