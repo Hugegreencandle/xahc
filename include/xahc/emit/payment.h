@@ -76,10 +76,12 @@ static inline uint32_t xahc_build_payment(
     *p++ = 0x83; *p++ = 0x14; for (int i=0;i<20;++i) *p++ = to20[i];/* Destination */
 
     int64_t edlen = etxn_details((uint32_t)p, XAHC_PAYMENT_SIZE - (uint32_t)(p - buf));
+    if (edlen < 0) rollback(0, 0, (int64_t)__LINE__);   /* host error -> stop, don't corrupt the buffer */
     p += edlen;
 
     uint32_t len = (uint32_t)(p - buf);
     int64_t fee = etxn_fee_base((uint32_t)buf, len);
+    if (fee < 0) rollback(0, 0, (int64_t)__LINE__);
     fee_ptr[1] = 0x40 | ((fee>>56)&0x3F);
     fee_ptr[2] = fee>>48; fee_ptr[3] = fee>>40; fee_ptr[4] = fee>>32; fee_ptr[5] = fee>>24;
     fee_ptr[6] = fee>>16; fee_ptr[7] = fee>>8; fee_ptr[8] = fee;
@@ -132,6 +134,7 @@ static inline uint32_t xahc_build_payment_iou(
     int64_t alen = float_sto((uint32_t)p, XAHC_PAYMENT_IOU_SIZE - (uint32_t)(p - buf),
                              (uint32_t)currency20, 20, (uint32_t)issuer20, 20,
                              xfl, sfAmount);
+    if (alen < 0) rollback(0, 0, (int64_t)__LINE__);   /* bad XFL/currency/issuer -> stop */
     p += alen;
 
     uint8_t* fee_ptr = p;
@@ -141,10 +144,12 @@ static inline uint32_t xahc_build_payment_iou(
     *p++ = 0x83; *p++ = 0x14; for (int i=0;i<20;++i) *p++ = to20[i];/* Destination */
 
     int64_t edlen = etxn_details((uint32_t)p, XAHC_PAYMENT_IOU_SIZE - (uint32_t)(p - buf));
+    if (edlen < 0) rollback(0, 0, (int64_t)__LINE__);
     p += edlen;
 
     uint32_t len = (uint32_t)(p - buf);
     int64_t fee = etxn_fee_base((uint32_t)buf, len);
+    if (fee < 0) rollback(0, 0, (int64_t)__LINE__);
     fee_ptr[1] = 0x40 | ((fee>>56)&0x3F);
     fee_ptr[2] = fee>>48; fee_ptr[3] = fee>>40; fee_ptr[4] = fee>>32; fee_ptr[5] = fee>>24;
     fee_ptr[6] = fee>>16; fee_ptr[7] = fee>>8; fee_ptr[8] = fee;

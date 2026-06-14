@@ -41,9 +41,12 @@ pub fn clean_bytes(wasm: &[u8]) -> Result<(Vec<u8>, usize)> {
         m.exports.delete(id);
     }
 
-    // Drop leftover compiler custom sections (target_features etc.).
-    for name in ["target_features", "producers", "name"] {
-        m.customs.remove_raw(name);
+    // Drop ALL custom sections — a hook needs none, and xahaud rejects unknown
+    // ones. (name/producers are also suppressed at emit by the config above;
+    // this also catches target_features, linking, reloc.*, .debug_*, etc.)
+    let custom_names: Vec<String> = m.customs.iter().map(|(_, c)| c.name().to_string()).collect();
+    for name in custom_names {
+        m.customs.remove_raw(&name);
     }
 
     Ok((m.emit_wasm(), removed))

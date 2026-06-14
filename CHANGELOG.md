@@ -3,6 +3,28 @@
 All notable changes to xahc are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); versioning is [SemVer](https://semver.org/).
 
+## [1.6.1] - 2026-06-14
+
+Post-audit hardening (5-reviewer audit of the money-touching + new-surface code).
+
+### Fixed
+- **Emit builders check host-fn returns.** `etxn_details` / `etxn_fee_base` /
+  `float_sto` return a negative error code on failure; the builders now
+  `rollback` on a negative instead of advancing the buffer pointer by a negative
+  length (which would corrupt the emit / shift a negative). Native + IOU paths.
+- **`clean` strips ALL custom sections** (not just name/producers/target_features)
+  — also any `linking`/`reloc.*`/`.debug_*` — so no stray section reaches xahaud.
+- **`install-tx` rejects an unknown numeric tx type** in `--on` (was silently
+  ignored by the HookOn encoder, so the user thought it fired on that type).
+- **`build` surfaces guard-reposition skips** — a loop guard with non-literal
+  args is left in place and now warned, not silent.
+
+### Known (documented, deferred)
+- `xahc lint`'s guard check is **presence**, not **positional** — it can't catch a
+  *mispositioned* guard the way xahaud does (built hooks are safe; the build pass
+  fixes position). Positional lint is planned for v1.7.
+- `check_stack` ignores `call_indirect` targets (underestimates depth).
+
 ## [1.6.0] - 2026-06-14
 
 Guard-reposition pass — hooks build at `-O2` again, no `-Oz` dependency.

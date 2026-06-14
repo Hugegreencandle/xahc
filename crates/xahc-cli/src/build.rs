@@ -65,6 +65,12 @@ pub fn run(input: &Path, output: &Path, extra_includes: &[PathBuf], do_lint: boo
             "warn".yellow(), grep.unguarded_loops
         );
     }
+    if grep.skipped > 0 {
+        println!(
+            "{} {} loop guard(s) had non-literal args, left in place — may be rejected on-chain; verify on testnet",
+            "warn".yellow(), grep.skipped
+        );
+    }
 
     // clean
     let (cleaned, removed) = clean::clean_bytes(&guarded)?;

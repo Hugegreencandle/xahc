@@ -20,6 +20,9 @@ pub struct Report {
     pub repositioned: usize,
     pub already_ok: usize,
     pub unguarded_loops: usize,
+    /// loops whose guard args weren't plain literals → left in place (may be
+    /// mispositioned; surfaced so it isn't silent).
+    pub skipped: usize,
 }
 
 pub fn reposition(wasm: &[u8]) -> Result<(Vec<u8>, Report)> {
@@ -29,11 +32,11 @@ pub fn reposition(wasm: &[u8]) -> Result<(Vec<u8>, Report)> {
         None => {
             // No guard import at all → no loops to guard (or an unguarded hook,
             // which lint catches separately). Pass through unchanged.
-            return Ok((m.emit_wasm(), Report { repositioned: 0, already_ok: 0, unguarded_loops: 0 }));
+            return Ok((m.emit_wasm(), Report { repositioned: 0, already_ok: 0, unguarded_loops: 0, skipped: 0 }));
         }
     };
 
-    let mut rep = Report { repositioned: 0, already_ok: 0, unguarded_loops: 0 };
+    let mut rep = Report { repositioned: 0, already_ok: 0, unguarded_loops: 0, skipped: 0 };
 
     let func_ids: Vec<FunctionId> = m
         .funcs
@@ -62,7 +65,7 @@ pub fn reposition(wasm: &[u8]) -> Result<(Vec<u8>, Report)> {
                 Hoist::AlreadyHead => rep.already_ok += 1,
                 Hoist::Moved => rep.repositioned += 1,
                 Hoist::NoGuard => rep.unguarded_loops += 1,
-                Hoist::Skip => rep.already_ok += 1, // non-literal args: leave it; lint will judge
+                Hoist::Skip => rep.skipped += 1, // non-literal args: left in place, surfaced by build
             }
         }
     }

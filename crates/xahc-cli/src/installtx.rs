@@ -58,6 +58,12 @@ fn parse_types(spec: &str) -> Result<HashSet<u32>> {
     let mut out = HashSet::new();
     for tok in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
         if let Ok(n) = tok.parse::<u32>() {
+            // Reject a numeric type that isn't a known Xahau tx type — otherwise
+            // it's silently ignored by encode_hook_on and the user thinks the
+            // hook fires on it.
+            if !TX_TYPES.iter().any(|(_, v)| *v == n) {
+                bail!("transaction-type number {} is not a known Xahau type", n);
+            }
             out.insert(n);
             continue;
         }
