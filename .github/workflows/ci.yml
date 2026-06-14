@@ -53,6 +53,13 @@ jobs:
           done
           echo "ok: clean on-chain shape"
 
+      - name: Lint rejects an unguarded loop (negative test)
+        run: |
+          if ./target/release/xahc build tests/fixtures/unguarded_loop.c -o /tmp/ng.wasm 2>/dev/null; then
+            echo "FAIL: an unguarded-loop hook built — lint must reject it (xahaud: temMALFORMED)"; exit 1
+          fi
+          echo "ok: unguarded loop correctly rejected"
+
       - name: install-tx HookOn regression (fire-on-Payment)
         run: |
           HO=$(./target/release/xahc install-tx /tmp/firewall.wasm \

@@ -3,6 +3,24 @@
 All notable changes to xahc are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); versioning is [SemVer](https://semver.org/).
 
+## [1.7.0] - 2026-06-14
+
+Positional guard lint — `xahc lint` now matches xahaud's guard verifier exactly.
+
+### Changed
+- **The guard check is POSITIONAL, not presence-based.** xahaud requires `_g` to
+  be the FIRST branch instruction in a loop (only const/local/arith may precede).
+  lint now enforces exactly that:
+  - `GUARD_NOT_FIRST` — a guard exists but a non-guard branch precedes it.
+  - `UNGUARDED_LOOP` — a loop with no `_g`.
+  Both are now **errors** (were warnings) — they cause `temMALFORMED` on-chain, so
+  `xahc build` / `install-tx` block them. Built hooks are unaffected: the
+  guard-reposition pass (v1.6.0) makes every built hook compliant.
+- **Validated against Xahau testnet:** lint's verdict equals the ledger's
+  `engine_result` across mispositioned / compliant / unguarded hooks (3/3).
+- Moved `unguarded_loop.c` to `tests/fixtures/` + a CI negative test asserting
+  `xahc build` fails on it.
+
 ## [1.6.1] - 2026-06-14
 
 Post-audit hardening (5-reviewer audit of the money-touching + new-surface code).

@@ -144,12 +144,50 @@ fn check_guards(m: &Module, g: FunctionId) -> Vec<Finding> {
     out
 }
 
-/// Does this instruction sequence directly (not in a nested seq) call `_g`?
-fn directly_guards(lf: &LocalFunction, seq: InstrSeqId, g: FunctionId) -> bool {
-    lf.block(seq)
-        .instrs
-        .iter()
-        .any(|(instr, _)| matches!(instr, Instr::Call(c) if c.func == g))
+enum GuardPos {
+    /// the first branch in the loop body is `call _g` — xahaud-compliant
+    Compliant,
+    /// a `_g` exists in the loop but a non-guard branch comes first
+    Mispositioned,
+    /// no `_g` call in the loop body at all
+    NoGuard,
+}
+
+/// A control-transfer / call instruction. xahaud's rule: only NON-branch
+/// instructions (const, local.*, arithmetic) may precede the guard `_g` in a loop.
+fn is_branch(instr: &Instr) -> bool {
+    matches!(
+        instr,
+        Instr::Call(_)
+            | Instr::CallIndirect(_)
+            | Instr::Br(_)
+            | Instr::BrIf(_)
+            | Instr::BrTable(_)
+            | Instr::IfElse(_)
+            | Instr::Loop(_)
+            | Instr::Block(_)
+            | Instr::Return(_)
+            | Instr::Unreachable(_)
+    )
+}
+
+/// xahaud requires the FIRST branch instruction in a loop body to be `call _g`.
+fn loop_guard_pos(lf: &LocalFunction, seq: InstrSeqId, g: FunctionId) -> GuardPos {
+    let instrs = &lf.block(seq).instrs;
+    for (instr, _) in instrs.iter() {
+        if matches!(instr, Instr::Call(c) if c.func == g) {
+            return GuardPos::Compliant; // guard is the first branch reached
+        }
+        if is_branch(instr) {
+            // a non-guard branch came first — is the guard present (just late) or missing?
+            let has_g = instrs
+                .iter()
+                .any(|(i, _)| matches!(i, Instr::Call(c) if c.func == g));
+            return if has_g { GuardPos::Mispositioned } else { GuardPos::NoGuard };
+        }
+        // non-branch instruction (const/local/arith) — allowed before the guard
+    }
+    GuardPos::NoGuard
 }
 
 /// Recurse the structured IR. On each `loop`, require a direct `_g` call.
@@ -157,12 +195,22 @@ fn walk_seq(lf: &LocalFunction, seq: InstrSeqId, g: FunctionId, label: &str, out
     for (instr, _) in lf.block(seq).instrs.iter() {
         match instr {
             Instr::Loop(l) => {
-                if !directly_guards(lf, l.seq, g) {
-                    out.push(Finding::warn("UNGUARDED_LOOP", format!(
-                        "unguarded loop in `{}` — add XAHC_GUARD(max) at the top of the loop \
-                         (heuristic: looks for a direct `_g` call in the loop body)",
-                        label
-                    )));
+                match loop_guard_pos(lf, l.seq, g) {
+                    GuardPos::Compliant => {}
+                    GuardPos::Mispositioned => out.push(Finding::error(
+                        "GUARD_NOT_FIRST",
+                        format!(
+                            "guard in `{}` is not the first instruction in the loop — xahaud \
+                             requires `_g` to be the first branch in a loop or it rejects the \
+                             hook (temMALFORMED). `xahc build` repositions it automatically; for a \
+                             hand-built wasm, put XAHC_GUARD() at the loop head.",
+                            label
+                        ),
+                    )),
+                    GuardPos::NoGuard => out.push(Finding::error(
+                        "UNGUARDED_LOOP",
+                        format!("unguarded loop in `{}` — add XAHC_GUARD(max) at the top of the loop (xahaud rejects unguarded loops: temMALFORMED)", label),
+                    )),
                 }
                 walk_seq(lf, l.seq, g, label, out);
             }
