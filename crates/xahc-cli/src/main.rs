@@ -7,6 +7,7 @@ mod doctor;
 mod guardpass;
 mod installtx;
 mod lint;
+mod prove;
 mod scaffold;
 mod sim;
 mod test;
@@ -152,6 +153,18 @@ enum Cmd {
         #[arg(long)]
         remote: Option<String>,
     },
+    /// Prove an invariant holds for ALL inputs (xahc-prover, symbolic execution + Z3).
+    /// Exit code: 0 PROVEN, 2 COUNTEREXAMPLE, 3 INCONCLUSIVE.
+    Prove {
+        /// Hook .wasm (or .c, built first)
+        input: PathBuf,
+        /// Invariant to prove: limit | guardrail | termination | monotonic
+        #[arg(long, default_value = "termination")]
+        invariant: String,
+        /// Extra args forwarded to the prover (e.g. a max_drops bound)
+        #[arg(last = true)]
+        rest: Vec<String>,
+    },
     /// Check the local toolchain can build hooks (clang/wasm-ld), with fix hints.
     Doctor,
     /// Scaffold a buildable hook project.
@@ -295,6 +308,10 @@ fn main() -> Result<()> {
             println!("{}", json);
             eprintln!("{} UNSIGNED — sign offline (xaman / xrpl-accountlib). Set Fee/Sequence at signing.",
                 "note:".yellow().bold());
+        }
+        Cmd::Prove { input, invariant, rest } => {
+            let code = prove::run(&input, &prove::Opts { invariant: &invariant, rest: &rest })?;
+            std::process::exit(code);
         }
     }
     Ok(())
