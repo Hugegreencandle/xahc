@@ -19,12 +19,14 @@ is the toolchain that audits and simulates them. Together they're the missing
 | Cap per-tx spend | not native | `LIM` parameter, enforced on every outgoing payment |
 | Lock to allowed destinations | deposit-auth (inbound only) | `DST` parameter on outbound |
 | Change policy without new keys | re-key / new signer set | re-install with new params (Flags=1) |
-| Bounded, auditable logic | n/a | not-Turing-complete, guard-bounded WASM — no open-ended execution risk |
+| Bounded, auditable logic | n/a | guard-bounded WASM (`_g`) — execution is bounded, narrowing open-ended execution risk |
 
-The "no smart-contract execution risk" argument *for* XRPL actually argues *for*
-Hooks too: they're deliberately **not Turing-complete** (every loop is `_g`-guarded,
-worst-case cost known ahead of time), so you get agent-policy programmability
-without the open-ended attack surface.
+The "no smart-contract execution risk" argument *for* XRPL also largely applies
+to Hooks: they are deliberately constrained — every loop is `_g`-guarded, so
+execution is bounded rather than open-ended — which gives you agent-policy
+programmability with a much smaller attack surface than a general smart-contract
+VM. (This bounds the Hook's own execution; it is not a guarantee about the safety
+of any particular policy you write — audit and testnet-confirm your Hook.)
 
 ## The kit
 

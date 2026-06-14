@@ -32,15 +32,34 @@ Xahau needs its own scheme binding.
   the server's requirements: `Destination = payTo`, `Amount ≤ maxAmountRequired`,
   a short `LastLedgerSequence` window (≈ `maxTimeoutSeconds`), and an
   `InvoiceID`/source-tag binding the payment to the request (replay protection).
-- **/verify** (facilitator, read-only): signature valid; `Amount`/`Destination`
-  match; `LastLedgerSequence` not expired; the payer account exists and is funded;
-  **and the payer's guardrail Hook would accept it** (run the wasm through
-  xahau-mcp `execute_hook` against the proposed tx — a pre-flight that the
-  on-chain Hook will repeat at settlement).
-- **/settle**: submit the signed tx; wait for validation (3–5s deterministic
-  finality); return tx hash. Xahau's Hook fires at settlement and is the final
-  authority — if the agent's policy rejects, the payment `tecHOOK_REJECTED`s and
-  no value moves.
+- **/verify** (facilitator, read-only): the requirements are complete (a valid
+  `payTo` and a strict `maxAmountRequired` — a missing bound is a failure, never
+  a skip); `NetworkID` matches; `tfPartialPayment` is absent; the **signature is
+  cryptographically verified AND bound to the payer** (xrpl `verifySignature`
+  against `SigningPubKey`, **then** `deriveAddress(SigningPubKey) == Account` —
+  `verifySignature` alone only proves the sig matches the embedded key, not that
+  the key belongs to `Account`, so a forged-`Account` tx with an attacker's key
+  would otherwise pass; a mismatch fails with `"signature does not match
+  Account"`, reported as `signatureVerified`); `Amount`/`Destination` match;
+  `LastLedgerSequence` not expired. The reference facilitator also reports
+  `guardrailHookPresent` (queried from `account_objects`) so the Hook guarantee
+  is conditional on a Hook actually being installed.
+  *Open/unimplemented (offline-unverifiable, deferred to on-chain settle):* a
+  **RegularKey**-signed tx (the signing key is authorized via an on-ledger
+  `SetRegularKey`, so it will NOT derive to `Account`) and **multisig
+  (`Signers`)** authorization (an on-ledger `SignerList`) cannot be validated by
+  the offline single-sig path — both are reported `signatureVerified:false`
+  rather than silently passed. Also open: running the payer's Hook wasm through
+  xahau-mcp `execute_hook` as a pre-settlement simulation (the on-chain Hook
+  still repeats the check at settlement).
+- **/settle**: re-run the full `/verify` checks (do not trust verify was called);
+  enforce single-use replay binding (`InvoiceID`/source-tag/`account:sequence`);
+  submit the signed tx; wait for validation (3–5s deterministic finality);
+  confirm `meta.delivered_amount >= required` (not just `tesSUCCESS`); return tx
+  hash. **If — and only if — the payer carries the guardrail Hook**, Xahau's Hook
+  fires at settlement and is the final authority: an over-policy payment
+  `tecHOOK_REJECTED`s and no value moves. An account with no Hook installed has
+  no L1 spending cap, so `guardrailHookPresent` must be checked, not assumed.
 
 ## Why the guardrail Hook matters here
 
@@ -52,8 +71,10 @@ The guardrail Hook does, at L1:
   a malicious server can't drain the account one request at a time beyond the cap.
 - `DST` (optional) locks the agent to an allowlisted payee set.
 - The Hook is the same authority at `/verify` (simulated) and at `/settle`
-  (enforced) — the facilitator can't be tricked into settling an over-policy tx,
-  because the ledger itself rejects it.
+  (enforced) — for a Hook-protected account the facilitator can't be tricked into
+  settling an over-policy tx, because the ledger itself rejects it. The
+  facilitator reports `guardrailHookPresent` so a caller never mistakes an
+  unprotected account for a protected one.
 
 So: **x402 handles the request/settlement handshake; the xahc Hook handles the
 agent's spending policy.** Clean separation, no overlap.
