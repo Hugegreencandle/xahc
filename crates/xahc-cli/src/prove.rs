@@ -31,7 +31,7 @@ const INVARIANTS: &[(&str, &str)] = &[
     ("monotonic", "prove_monotonic.py"),
     ("nospend", "prove_nospend.py"),
     ("conservation", "prove_conservation.py"),
-    ("limit_iou", "prove_limit_iou.py"),
+    ("limit-iou", "prove_limit_iou.py"),
     ("authz", "prove_authz.py"),
     ("validate", "prove_validate.py"),
     ("overflow", "prove_overflow.py"),

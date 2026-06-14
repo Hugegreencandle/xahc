@@ -3,6 +3,14 @@
 All notable changes to xahc are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); versioning is [SemVer](https://semver.org/).
 
+## [1.9.2] - 2026-06-14
+
+### Added
+- Expose the IOU spend-limit invariant via `xahc prove --invariant limit-iou`
+  (driver `prove_limit_iou.py` in xahc-prover). Canonical kebab name; help text and
+  CLAUDE.md invariant list updated to the full set (limit · guardrail · termination ·
+  monotonic · nospend · conservation · limit-iou · authz · validate · overflow).
+
 ## [1.9.1] - 2026-06-14
 
 `xahc prove` CLI integration fixes (residual audit LOW/MED items; the Rust glue

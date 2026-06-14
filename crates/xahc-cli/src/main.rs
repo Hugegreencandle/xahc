@@ -179,7 +179,7 @@ enum Cmd {
     Prove {
         /// Hook .wasm (or .c, built first)
         input: PathBuf,
-        /// Invariant: limit | guardrail | termination | monotonic | nospend | conservation | limit_iou | authz | validate | overflow
+        /// Invariant: limit | guardrail | termination | monotonic | nospend | conservation | limit-iou | authz | validate | overflow
         #[arg(long, default_value = "termination")]
         invariant: String,
         /// Extra args forwarded to the prover (e.g. a max_drops bound)
