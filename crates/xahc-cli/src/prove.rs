@@ -74,7 +74,7 @@ pub fn run(input: &Path, opts: &Opts) -> Result<i32> {
     let py = python(&dir);
 
     // A .c input is built to a temporary .wasm first; a .wasm is proven directly.
-    let wasm: PathBuf = if input.extension().map_or(false, |e| e == "c") {
+    let wasm: PathBuf = if input.extension().is_some_and(|e| e == "c") {
         let out = std::env::temp_dir().join(format!("xahc_prove_{}.wasm", std::process::id()));
         crate::build::run(input, &out, &[], true)?;
         out
