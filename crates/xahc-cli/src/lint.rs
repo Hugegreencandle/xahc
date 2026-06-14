@@ -38,7 +38,7 @@ pub const HOOK_API: &[&str] = &[
 
 #[derive(PartialEq, Eq, Clone, Copy, Serialize)]
 #[serde(rename_all = "lowercase")]
-pub enum Level { Error, Warn }
+pub enum Level { Error, Warn, Info }
 
 /// Stable machine-routable rule identifiers. Treat these as a COMPATIBILITY
 /// CONTRACT — xahau-mcp, CI gates, and any `--json` consumer key on them, so do
@@ -56,6 +56,9 @@ impl Finding {
     }
     pub fn warn(rule_id: &'static str, msg: impl Into<String>) -> Self {
         Finding { level: Level::Warn, rule_id, msg: msg.into() }
+    }
+    pub fn info(rule_id: &'static str, msg: impl Into<String>) -> Self {
+        Finding { level: Level::Info, rule_id, msg: msg.into() }
     }
 }
 
@@ -117,7 +120,122 @@ pub fn lint(wasm: &[u8]) -> Result<Vec<Finding>> {
     // 5. Stack budget: hooks have no heap; deep/large stack frames overflow.
     f.extend(check_stack(&m));
 
+    // 6. Semantic safety lints — runtime/correctness footguns that DEPLOY fine but
+    //    misbehave on-chain. Mirrors the wasm-tractable rules in xahau-mcp's analyzer
+    //    (the canonical verify side) so `xahc lint` and the MCP agree before you ever
+    //    reach simulation. Crosswalk to the MCP rule id is noted on each.
+    f.extend(check_semantics(&m, wasm));
+
     Ok(f)
+}
+
+/// Import/size-based safety checks. Zero false positives (you can't call a host fn
+/// you don't import). Each maps to a xahau-mcp analyzer rule (HOOK-*) so the two
+/// halves of the toolchain stay in agreement — see docs crosswalk in the analyzer.
+fn check_semantics(m: &Module, wasm: &[u8]) -> Vec<Finding> {
+    use std::collections::HashSet;
+    let mut out = Vec::new();
+
+    let imports: HashSet<&str> = m
+        .imports
+        .iter()
+        .filter(|i| i.module == "env" && matches!(i.kind, ImportKind::Function(_)))
+        .map(|i| i.name.as_str())
+        .collect();
+    let exports: HashSet<&str> = m
+        .exports
+        .iter()
+        .filter(|e| matches!(e.item, ExportItem::Function(_)))
+        .map(|e| e.name.as_str())
+        .collect();
+    let imp = |n: &str| imports.contains(n);
+
+    // NO_EXIT_PATH (~ HOOK-001-NO-EXIT, CRITICAL): a hook importing neither accept
+    // nor rollback can never terminate a transaction decision — it traps / is rejected.
+    if !imp("accept") && !imp("rollback") {
+        out.push(Finding::error(
+            "NO_EXIT_PATH",
+            "imports neither `accept` nor `rollback` — the hook cannot terminate a transaction decision (it will trap or be rejected). End every path with accept() or rollback().",
+        ));
+    }
+
+    // EMIT_WITHOUT_RESERVE (~ HOOK-009, MEDIUM): emit() needs a prior etxn_reserve(n);
+    // without it every emit fails at runtime (PREREQUISITE_NOT_MET).
+    if imp("emit") && !imp("etxn_reserve") {
+        out.push(Finding::warn(
+            "EMIT_WITHOUT_RESERVE",
+            "calls `emit` but never imports `etxn_reserve` — emitted transactions must be reserved first or the emit fails at runtime. Use the XAHC_EMIT_* macros (they reserve for you) or call etxn_reserve(n).",
+        ));
+    }
+
+    // REENTRANCY_EMIT (~ HOOK-010, MEDIUM): emit + cbak + hook_again can form an
+    // unbounded emission / re-execution loop.
+    if imp("emit") && imp("hook_again") && exports.contains("cbak") {
+        out.push(Finding::warn(
+            "REENTRANCY_EMIT",
+            "combines `emit`, `hook_again` and a `cbak` callback — verify this cannot form an unbounded emission / re-execution loop.",
+        ));
+    }
+
+    // EMIT_NO_CBAK (~ HOOK-003, INFO): advisory — fine unless you need to react to
+    // the emitted transaction's result.
+    if imp("emit") && !exports.contains("cbak") {
+        out.push(Finding::info(
+            "EMIT_NO_CBAK",
+            "calls `emit` but exports no `cbak` — fine unless you need to react to the emitted transaction's result.",
+        ));
+    }
+
+    // STATE_FOREIGN_WRITE (~ HOOK-008 foreign, MEDIUM) / STATE_WRITE (LOW): foreign
+    // writes touch ANOTHER account's state (needs a HookGrant) — flag louder.
+    if imp("state_foreign_set") {
+        out.push(Finding::warn(
+            "STATE_FOREIGN_WRITE",
+            "writes foreign state via `state_foreign_set` (modifies ANOTHER account's state) — confirm the target's HookGrant authorizes it and the value sizes are bounded.",
+        ));
+    } else if imp("state_set") {
+        out.push(Finding::info(
+            "STATE_WRITE",
+            "writes hook state via `state_set` — confirm value sizes are bounded (hook state grows the account reserve).",
+        ));
+    }
+
+    // FLOAT_USAGE (~ HOOK-012, INFO): XFL reminder.
+    if imports.iter().any(|n| n.starts_with("float_")) {
+        out.push(Finding::info(
+            "FLOAT_USAGE",
+            "uses the XFL float API (`float_*`) — handle results only with float_* operations (never native arithmetic) and compare via float_compare.",
+        ));
+    }
+
+    // OVERSIZE_WASM (~ HOOK-011, LOW): SetHook fee scales with CreateCode size.
+    const OVERSIZE_BYTES: usize = 64 * 1024;
+    if wasm.len() > OVERSIZE_BYTES {
+        out.push(Finding::info(
+            "OVERSIZE_WASM",
+            format!(
+                "wasm is {} bytes (> {} KiB) — the SetHook fee scales with CreateCode size; consider trimming.",
+                wasm.len(),
+                OVERSIZE_BYTES / 1024
+            ),
+        ));
+    }
+
+    // MEMORY_EXCESS (~ HOOK-013, LOW): hooks rarely need more than 2 pages.
+    const MEMORY_PAGE_CEIL: u64 = 2;
+    if let Some(mem) = m.memories.iter().next() {
+        if mem.initial > MEMORY_PAGE_CEIL {
+            out.push(Finding::info(
+                "MEMORY_EXCESS",
+                format!(
+                    "declares {} memory pages (> {}) — hooks rarely need this much linear memory.",
+                    mem.initial, MEMORY_PAGE_CEIL
+                ),
+            ));
+        }
+    }
+
+    out
 }
 
 /// FunctionId of the imported guard function `env._g`, if present.
@@ -394,11 +512,13 @@ pub fn report(findings: &[Finding]) {
         match fd.level {
             Level::Error => println!("{} {}", "error".red().bold(), fd.msg),
             Level::Warn => println!("{} {}", "warn".yellow().bold(), fd.msg),
+            Level::Info => println!("{} {}", "info".cyan().bold(), fd.msg),
         }
     }
     let errs = findings.iter().filter(|f| f.level == Level::Error).count();
-    let warns = findings.len() - errs;
-    println!("{} error(s), {} warning(s)", errs, warns);
+    let warns = findings.iter().filter(|f| f.level == Level::Warn).count();
+    let infos = findings.iter().filter(|f| f.level == Level::Info).count();
+    println!("{} error(s), {} warning(s), {} info", errs, warns, infos);
 }
 
 /// Same as `report` but to stderr — used by `build` (whose lint is a diagnostic
@@ -412,9 +532,104 @@ pub fn report_stderr(findings: &[Finding]) {
         match fd.level {
             Level::Error => eprintln!("{} {}", "error".red().bold(), fd.msg),
             Level::Warn => eprintln!("{} {}", "warn".yellow().bold(), fd.msg),
+            Level::Info => eprintln!("{} {}", "info".cyan().bold(), fd.msg),
         }
     }
     let errs = findings.iter().filter(|f| f.level == Level::Error).count();
-    let warns = findings.len() - errs;
-    eprintln!("{} error(s), {} warning(s)", errs, warns);
+    let warns = findings.iter().filter(|f| f.level == Level::Warn).count();
+    let infos = findings.iter().filter(|f| f.level == Level::Info).count();
+    eprintln!("{} error(s), {} warning(s), {} info", errs, warns, infos);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lint_wat(src: &str) -> Vec<Finding> {
+        let wasm = wat::parse_str(src).expect("valid wat");
+        lint(&wasm).expect("lint ok")
+    }
+    fn ids(f: &[Finding]) -> Vec<&str> { f.iter().map(|x| x.rule_id).collect() }
+    fn has(f: &[Finding], id: &str) -> bool { f.iter().any(|x| x.rule_id == id) }
+
+    // `_g` import keeps the baseline clear of NO_G_IMPORT; `accept` clears NO_EXIT_PATH.
+    const G: &str = r#"(import "env" "_g" (func (param i32 i32) (result i64)))"#;
+    const ACCEPT: &str = r#"(import "env" "accept" (func (param i32 i32 i64) (result i64)))"#;
+    const HOOK: &str = r#"(func (export "hook") (param i32) (result i64) (i64.const 0))"#;
+
+    #[test]
+    fn clean_hook_has_no_findings() {
+        let f = lint_wat(&format!("(module {G} {ACCEPT} {HOOK})"));
+        assert!(f.is_empty(), "expected clean, got {:?}", ids(&f));
+    }
+
+    #[test]
+    fn no_exit_path_is_error() {
+        let f = lint_wat(&format!("(module {G} {HOOK})"));
+        assert!(f.iter().any(|x| x.rule_id == "NO_EXIT_PATH" && x.level == Level::Error),
+            "expected NO_EXIT_PATH error, got {:?}", ids(&f));
+    }
+
+    #[test]
+    fn rollback_alone_satisfies_exit_path() {
+        let f = lint_wat(&format!(
+            r#"(module {G} (import "env" "rollback" (func (param i32 i32 i64) (result i64))) {HOOK})"#));
+        assert!(!has(&f, "NO_EXIT_PATH"), "rollback should count as an exit, got {:?}", ids(&f));
+    }
+
+    #[test]
+    fn emit_without_reserve_warns_and_advises_cbak() {
+        let f = lint_wat(&format!(
+            r#"(module {G} {ACCEPT}
+               (import "env" "emit" (func (param i32 i32 i32 i32) (result i64))) {HOOK})"#));
+        assert!(has(&f, "EMIT_WITHOUT_RESERVE"), "got {:?}", ids(&f));
+        assert!(has(&f, "EMIT_NO_CBAK"), "got {:?}", ids(&f));
+    }
+
+    #[test]
+    fn emit_with_reserve_and_cbak_is_clean() {
+        let f = lint_wat(&format!(
+            r#"(module {G} {ACCEPT}
+               (import "env" "emit" (func (param i32 i32 i32 i32) (result i64)))
+               (import "env" "etxn_reserve" (func (param i32) (result i64)))
+               (func (export "cbak") (param i32) (result i64) (i64.const 0))
+               {HOOK})"#));
+        assert!(!has(&f, "EMIT_WITHOUT_RESERVE"), "got {:?}", ids(&f));
+        assert!(!has(&f, "EMIT_NO_CBAK"), "got {:?}", ids(&f));
+    }
+
+    #[test]
+    fn reentrancy_emit_warns() {
+        let f = lint_wat(&format!(
+            r#"(module {G} {ACCEPT}
+               (import "env" "emit" (func (param i32 i32 i32 i32) (result i64)))
+               (import "env" "etxn_reserve" (func (param i32) (result i64)))
+               (import "env" "hook_again" (func (result i64)))
+               (func (export "cbak") (param i32) (result i64) (i64.const 0))
+               {HOOK})"#));
+        assert!(has(&f, "REENTRANCY_EMIT"), "got {:?}", ids(&f));
+    }
+
+    #[test]
+    fn foreign_state_write_warns() {
+        let f = lint_wat(&format!(
+            r#"(module {G} {ACCEPT}
+               (import "env" "state_foreign_set" (func (param i32 i32 i32 i32 i32 i32) (result i64))) {HOOK})"#));
+        assert!(has(&f, "STATE_FOREIGN_WRITE"), "got {:?}", ids(&f));
+    }
+
+    #[test]
+    fn float_usage_is_info() {
+        let f = lint_wat(&format!(
+            r#"(module {G} {ACCEPT}
+               (import "env" "float_set" (func (param i32 i64) (result i64))) {HOOK})"#));
+        assert!(f.iter().any(|x| x.rule_id == "FLOAT_USAGE" && x.level == Level::Info),
+            "got {:?}", ids(&f));
+    }
+
+    #[test]
+    fn memory_excess_is_info() {
+        let f = lint_wat(&format!("(module {G} {ACCEPT} (memory 3) {HOOK})"));
+        assert!(has(&f, "MEMORY_EXCESS"), "got {:?}", ids(&f));
+    }
 }

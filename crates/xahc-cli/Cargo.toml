@@ -25,3 +25,6 @@ toml = "0.8"
 include_dir = "0.7"
 sha2 = "0.10"
 ureq = { version = "2", features = ["json"] }
+
+[dev-dependencies]
+wat = "1"

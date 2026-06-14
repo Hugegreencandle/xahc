@@ -3,6 +3,29 @@
 All notable changes to xahc are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); versioning is [SemVer](https://semver.org/).
 
+## [1.8.0] - 2026-06-14
+
+Semantic safety lints — `xahc lint` now catches runtime/correctness footguns, not
+just structural (`temMALFORMED`-class) rejections. These mirror the wasm-tractable
+rules in xahau-mcp's analyzer, so the author side and the verify side agree before
+you ever reach simulation.
+
+### Added
+- **`NO_EXIT_PATH`** (error) — hook imports neither `accept` nor `rollback`; it
+  cannot terminate a transaction decision (traps / rejected). Blocks `build` /
+  `install-tx`. (~ xahau-mcp `HOOK-001-NO-EXIT`.)
+- **`EMIT_WITHOUT_RESERVE`** (warn) — calls `emit` without importing `etxn_reserve`;
+  every emit fails at runtime. The `XAHC_EMIT_*` macros reserve for you. (~ `HOOK-009`.)
+- **`REENTRANCY_EMIT`** (warn) — `emit` + `hook_again` + a `cbak` export can form an
+  unbounded emission / re-execution loop. (~ `HOOK-010`.)
+- **`STATE_FOREIGN_WRITE`** (warn) — `state_foreign_set` modifies another account's
+  state; confirm the HookGrant + bounds. (~ `HOOK-008` foreign.)
+- Advisories (new **`info`** level): `EMIT_NO_CBAK`, `STATE_WRITE`, `FLOAT_USAGE`,
+  `OVERSIZE_WASM`, `MEMORY_EXCESS`. (~ `HOOK-003/008/012/011/013`.)
+- New `info` severity in the `--json` envelope and the human report (does not gate
+  build/install — only errors do).
+- 9 new lint unit tests (WAT-based); 22 tests total.
+
 ## [1.7.0] - 2026-06-14
 
 Positional guard lint — `xahc lint` now matches xahaud's guard verifier exactly.

@@ -105,7 +105,7 @@ xahc install-tx myhook.wasm --account <rYourAccount> --on Payment   # unsigned S
 | `new <name> [--archetype]` | Scaffold a buildable project (firewall / accept_all / emitter / agent_guardrail) |
 | `build <in.c> -o <out.wasm>` | clang→wasm → clean → lint |
 | `clean <wasm>` | Strip stray exports (Rust hook-cleaner) |
-| `lint <wasm>` | Exports + Hook-API imports + per-loop guards + stack budget |
+| `lint <wasm>` | Exports + Hook-API imports + per-loop guards + stack budget + semantic safety (exit path, emit/reserve, foreign state, …) |
 | `sim <wasm> --tt --drops` | Local wasmtime run → accept/rollback, emits, state |
 | `test <suite.toml>` | Declarative asserted test suite over sim |
 | `install-tx <wasm> --account r…` | Emit an UNSIGNED SetHook (HookOn/namespace/params) |
@@ -114,6 +114,13 @@ xahc install-tx myhook.wasm --account <rYourAccount> --on Payment   # unsigned S
 Add `--json` to `build`/`lint`/`sim`/`test`/`clean` for a stable result envelope on
 stdout (diagnostics stay on stderr) — pipeable into CI, the web funnel, or xahau-mcp:
 `xahc build hook.c --json | jq .wasm_hex`. Lint findings carry stable `rule_id`s.
+
+Beyond the structural checks (which catch `temMALFORMED`-class on-chain rejections),
+lint also runs **semantic safety** rules — runtime/correctness footguns that deploy
+fine but misbehave: `NO_EXIT_PATH` (no `accept`/`rollback` — error), `EMIT_WITHOUT_RESERVE`,
+`REENTRANCY_EMIT`, `STATE_FOREIGN_WRITE`, plus advisories (`info`) for `emit`-without-`cbak`,
+XFL use, oversize wasm, and excess memory. These mirror the wasm-tractable rules in
+xahau-mcp's analyzer, so `xahc lint` (author side) and the MCP (verify side) agree.
 
 Write a hook:
 
