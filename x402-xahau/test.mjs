@@ -46,6 +46,36 @@ function blob(overrides = {}, { sign = true, tamper = null } = {}) {
 
 const req = { payTo: PAY_TO, maxAmountRequired: "1000000", network: "xahau" };
 
+// --- IOU / issued-amount test harness --------------------------------------
+// A token issuer + the asset the server prices in. Build REAL signed Payment blobs
+// whose Amount is an issued-amount object { currency, issuer, value }.
+const ISSUER = "rhub8VRN55s94qWKDv6jmDy1pUykJzF3wq";
+const IOU_ASSET = { currency: "USD", issuer: ISSUER };
+const iouReq = { payTo: PAY_TO, maxAmountRequired: "1.5", network: "xahau", asset: IOU_ASSET };
+
+/** Build a real, signed Payment blob whose Amount is an issued amount object. */
+function iouBlob(amountOverride = {}, txOverrides = {}, { sign = true, tamper = null } = {}) {
+  const tx = {
+    TransactionType: "Payment",
+    Account: PAYER,
+    Destination: PAY_TO,
+    Amount: { currency: "USD", issuer: ISSUER, value: "1.5", ...amountOverride },
+    Fee: "10",
+    Sequence: 1,
+    Flags: 0,
+    NetworkID: EXPECTED_NETWORK_ID,
+    LastLedgerSequence: 1000005,
+    SigningPubKey: publicKey,
+    ...txOverrides,
+  };
+  if (sign) {
+    const signingData = encodeForSigning(tx);
+    tx.TxnSignature = kp.sign(signingData, privateKey);
+  }
+  if (tamper) Object.assign(tx, tamper);
+  return encode(tx);
+}
+
 let r;
 
 // 1. valid, genuinely-signed exact payment
@@ -911,4 +941,364 @@ await new Promise((resolveTest, rejectTest) => {
   }).catch(rejectTest);
 });
 
-console.log("ok — all hardened verifyExact + settle cases pass");
+// ===========================================================================
+// ISSUED-AMOUNT (IOU / token) SUPPORT
+// ===========================================================================
+
+// ---- exact decimal comparator unit tests (the security-critical core) -------
+{
+  const { parseTokenValue: p, cmpTokenValue: c, tokenValueToString: ts } = __test;
+  const cmp = (a, b) => { const pa = p(a), pb = p(b); assert.ok(pa && pb, `both parse: ${a},${b}`); return c(pa, pb); };
+
+  // trailing-zero equality: "1.0" === "1", "100.00" === "100", "0.30" === "0.3".
+  assert.equal(cmp("1.0", "1"), 0, "1.0 == 1");
+  assert.equal(cmp("100.00", "100"), 0, "100.00 == 100");
+  assert.equal(cmp("0.30", "0.3"), 0, "0.30 == 0.3");
+  assert.equal(cmp("0.1", "0.10"), 0, "0.1 == 0.10");
+
+  // exponent forms equal their plain forms (no float drift).
+  assert.equal(cmp("1e3", "1000"), 0, "1e3 == 1000");
+  assert.equal(cmp("2.5E-4", "0.00025"), 0, "2.5E-4 == 0.00025");
+  assert.equal(cmp("0.000001", "1e-6"), 0, "0.000001 == 1e-6");
+
+  // many-digit values (16 significant digits — XRPL's precision ceiling).
+  assert.equal(cmp("1.234567890123456", "1.234567890123456"), 0, "16-digit equal");
+  assert.equal(cmp("9999999999999999", "9999999999999998"), 1, "big values: a>b by 1 ULP");
+  assert.equal(cmp("9999999999999998", "9999999999999999"), -1, "big values: a<b by 1 ULP");
+
+  // just over / under the max by one ULP at the precision boundary.
+  assert.equal(cmp("1.00000000000001", "1"), 1, "1 + 1e-14 > 1");
+  assert.equal(cmp("0.99999999999999", "1"), -1, "1 - 1e-14 < 1");
+
+  // LOAD-BEARING soundness proof: 2^53+1 vs 2^53 are BOTH valid 16-sig-digit XRPL
+  // token values, but IEEE754 double cannot represent 2^53+1 — parseFloat COLLAPSES
+  // them to equal. A naive parseFloat facilitator would accept 9007199254740993
+  // against a max of 9007199254740992 (over-payment) or pass an under-delivery. Our
+  // BigInt comparator distinguishes them exactly.
+  assert.equal(parseFloat("9007199254740993") === parseFloat("9007199254740992"), true,
+    "parseFloat WRONGLY collapses 2^53+1 and 2^53 (this is the unsoundness we guard against)");
+  assert.equal(cmp("9007199254740993", "9007199254740992"), 1,
+    "exact comparator distinguishes 2^53+1 > 2^53 (sound where parseFloat fails)");
+  assert.equal(cmp("9007199254740992", "9007199254740993"), -1, "and the reverse");
+
+  // a classic float-trap: 0.1 + 0.2 != 0.3 in IEEE754, but our compare is exact.
+  // (we can't add here, but we prove 0.3 strings compare exactly with no drift)
+  assert.equal(cmp("0.3", "0.30000000000000"), 0, "0.3 == 0.30000000000000 (no float drift)");
+  assert.equal(cmp("0.30000000000001", "0.3"), 1, "0.3 + 1e-14 > 0.3");
+
+  // very small / very large exponents within the XRPL token range.
+  assert.ok(p("1e80"), "1e80 in range");
+  assert.ok(p("9999999999999999e80"), "~1e96 (max, normExp 80) in range");
+  assert.ok(p("1e90"), "1e90 == 1e15 * 10^75, normExp 75 -> in range");
+  assert.equal(p("1e96"), null, "1e96 (normExp 81 > 80) out of range -> reject");
+  assert.equal(p("1e-82"), null, "1e-82 (normExp -97 < -96) out of range -> reject");
+  assert.equal(p("1e-100"), null, "1e-100 out of range -> reject");
+
+  // precision overflow: > 16 significant digits cannot be held exactly -> reject,
+  // NOT silently truncated (a truncation would let an under/over-payment slip).
+  assert.equal(p("1.0000000000000001"), null, "17 significant digits -> reject (no truncation)");
+  assert.equal(p("12345678901234567"), null, "17-digit integer -> reject");
+
+  // malformed values -> null.
+  for (const bad of ["", "0", "-5", "+5", "0x10", "abc", "1.5.5", "1e", "1.", ".5", " 1", "1 ", "Infinity", "NaN", "1,000"]) {
+    assert.equal(p(bad), null, `malformed token value '${bad}' -> null`);
+  }
+
+  // round-trip string rendering is exact.
+  assert.equal(ts(p("1.5")), "1.5");
+  assert.equal(ts(p("100.00")), "100");
+  assert.equal(ts(p("0.000001")), "0.000001");
+  assert.equal(ts(p("1e3")), "1000");
+}
+
+// ---- currency canonicalization (3-char ASCII <-> 40-hex are the same) -------
+{
+  const { canonicalizeCurrency: cc } = __test;
+  // The standard 40-hex encoding of "USD" must canonicalize to the SAME value as
+  // the ASCII "USD" (codec decodes standard codes to ASCII; servers may send either).
+  const usdHex = "0000000000000000000000005553440000000000";
+  assert.equal(cc("USD"), cc(usdHex), "ASCII USD == its 40-hex standard encoding");
+  // lowercase 'usd' is 3 printable ASCII chars -> canonicalizes structurally, but to a
+  // DIFFERENT hex than 'USD' (currency codes are case-sensitive).
+  assert.ok(cc("usd"), "lowercase 3-char code canonicalizes structurally");
+  assert.notEqual(cc("usd"), cc("USD"), "USD != usd (case-sensitive currency codes)");
+  // non-standard 40-hex codes pass through (uppercased).
+  assert.equal(cc("0158415500000000C1F76FF6ECB0BAC600000000"), "0158415500000000C1F76FF6ECB0BAC600000000");
+  assert.equal(cc("0158415500000000c1f76ff6ecb0bac600000000"), "0158415500000000C1F76FF6ECB0BAC600000000", "hex case-insensitive");
+  // rejects: native XRP, all-zero (native), malformed lengths.
+  assert.equal(cc("XRP"), null, "XRP rejected as an issued currency");
+  assert.equal(cc("0".repeat(40)), null, "all-zero (native) rejected");
+  assert.equal(cc(""), null);
+  assert.equal(cc("US"), null, "2-char rejected");
+  assert.equal(cc("ABCD"), null, "4-char non-hex rejected");
+  assert.equal(cc("ZZ"), null);
+}
+
+// ---- verify: IOU payments --------------------------------------------------
+
+// valid IOU payment within max -> isValid, echoes asset + value.
+r = verifyExact({ txBlob: iouBlob({ value: "1.5" }) }, iouReq);
+assert.equal(r.isValid, true, `valid IOU payment should pass: ${r.invalidReason}`);
+assert.equal(r.payer, PAYER);
+assert.equal(r.amount, "1.5", "echoes the verified token value");
+assert.deepEqual(r.asset, IOU_ASSET, "echoes the asset");
+assert.equal(r.signatureVerified, true, "IOU signature is cryptographically verified + bound to Account");
+
+// valid IOU strictly under max (1.0 <= 1.5).
+r = verifyExact({ txBlob: iouBlob({ value: "1.0" }) }, iouReq);
+assert.equal(r.isValid, true, `under-max IOU should pass: ${r.invalidReason}`);
+assert.equal(r.amount, "1", "1.0 normalizes to 1");
+
+// IOU exactly at max.
+r = verifyExact({ txBlob: iouBlob({ value: "1.5" }) }, { ...iouReq, maxAmountRequired: "1.50" });
+assert.equal(r.isValid, true, "IOU exactly at max (1.5 <= 1.50) passes");
+
+// IOU over max -> reject.
+r = verifyExact({ txBlob: iouBlob({ value: "1.50000000000001" }) }, iouReq);
+assert.equal(r.isValid, false, "IOU just over max must fail");
+assert.match(r.invalidReason, /maxAmountRequired/);
+r = verifyExact({ txBlob: iouBlob({ value: "2" }) }, iouReq);
+assert.equal(r.isValid, false, "IOU 2 > 1.5 must fail");
+assert.match(r.invalidReason, /maxAmountRequired/);
+
+// wrong currency -> reject.
+r = verifyExact({ txBlob: iouBlob({ currency: "EUR" }) }, iouReq);
+assert.equal(r.isValid, false, "wrong currency must fail");
+assert.match(r.invalidReason, /currency/);
+
+// wrong issuer -> reject.
+r = verifyExact({ txBlob: iouBlob({ issuer: "rJfeEF9Fh3gs7syURNy6daLJz68kyA65n1" }) }, iouReq);
+assert.equal(r.isValid, false, "wrong issuer must fail");
+assert.match(r.invalidReason, /issuer/);
+
+// asset-vs-native mismatch BOTH directions.
+//  (a) asset required (iouReq) but Amount is a native drops string.
+r = verifyExact({ txBlob: blob({ Amount: "1000000" }) }, iouReq);
+assert.equal(r.isValid, false, "native Amount when an asset is required must fail");
+assert.match(r.invalidReason, /asset mismatch/);
+//  (b) native required (req) but Amount is an issued-amount object.
+r = verifyExact({ txBlob: iouBlob({ value: "1.5" }) }, req);
+assert.equal(r.isValid, false, "issued Amount when native is required must fail");
+assert.match(r.invalidReason, /asset mismatch/);
+
+// malformed value in the Amount -> reject. The codec itself only ENCODES a subset
+// of malformed values (it rejects "abc" / over-precision at serialization); for the
+// ones it DOES encode ("0", negative), verifyExact must still reject after decode.
+for (const badVal of ["0", "-1"]) {
+  r = verifyExact({ txBlob: iouBlob({ value: badVal }) }, iouReq);
+  assert.equal(r.isValid, false, `malformed IOU value '${badVal}' must fail`);
+}
+// Values the codec refuses to encode (so they can't arrive as a real blob) are still
+// rejected at the facilitator layer — assert via checkIssuedAmount on a decoded-shape
+// object (defense in depth: verifyExact re-parses the decoded value too).
+{
+  const { checkIssuedAmount, parseTokenValue } = __test;
+  const maxV = parseTokenValue("1.5");
+  for (const badVal of ["abc", "1.0000000000000001", "0", "-1", "", "1.5.5"]) {
+    const out = checkIssuedAmount({ currency: "USD", issuer: ISSUER, value: badVal }, IOU_ASSET, maxV);
+    assert.ok(out.error, `checkIssuedAmount rejects value '${badVal}'`);
+  }
+  // a non-object Amount (string) when an asset is required -> rejected by checkIssuedAmount.
+  assert.ok(checkIssuedAmount("1000000", IOU_ASSET, maxV).error, "string Amount rejected for an asset");
+  assert.ok(checkIssuedAmount(null, IOU_ASSET, maxV).error, "null Amount rejected");
+}
+
+// malformed asset in the REQUIREMENTS -> incomplete requirements.
+r = verifyExact({ txBlob: iouBlob() }, { payTo: PAY_TO, maxAmountRequired: "1.5", asset: { currency: "XRP", issuer: ISSUER } });
+assert.equal(r.isValid, false, "asset.currency = XRP must fail");
+assert.match(r.invalidReason, /asset\.currency invalid/);
+r = verifyExact({ txBlob: iouBlob() }, { payTo: PAY_TO, maxAmountRequired: "1.5", asset: { currency: "USD", issuer: "rNOPE!!!" } });
+assert.equal(r.isValid, false, "asset.issuer invalid must fail");
+assert.match(r.invalidReason, /asset\.issuer invalid/);
+r = verifyExact({ txBlob: iouBlob() }, { payTo: PAY_TO, maxAmountRequired: "not-a-number", asset: IOU_ASSET });
+assert.equal(r.isValid, false, "IOU maxAmountRequired must be a valid token value");
+assert.match(r.invalidReason, /maxAmountRequired/);
+
+// requirements maxAmountRequired with too much precision -> reject.
+r = verifyExact({ txBlob: iouBlob() }, { payTo: PAY_TO, maxAmountRequired: "1.0000000000000001", asset: IOU_ASSET });
+assert.equal(r.isValid, false, "over-precision IOU max must fail");
+
+// asset.currency supplied as 40-hex must match an ASCII-currency tx Amount.
+r = verifyExact({ txBlob: iouBlob({ value: "1.5" }) }, { payTo: PAY_TO, maxAmountRequired: "1.5", asset: { currency: "0000000000000000000000005553440000000000", issuer: ISSUER } });
+assert.equal(r.isValid, true, `hex-form asset.currency must match ASCII USD Amount: ${r.invalidReason}`);
+
+// tampered IOU tx -> signature fails.
+r = verifyExact({ txBlob: iouBlob({ value: "1.5" }, {}, { tamper: { Amount: { currency: "USD", issuer: ISSUER, value: "0.5" } } }) }, iouReq);
+assert.equal(r.isValid, false, "tampered IOU tx must fail signature");
+assert.match(r.invalidReason, /signature/);
+
+// IOU tx still rejects tfPartialPayment + wrong NetworkID + missing expiry.
+r = verifyExact({ txBlob: iouBlob({ value: "1.5" }, { Flags: 0x00020000 }) }, iouReq);
+assert.equal(r.isValid, false);
+assert.match(r.invalidReason, /tfPartialPayment/);
+r = verifyExact({ txBlob: iouBlob({ value: "1.5" }, { NetworkID: 999 }) }, iouReq);
+assert.equal(r.isValid, false);
+assert.match(r.invalidReason, /NetworkID/);
+r = verifyExact({ txBlob: iouBlob({ value: "1.5" }, { LastLedgerSequence: undefined }) }, iouReq);
+assert.equal(r.isValid, false);
+assert.match(r.invalidReason, /LastLedgerSequence/);
+
+// native path remains byte-for-byte unchanged: re-assert case 1 still passes and
+// still returns asset:null.
+r = verifyExact({ txBlob: blob() }, req);
+assert.equal(r.isValid, true);
+assert.equal(r.amount, "1000000");
+assert.equal(r.asset, null, "native result carries asset:null");
+
+// ---- settle: IOU delivered_amount checks (stubbed client) ------------------
+function iouFakeClient({ result, throwErr } = {}) {
+  const c = {
+    submitCount: 0,
+    isConnected: () => true,
+    request: async () => ({ result: { account_objects: [] } }),
+    submitAndWait: async () => { c.submitCount++; if (throwErr) throw throwErr; return { result }; },
+  };
+  return c;
+}
+
+// (IOU-1) tesSUCCESS with delivered >= required -> success receipt (delivered echoed).
+{
+  const prev = process.env.XAHAU_WSS;
+  process.env.XAHAU_WSS = "wss://invalid.example";
+  const { InMemoryStore } = __test;
+  const now = 1_000_000_000, curLedger = 100;
+  const store = new InMemoryStore({ now: () => now });
+  const client = iouFakeClient({
+    result: { hash: "IOUOK", meta: { TransactionResult: "tesSUCCESS", delivered_amount: { currency: "USD", issuer: ISSUER, value: "1.5" } } },
+  });
+  const deps = { store, client, currentValidatedLedger: async () => curLedger, now: () => now };
+  const payment = { txBlob: iouBlob({ value: "1.5" }, { LastLedgerSequence: curLedger + 5, Sequence: 81 }) };
+
+  const out = await __test.settle(payment, iouReq, deps);
+  assert.equal(out.success, true, `IOU settle should succeed: ${out.errorReason}`);
+  assert.equal(out.transaction, "IOUOK");
+  assert.deepEqual(out.delivered, { currency: "USD", issuer: ISSUER, value: "1.5" }, "delivered IOU echoed");
+  assert.equal(client.submitCount, 1);
+
+  // idempotent replay returns the same receipt, no re-submit.
+  const out2 = await __test.settle(payment, iouReq, deps);
+  assert.equal(out2.replayed, true, "IOU idempotent replay");
+  assert.equal(out2.success, true);
+  assert.equal(client.submitCount, 1, "no re-submit on IOU replay");
+  if (prev === undefined) delete process.env.XAHAU_WSS; else process.env.XAHAU_WSS = prev;
+}
+
+// (IOU-2) delivered MORE than required (over-delivery still >= required) -> success.
+{
+  const prev = process.env.XAHAU_WSS;
+  process.env.XAHAU_WSS = "wss://invalid.example";
+  const { InMemoryStore } = __test;
+  const now = 1_000_000_000, curLedger = 100;
+  const store = new InMemoryStore({ now: () => now });
+  const client = iouFakeClient({
+    result: { hash: "IOUMORE", meta: { TransactionResult: "tesSUCCESS", delivered_amount: { currency: "USD", issuer: ISSUER, value: "1.5" } } },
+  });
+  const deps = { store, client, currentValidatedLedger: async () => curLedger, now: () => now };
+  // required 1.0 (under the 1.5 max); delivered 1.5 >= 1.0 -> ok.
+  const payment = { txBlob: iouBlob({ value: "1.0" }, { LastLedgerSequence: curLedger + 5, Sequence: 82 }) };
+  const out = await __test.settle(payment, iouReq, deps);
+  assert.equal(out.success, true, `delivered 1.5 >= required 1.0 should succeed: ${out.errorReason}`);
+  if (prev === undefined) delete process.env.XAHAU_WSS; else process.env.XAHAU_WSS = prev;
+}
+
+// (IOU-3) delivered < required -> fail (a partial-ish underpayment in meta).
+{
+  const prev = process.env.XAHAU_WSS;
+  process.env.XAHAU_WSS = "wss://invalid.example";
+  const { InMemoryStore } = __test;
+  const now = 1_000_000_000, curLedger = 100;
+  const store = new InMemoryStore({ now: () => now });
+  const client = iouFakeClient({
+    result: { hash: "IOULESS", meta: { TransactionResult: "tesSUCCESS", delivered_amount: { currency: "USD", issuer: ISSUER, value: "1.49999999999999" } } },
+  });
+  const deps = { store, client, currentValidatedLedger: async () => curLedger, now: () => now };
+  const payment = { txBlob: iouBlob({ value: "1.5" }, { LastLedgerSequence: curLedger + 5, Sequence: 83 }) };
+  const out = await __test.settle(payment, iouReq, deps);
+  assert.equal(out.success, false, "delivered 1.49999999999999 < required 1.5 must fail (exact compare)");
+  assert.match(out.errorReason, /delivered_amount < required/);
+  if (prev === undefined) delete process.env.XAHAU_WSS; else process.env.XAHAU_WSS = prev;
+}
+
+// (IOU-4) wrong delivered currency -> fail.
+{
+  const prev = process.env.XAHAU_WSS;
+  process.env.XAHAU_WSS = "wss://invalid.example";
+  const { InMemoryStore } = __test;
+  const now = 1_000_000_000, curLedger = 100;
+  const store = new InMemoryStore({ now: () => now });
+  const client = iouFakeClient({
+    result: { hash: "IOUWRONGCUR", meta: { TransactionResult: "tesSUCCESS", delivered_amount: { currency: "EUR", issuer: ISSUER, value: "1.5" } } },
+  });
+  const deps = { store, client, currentValidatedLedger: async () => curLedger, now: () => now };
+  const payment = { txBlob: iouBlob({ value: "1.5" }, { LastLedgerSequence: curLedger + 5, Sequence: 84 }) };
+  const out = await __test.settle(payment, iouReq, deps);
+  assert.equal(out.success, false, "wrong delivered currency must fail");
+  assert.match(out.errorReason, /asset mismatch/);
+  if (prev === undefined) delete process.env.XAHAU_WSS; else process.env.XAHAU_WSS = prev;
+}
+
+// (IOU-5) wrong delivered issuer -> fail.
+{
+  const prev = process.env.XAHAU_WSS;
+  process.env.XAHAU_WSS = "wss://invalid.example";
+  const { InMemoryStore } = __test;
+  const now = 1_000_000_000, curLedger = 100;
+  const store = new InMemoryStore({ now: () => now });
+  const client = iouFakeClient({
+    result: { hash: "IOUWRONGISS", meta: { TransactionResult: "tesSUCCESS", delivered_amount: { currency: "USD", issuer: "rJfeEF9Fh3gs7syURNy6daLJz68kyA65n1", value: "1.5" } } },
+  });
+  const deps = { store, client, currentValidatedLedger: async () => curLedger, now: () => now };
+  const payment = { txBlob: iouBlob({ value: "1.5" }, { LastLedgerSequence: curLedger + 5, Sequence: 85 }) };
+  const out = await __test.settle(payment, iouReq, deps);
+  assert.equal(out.success, false, "wrong delivered issuer must fail");
+  assert.match(out.errorReason, /asset mismatch/);
+  if (prev === undefined) delete process.env.XAHAU_WSS; else process.env.XAHAU_WSS = prev;
+}
+
+// (IOU-6) delivered_amount of the WRONG TYPE for an IOU (a native drops string) -> fail.
+{
+  const prev = process.env.XAHAU_WSS;
+  process.env.XAHAU_WSS = "wss://invalid.example";
+  const { InMemoryStore } = __test;
+  const now = 1_000_000_000, curLedger = 100;
+  const store = new InMemoryStore({ now: () => now });
+  const client = iouFakeClient({
+    result: { hash: "IOUTYPE", meta: { TransactionResult: "tesSUCCESS", delivered_amount: "1500000" } },
+  });
+  const deps = { store, client, currentValidatedLedger: async () => curLedger, now: () => now };
+  const payment = { txBlob: iouBlob({ value: "1.5" }, { LastLedgerSequence: curLedger + 5, Sequence: 86 }) };
+  const out = await __test.settle(payment, iouReq, deps);
+  assert.equal(out.success, false, "drops-string delivered_amount for an IOU must fail (wrong type)");
+  assert.match(out.errorReason, /could not read delivered_amount/);
+  if (prev === undefined) delete process.env.XAHAU_WSS; else process.env.XAHAU_WSS = prev;
+}
+
+// (IOU-7) settle re-validates: an over-max IOU is rejected before any node contact.
+{
+  const prev = process.env.XAHAU_WSS;
+  process.env.XAHAU_WSS = "wss://invalid.example";
+  const out = await __test.settle({ txBlob: iouBlob({ value: "5" }) }, iouReq);
+  assert.equal(out.success, false, "settle rejects over-max IOU");
+  assert.match(out.errorReason, /verify failed/);
+  if (prev === undefined) delete process.env.XAHAU_WSS; else process.env.XAHAU_WSS = prev;
+}
+
+// (IOU-8) native settle still works unchanged (delivered drops string).
+{
+  const prev = process.env.XAHAU_WSS;
+  process.env.XAHAU_WSS = "wss://invalid.example";
+  const { InMemoryStore } = __test;
+  const now = 1_000_000_000, curLedger = 100;
+  const store = new InMemoryStore({ now: () => now });
+  const client = iouFakeClient({
+    result: { hash: "NATIVEOK", meta: { TransactionResult: "tesSUCCESS", delivered_amount: "1000000" } },
+  });
+  const deps = { store, client, currentValidatedLedger: async () => curLedger, now: () => now };
+  const payment = { txBlob: blob({ LastLedgerSequence: curLedger + 5, Sequence: 87 }) };
+  const out = await __test.settle(payment, req, deps);
+  assert.equal(out.success, true, `native settle still works: ${out.errorReason}`);
+  assert.equal(out.delivered, "1000000", "native delivered stays a drops string");
+  if (prev === undefined) delete process.env.XAHAU_WSS; else process.env.XAHAU_WSS = prev;
+}
+
+console.log("ok — all hardened verifyExact + settle cases pass (native + IOU)");

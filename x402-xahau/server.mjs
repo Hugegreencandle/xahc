@@ -43,6 +43,20 @@
  * additionally requires the shared secret.
  * Signatures are bound to Account (deriveAddress == Account); RegularKey/multisig
  * are offline-unverifiable and are flagged (signatureVerified:false), not passed.
+ *
+ * ASSETS: both native XAH and ISSUED amounts (IOU / tokens) are supported. The x402
+ * paymentRequirements carry an optional `asset` field: when ABSENT the payment is
+ * native XAH (Amount is a drops string — the original behavior, byte-for-byte
+ * unchanged); when PRESENT it is { currency, issuer } and the payment must be exactly
+ * that token (Amount is an object { currency, issuer, value }, maxAmountRequired is a
+ * decimal value string in the token's units). Token value comparison is EXACT — a
+ * self-contained BigInt decimal comparator (mantissa+exponent, no JS float anywhere),
+ * sound over the full XRPL token range; a float compare would wrongly accept an
+ * under/over-payment (e.g. it collapses 2^53+1 and 2^53). Currency codes are
+ * canonicalized so the 3-char ASCII and 40-hex forms of the same code match. /settle
+ * checks delivered_amount as an issued-amount object for an IOU (currency+issuer match
+ * + value >= required, exact compare), failing closed on a wrong-type/wrong-asset
+ * delivered_amount.
  */
 import http from "node:http";
 import crypto from "node:crypto";
@@ -166,6 +180,171 @@ function parseStrictDrops(value) {
   return n;
 }
 
+// ---------------------------------------------------------------------------
+// issued-amount (IOU / token) support
+// ---------------------------------------------------------------------------
+// XRPL/Xahau token amounts are base-10 floats with a 54-bit mantissa normalized
+// to [1e15, 1e16) and an exponent in [-96, 80] — i.e. up to ~16 significant
+// decimal digits over a very wide magnitude range. Comparing two such values with
+// JS `Number`/parseFloat is UNSOUND: doubles carry only ~15-17 significant digits
+// and cannot represent many decimal fractions exactly, so a compare can wrongly
+// accept an under/over-payment. This is security-critical for a payment facilitator.
+//
+// APPROACH (b) — self-contained EXACT decimal comparator over BigInt. We parse each
+// decimal `value` string into a sign + an integer mantissa + a base-10 exponent
+// (mant * 10^exp, no fraction lost), then compare two values by aligning exponents
+// with BigInt powers of ten. BigInt is arbitrary-precision, so the alignment +
+// compare is EXACT for the entire XRPL token range (and beyond) — there is no float
+// anywhere on the path. We chose this over porting XFL parse/encode because the
+// inputs here are already decimal STRINGS (XFL's enbase-10 packing buys us nothing
+// for a string<->string compare, and its normalization TRUNCATES the 16th+ digit,
+// which we must NOT do when validating a client's stated value). The validator also
+// enforces the XRPL token bounds so a malformed/out-of-range value is rejected, not
+// silently compared.
+//
+// Range bounds mirror XRPL's IOU representation (see xfl.ts): a non-zero value's
+// normalized exponent must be within [-96, 80]; combined with up to 16 significant
+// mantissa digits, the smallest positive value is ~1e-96 and the largest ~9.999...e95.
+const TOKEN_EXP_MIN = -96;
+const TOKEN_EXP_MAX = 80;
+const TOKEN_MAX_MANT_DIGITS = 16; // XRPL mantissa precision (normalized [1e15,1e16))
+
+/**
+ * Parse a decimal token `value` string EXACTLY into { sign, mant, exp } such that
+ * the value == sign * mant * 10^exp, with `mant` a non-negative BigInt (no fraction
+ * lost). Returns null if the string is not a well-formed, in-range, POSITIVE token
+ * value. Hostile-input rule: anything we cannot represent exactly and in range is
+ * rejected (null), never coerced.
+ *
+ * Accepted grammar (a strict subset of XRPL's, sufficient for x402 prices):
+ *   [whitespace-free] digits, optional single '.', optional exponent e/E[+/-]digits.
+ *   Examples: "1", "1.0", "0.000001", "100", "1.5", "1e3", "2.5E-4".
+ * Rejected: empty, sign-prefixed ('+'/'-' -> not positive), hex, NaN/Inf, multiple
+ *   dots, value <= 0, or a value whose normalized base-10 exponent falls outside
+ *   [TOKEN_EXP_MIN, TOKEN_EXP_MAX], or with more than TOKEN_MAX_MANT_DIGITS
+ *   significant digits (more precision than XRPL can hold -> reject, don't truncate).
+ */
+function parseTokenValue(value) {
+  if (typeof value !== "string" || value.length === 0) return null;
+  // Strict: optional digits with at most one dot, optional decimal exponent. No sign
+  // (must be positive), no spaces, no hex, no leading '+'.
+  const m = /^([0-9]+)(?:\.([0-9]+))?(?:[eE]([+-]?[0-9]+))?$/.exec(value);
+  if (!m) return null;
+  const intPart = m[1];
+  const fracPart = m[2] || "";
+  const expPart = m[3];
+  let exp10;
+  try { exp10 = expPart != null ? Number(expPart) : 0; } catch { return null; }
+  if (!Number.isFinite(exp10) || !Number.isInteger(exp10)) return null;
+
+  // Combine int+frac into a single integer mantissa string; the fractional digit
+  // count shifts the exponent down (mant * 10^(exp10 - fracLen)).
+  let digits = intPart + fracPart;
+  let exp = exp10 - fracPart.length;
+
+  // Strip leading zeros from the mantissa (exact: leading zeros carry no value).
+  digits = digits.replace(/^0+/, "");
+  if (digits === "") return null; // value is exactly zero -> not a positive payment value
+
+  // Strip trailing zeros, folding them into the exponent (keeps mant minimal +
+  // canonical so "1.0", "1", "1e0", "10e-1" all parse to the same {mant,exp}).
+  let trailing = 0;
+  for (let i = digits.length - 1; i > 0 && digits[i] === "0"; i--) trailing++;
+  if (trailing > 0) { digits = digits.slice(0, digits.length - trailing); exp += trailing; }
+
+  // Significant-digit (precision) bound: XRPL can hold at most ~16 significant digits.
+  // A value needing more precision than that is NOT exactly representable on-ledger,
+  // so reject rather than silently round.
+  if (digits.length > TOKEN_MAX_MANT_DIGITS) return null;
+
+  let mant;
+  try { mant = BigInt(digits); } catch { return null; }
+  if (mant <= 0n) return null;
+
+  // Normalized-exponent range check, mirroring XRPL/XFL: normalize the mantissa to
+  // [1e15, 1e16) and require the resulting exponent within [-96, 80]. We compute the
+  // normalized exponent without mutating our exact {mant, exp} (used for compare).
+  const normExp = exp + (digits.length - TOKEN_MAX_MANT_DIGITS);
+  if (normExp < TOKEN_EXP_MIN || normExp > TOKEN_EXP_MAX) return null;
+
+  return { sign: 1, mant, exp };
+}
+
+/**
+ * Exact signed comparison of two parsed token values a,b (each { sign:1, mant, exp }
+ * from parseTokenValue — both positive here). Returns -1 if a<b, 0 if equal, 1 if a>b.
+ * Aligns the two mantissas to a common exponent using BigInt powers of ten (exact,
+ * no float) and compares the resulting integers.
+ */
+function cmpTokenValue(a, b) {
+  // Align to the lower exponent so both become integers in the same base-10 unit.
+  const e = a.exp < b.exp ? a.exp : b.exp;
+  const ma = a.mant * 10n ** BigInt(a.exp - e);
+  const mb = b.mant * 10n ** BigInt(b.exp - e);
+  if (ma === mb) return 0;
+  return ma > mb ? 1 : -1;
+}
+
+/**
+ * Canonicalize an XRPL/Xahau currency code to a comparable 40-hex (20-byte) string.
+ * Accepts either the 3-character ASCII form (e.g. "USD") or the 40-char hex form;
+ * the codec decodes standard codes back to 3-char ASCII and non-standard codes as
+ * 40-hex, while a server may supply asset.currency in EITHER form — so we map both
+ * to one canonical 40-hex value before comparing. Returns the uppercase 40-hex
+ * string, or null if the input is malformed.
+ *
+ * Standard 3-char ASCII codes map to the 20-byte layout with the ASCII bytes at
+ * offset 12..14 and all other bytes zero (the XRPL standard-currency encoding) — the
+ * same canonical form the codec produces internally. "XRP" is rejected as a token
+ * currency (it is native, not an issued asset).
+ */
+function canonicalizeCurrency(cur) {
+  if (typeof cur !== "string" || cur.length === 0) return null;
+  if (/^[0-9a-fA-F]{40}$/.test(cur)) {
+    const hex = cur.toUpperCase();
+    // The all-zero code is XRP/native, never a valid issued-asset currency.
+    if (/^0{40}$/.test(hex)) return null;
+    return hex;
+  }
+  // 3-char ASCII standard code. XRPL standard codes are exactly 3 chars; "XRP" is
+  // reserved for native and is invalid as an issued currency.
+  if (cur.length === 3 && /^[\x20-\x7E]{3}$/.test(cur)) {
+    if (cur === "XRP") return null;
+    const b = Buffer.alloc(20, 0);
+    b.write(cur, 12, "ascii");
+    return b.toString("hex").toUpperCase();
+  }
+  return null;
+}
+
+/**
+ * Validate a decoded tx Amount that is expected to be an ISSUED amount object
+ * { currency, issuer, value } against the required asset + max value. Returns
+ * { value } (the parsed {sign,mant,exp}) on success, or { error } on failure.
+ * Performs: type/shape check, currency canonicalization + match, issuer match,
+ * value well-formedness + range, and value <= maxTokenValue (exact).
+ */
+function checkIssuedAmount(amount, asset, maxTokenValue) {
+  if (amount === null || typeof amount !== "object" || Array.isArray(amount))
+    return { error: "Amount must be an issued-amount object for this asset" };
+  if (typeof amount.currency !== "string" || typeof amount.issuer !== "string" || typeof amount.value !== "string")
+    return { error: "Amount issued-amount object malformed (currency/issuer/value)" };
+
+  const wantCur = canonicalizeCurrency(asset.currency);
+  const gotCur = canonicalizeCurrency(amount.currency);
+  if (wantCur === null) return { error: "asset.currency malformed" };
+  if (gotCur === null || gotCur !== wantCur)
+    return { error: "Amount.currency != asset.currency" };
+  if (!isValidRAddress(amount.issuer)) return { error: "Amount.issuer malformed" };
+  if (amount.issuer !== asset.issuer) return { error: "Amount.issuer != asset.issuer" };
+
+  const v = parseTokenValue(amount.value);
+  if (v === null) return { error: "Amount.value malformed or out of token range" };
+  if (cmpTokenValue(v, maxTokenValue) > 0)
+    return { error: "Amount.value > maxAmountRequired" };
+  return { value: v };
+}
+
 /**
  * Cryptographically verify the tx blob's signature against its SigningPubKey
  * (single-sig) using the xrpl library. Returns true/false; null if xrpl is not
@@ -221,9 +400,32 @@ export function verifyExact(payload, req) {
     return { isValid: false, invalidReason: "incomplete payment requirements" };
   if (!isValidRAddress(req.payTo))
     return { isValid: false, invalidReason: "incomplete payment requirements (payTo missing/invalid)" };
-  const maxDrops = parseStrictDrops(req.maxAmountRequired);
-  if (maxDrops === null)
-    return { isValid: false, invalidReason: "incomplete payment requirements (maxAmountRequired missing/invalid)" };
+
+  // Asset selection: when req.asset is present this is an ISSUED-AMOUNT (IOU/token)
+  // payment; when absent it is native XAH (today's behavior, UNCHANGED). For an IOU
+  // the asset must be a well-formed { currency, issuer } and maxAmountRequired is a
+  // token VALUE string (same units as the token), validated like Amount.value.
+  let asset = null;
+  let maxDrops = null;        // native path: bigint drops
+  let maxTokenValue = null;   // IOU path: parsed {sign,mant,exp}
+  if (req.asset !== undefined && req.asset !== null) {
+    const a = req.asset;
+    if (typeof a !== "object" || Array.isArray(a) || typeof a.currency !== "string" || typeof a.issuer !== "string")
+      return { isValid: false, invalidReason: "incomplete payment requirements (asset malformed)" };
+    const canonCur = canonicalizeCurrency(a.currency);
+    if (canonCur === null)
+      return { isValid: false, invalidReason: "incomplete payment requirements (asset.currency invalid)" };
+    if (!isValidRAddress(a.issuer))
+      return { isValid: false, invalidReason: "incomplete payment requirements (asset.issuer invalid)" };
+    asset = { currency: a.currency, issuer: a.issuer };
+    maxTokenValue = parseTokenValue(req.maxAmountRequired);
+    if (maxTokenValue === null)
+      return { isValid: false, invalidReason: "incomplete payment requirements (maxAmountRequired missing/invalid token value)" };
+  } else {
+    maxDrops = parseStrictDrops(req.maxAmountRequired);
+    if (maxDrops === null)
+      return { isValid: false, invalidReason: "incomplete payment requirements (maxAmountRequired missing/invalid)" };
+  }
 
   let tx;
   try { tx = decode(payload.txBlob); } catch { return { isValid: false, invalidReason: "undecodable txBlob" }; }
@@ -243,14 +445,31 @@ export function verifyExact(payload, req) {
   if (flags & TF_PARTIAL_PAYMENT)
     return { isValid: false, invalidReason: "tfPartialPayment not allowed" };
 
-  // Native XAH only in this reference. Issued amounts are an open spec item.
-  if (typeof tx.Amount !== "string")
-    return { isValid: false, invalidReason: "issued-amount verify not implemented in this shim (native XAH only)" };
-  const paid = parseStrictDrops(tx.Amount);
-  if (paid === null)
-    return { isValid: false, invalidReason: "Amount malformed (must be positive drops string)" };
-  if (paid > maxDrops)
-    return { isValid: false, invalidReason: "Amount > maxAmountRequired" };
+  // Amount check. Two mutually-exclusive shapes, keyed off whether req.asset is set:
+  //   - native XAH (asset absent): Amount is a drops STRING (UNCHANGED behavior).
+  //   - issued amount (asset present): Amount is an OBJECT {currency,issuer,value}.
+  // A mismatch between the required asset and the Amount's shape is rejected in BOTH
+  // directions (native-required but Amount is an object; IOU-required but Amount is a
+  // string) — a hostile client cannot substitute one asset class for the other.
+  let paid = null;          // native: bigint drops (kept for downstream code paths)
+  let paidTokenValue = null; // IOU: parsed {sign,mant,exp}
+  if (asset === null) {
+    // Native XAH path — byte-for-byte the original logic.
+    if (typeof tx.Amount !== "string")
+      return { isValid: false, invalidReason: "asset mismatch: native XAH required but Amount is an issued amount" };
+    paid = parseStrictDrops(tx.Amount);
+    if (paid === null)
+      return { isValid: false, invalidReason: "Amount malformed (must be positive drops string)" };
+    if (paid > maxDrops)
+      return { isValid: false, invalidReason: "Amount > maxAmountRequired" };
+  } else {
+    // Issued-amount (IOU/token) path.
+    if (typeof tx.Amount === "string")
+      return { isValid: false, invalidReason: "asset mismatch: issued amount required but Amount is native XAH" };
+    const chk = checkIssuedAmount(tx.Amount, asset, maxTokenValue);
+    if (chk.error) return { isValid: false, invalidReason: chk.error };
+    paidTokenValue = chk.value;
+  }
 
   if (tx.LastLedgerSequence == null)
     return { isValid: false, invalidReason: "missing LastLedgerSequence (no expiry window)" };
@@ -302,14 +521,46 @@ export function verifyExact(payload, req) {
   // or a SourceTag nonce. We surface the binding so /settle can consume it.
   const replayId = replayKeyFor(tx);
 
+  if (asset !== null) {
+    // Issued-amount result. `amount` echoes the (canonicalized) decimal value string;
+    // `asset` lets /settle re-derive the required value + check delivered_amount.
+    return {
+      isValid: true,
+      invalidReason: null,
+      payer: tx.Account,
+      amount: tokenValueToString(paidTokenValue),
+      asset,
+      signatureVerified,
+      replayId,
+    };
+  }
+
   return {
     isValid: true,
     invalidReason: null,
     payer: tx.Account,
     amount: paid.toString(),
+    asset: null,
     signatureVerified,
     replayId,
   };
+}
+
+/**
+ * Render a parsed token value { sign:1, mant, exp } back to a plain decimal string
+ * (no exponent), exact. Used to echo the verified value in the result + to memoize
+ * the required value for /settle. mant>0, sign positive (we only handle positive
+ * payment values).
+ */
+function tokenValueToString(v) {
+  const digits = v.mant.toString();
+  if (v.exp >= 0) return digits + "0".repeat(v.exp);
+  const neg = -v.exp;
+  if (neg < digits.length) {
+    const i = digits.length - neg;
+    return digits.slice(0, i) + "." + digits.slice(i);
+  }
+  return "0." + "0".repeat(neg - digits.length) + digits;
 }
 
 /** Stable replay key for a decoded tx: InvoiceID if present, else acct:seq. */
@@ -657,7 +908,12 @@ async function settle(payload, req, _deps = {}) {
 
   let tx;
   try { tx = decode(payload.txBlob); } catch { return { success: false, network: NETWORK, errorReason: "undecodable txBlob" }; }
-  const required = BigInt(v.amount); // exact-xahau: client pays >= server's price up to max
+  // exact-xahau: the delivered amount must be >= the verified required amount, up to
+  // max. For native that's a bigint drops compare; for an IOU it's an exact token
+  // compare. v.amount is the verified value the payer committed to (<= maxRequired).
+  const isIou = v.asset != null;
+  const required = isIou ? null : BigInt(v.amount);
+  const requiredTokenValue = isIou ? parseTokenValue(v.amount) : null;
 
   const now = typeof _deps.now === "function" ? _deps.now() : Date.now();
   const getLedger = _deps.currentValidatedLedger || currentValidatedLedger;
@@ -751,21 +1007,53 @@ async function settle(payload, req, _deps = {}) {
       guardrailHookPresent: hookPresent,
     };
   } else {
-    // (4c) Validate delivered_amount >= required (not just tesSUCCESS).
-    const delivered = deliveredDrops(meta);
-    if (delivered === null) {
-      receipt = { success: false, transaction: hash, network: NETWORK, errorReason: "could not read delivered_amount", guardrailHookPresent: hookPresent };
-    } else if (delivered < required) {
-      receipt = { success: false, transaction: hash, network: NETWORK, errorReason: "delivered_amount < required", guardrailHookPresent: hookPresent };
+    // (4c) Validate delivered_amount >= required (not just tesSUCCESS). For an IOU,
+    // delivered_amount is an OBJECT {currency,issuer,value} and must match the asset
+    // AND carry value >= required (exact token compare). For native it stays drops.
+    if (isIou) {
+      const delivered = deliveredIssued(meta);
+      if (delivered === null) {
+        receipt = { success: false, transaction: hash, network: NETWORK, errorReason: "could not read delivered_amount", guardrailHookPresent: hookPresent };
+      } else if (
+        canonicalizeCurrency(delivered.currency) === null ||
+        canonicalizeCurrency(delivered.currency) !== canonicalizeCurrency(v.asset.currency) ||
+        delivered.issuer !== v.asset.issuer
+      ) {
+        // Wrong asset delivered (different currency/issuer than required) -> fail.
+        receipt = { success: false, transaction: hash, network: NETWORK, errorReason: "delivered_amount asset mismatch", guardrailHookPresent: hookPresent };
+      } else {
+        const dv = parseTokenValue(delivered.value);
+        if (dv === null) {
+          receipt = { success: false, transaction: hash, network: NETWORK, errorReason: "could not read delivered_amount", guardrailHookPresent: hookPresent };
+        } else if (requiredTokenValue === null || cmpTokenValue(dv, requiredTokenValue) < 0) {
+          receipt = { success: false, transaction: hash, network: NETWORK, errorReason: "delivered_amount < required", guardrailHookPresent: hookPresent };
+        } else {
+          receipt = {
+            success: true,
+            transaction: hash,
+            network: NETWORK,
+            errorReason: null,
+            delivered: { currency: delivered.currency, issuer: delivered.issuer, value: tokenValueToString(dv) },
+            guardrailHookPresent: hookPresent,
+          };
+        }
+      }
     } else {
-      receipt = {
-        success: true,
-        transaction: hash,
-        network: NETWORK,
-        errorReason: null,
-        delivered: delivered.toString(),
-        guardrailHookPresent: hookPresent,
-      };
+      const delivered = deliveredDrops(meta);
+      if (delivered === null) {
+        receipt = { success: false, transaction: hash, network: NETWORK, errorReason: "could not read delivered_amount", guardrailHookPresent: hookPresent };
+      } else if (delivered < required) {
+        receipt = { success: false, transaction: hash, network: NETWORK, errorReason: "delivered_amount < required", guardrailHookPresent: hookPresent };
+      } else {
+        receipt = {
+          success: true,
+          transaction: hash,
+          network: NETWORK,
+          errorReason: null,
+          delivered: delivered.toString(),
+          guardrailHookPresent: hookPresent,
+        };
+      }
     }
   }
   await st.setReceipt(v.replayId, receipt, expiryMs);
@@ -777,6 +1065,19 @@ function deliveredDrops(meta) {
   const d = meta.delivered_amount ?? meta.DeliveredAmount;
   if (typeof d === "string" && STRICT_DROPS.test(d)) { try { return BigInt(d); } catch { return null; } }
   return null;
+}
+
+/**
+ * delivered_amount (issued/IOU) as a raw { currency, issuer, value } object, or null
+ * if it is absent or the WRONG type for an IOU (e.g. a drops string when an issued
+ * amount was required — fail closed, never coerce). Caller validates currency/issuer/
+ * value against the required asset.
+ */
+function deliveredIssued(meta) {
+  const d = meta.delivered_amount ?? meta.DeliveredAmount;
+  if (d === null || typeof d !== "object" || Array.isArray(d)) return null;
+  if (typeof d.currency !== "string" || typeof d.issuer !== "string" || typeof d.value !== "string") return null;
+  return d;
 }
 
 // ---------------------------------------------------------------------------
@@ -959,6 +1260,10 @@ export const __test = {
   parseStrictDrops, isValidRAddress, verifyTxSignature, deriveAddressFromPubKey,
   replayKeyFor, settle, _sweepBuckets, rateLimitOk, submitDefinitelyNotApplied,
   RATE_MAX,
+  // Issued-amount (IOU/token) helpers.
+  parseTokenValue, cmpTokenValue, canonicalizeCurrency, tokenValueToString,
+  checkIssuedAmount, deliveredIssued, deliveredDrops,
+  TOKEN_EXP_MIN, TOKEN_EXP_MAX, TOKEN_MAX_MANT_DIGITS,
   // Hole-1/Hole-2 hooks: replay-store internals + the chosen bounds.
   _sweepConsumed, _markConsumed, _isConsumed, _consumedExpiryFor, _reserveConsumed,
   REPLAY_TTL_MS, REPLAY_MAX_ENTRIES, MAX_VALIDITY_LEDGERS, LEDGER_CLOSE_MS, REPLAY_EXPIRY_MARGIN_MS,
