@@ -35,6 +35,9 @@ const INVARIANTS: &[(&str, &str)] = &[
     ("authz", "prove_authz.py"),
     ("validate", "prove_validate.py"),
     ("overflow", "prove_overflow.py"),
+    ("foreign-authz", "prove_foreign_authz.py"),
+    ("reserve", "prove_reserve.py"),
+    ("time-nonce", "prove_time_nonce.py"),
 ];
 
 /// Resolve the xahc-prover checkout.
