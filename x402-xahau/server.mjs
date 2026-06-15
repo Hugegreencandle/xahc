@@ -23,8 +23,13 @@
  * binding never expires while its tx is still submittable), settle rejects any tx
  * whose window exceeds the bound, and the hard-cap eviction is fail-CLOSED (drops
  * only EXPIRED entries; refuses new reservations with 503 when full of live ones —
- * never evicts a live binding). A production deployment still needs a shared/durable
- * nonce store (e.g. Redis/DB) and a distributed rate limiter.
+ * never evicts a live binding). A submit that fails AMBIGUOUSLY (LastLedgerSequence
+ * passed mid-wait / disconnect / timeout) RETAINS the reservation — only a
+ * provably-not-applied preliminary `tem*` result releases it, so a maybe-applied tx
+ * can never be settled twice. Both public POST paths (/verify and /settle) are
+ * rate-limited; /settle additionally requires the shared secret. A production
+ * deployment still needs a shared/durable nonce store (e.g. Redis/DB) and a
+ * distributed rate limiter.
  * Signatures are bound to Account (deriveAddress == Account); RegularKey/multisig
  * are offline-unverifiable and are flagged (signatureVerified:false), not passed.
  */
@@ -455,6 +460,28 @@ async function getClient() {
   return _client;
 }
 
+/**
+ * Return true ONLY when a thrown `submitAndWait` PROVES the transaction was not
+ * (and cannot become) applied — i.e. a preliminary `tem*` engine result, which
+ * xahaud rejects BEFORE the tx is broadcast. Every other failure (LastLedgerSequence
+ * passed mid-wait, disconnect, timeout, tx-lookup error, any unrecognised throw) is
+ * treated as MAYBE-APPLIED and must fail CLOSED — releasing the replay reservation
+ * there would reopen a replay/double-settle window for a tx that may already be
+ * (or about to be) on-ledger. `tem*` is the only class where release is provably safe.
+ */
+function submitDefinitelyNotApplied(e) {
+  // Prefer a structured engine_result if xrpl attached one.
+  const er =
+    (e && (e.data?.engine_result ?? e.data?.result?.engine_result)) ??
+    (typeof e?.engine_result === "string" ? e.engine_result : null);
+  if (typeof er === "string") return /^tem[A-Z]/.test(er);
+  // Fallback: a TIGHT match for an explicit tem* code token in the message. tem*
+  // codes are the only safe-to-release class; an LLS-passed / disconnect message
+  // never carries a tem* token (tem* rejects before the wait that throws those).
+  const msg = typeof e?.message === "string" ? e.message : "";
+  return /\btem[A-Z][A-Z_]{2,}\b/.test(msg);
+}
+
 // ---------------------------------------------------------------------------
 // settle
 // ---------------------------------------------------------------------------
@@ -519,10 +546,19 @@ async function settle(payload, req, _deps = {}) {
   try {
     r = await client.submitAndWait(payload.txBlob);
   } catch (e) {
-    // Submission failed before validation: release the reservation so a genuine
-    // retry (same blob) is possible. (tef/tem errors mean nothing was applied.)
-    unmarkConsumed(v.replayId);
-    return { success: false, network: NETWORK, errorReason: "submit failed", guardrailHookPresent: hookPresent };
+    // A thrown submitAndWait is AMBIGUOUS by default: a tx that cleared preflight
+    // can be broadcast and applied on-ledger yet still throw here when its
+    // LastLedgerSequence passes mid-wait or the connection drops. We therefore fail
+    // CLOSED — release the reservation ONLY when we can prove nothing was applied
+    // (a preliminary tem*). Otherwise KEEP the binding and let the Hole-1 expiry
+    // (tied to the tx's real on-ledger validity window) reopen the slot once the tx
+    // can no longer apply. Releasing on a maybe-applied throw is a double-settle hole.
+    if (submitDefinitelyNotApplied(e)) {
+      unmarkConsumed(v.replayId);
+      return { success: false, network: NETWORK, errorReason: "submit rejected (tem, not applied)", guardrailHookPresent: hookPresent };
+    }
+    console.error("[x402] settle: ambiguous submit failure, reservation RETAINED:", e?.message || e);
+    return { success: false, network: NETWORK, errorReason: "submit result unknown — reservation retained until validity window expires", guardrailHookPresent: hookPresent };
   }
 
   const meta = r.result.meta || {};
@@ -627,6 +663,12 @@ function serve() {
         return send(res, 200, { kinds: [{ scheme: "exact", network: NETWORK }] });
 
       if (req.method === "POST" && req.url === "/verify") {
+        // /verify decodes a full tx blob + runs signature crypto — an
+        // unauthenticated, CPU-bound path. It MUST be rate-limited (but NOT
+        // auth-gated: it is intentionally a public, pre-payment offline check, so
+        // requiring a secret would break x402 semantics).
+        const ip = req.socket.remoteAddress || "unknown";
+        if (!rateLimitOk(ip)) return send(res, 429, { error: "rate limited" });
         const b = await readBody(req, res);
         return send(res, 200, verifyExact(b.paymentPayload, b.paymentRequirements));
       }
@@ -668,7 +710,8 @@ function _isConsumed(key, now) { return isConsumed(key, now); }
 function _consumedExpiryFor(ctx, now) { return consumedExpiryFor(ctx, now); }
 export const __test = {
   parseStrictDrops, isValidRAddress, verifyTxSignature, deriveAddressFromPubKey,
-  replayKeyFor, settle, consumed, _sweepBuckets,
+  replayKeyFor, settle, consumed, _sweepBuckets, rateLimitOk, submitDefinitelyNotApplied,
+  RATE_MAX,
   // Hole-1/Hole-2 hooks: replay-store internals + the chosen bounds.
   _sweepConsumed, _markConsumed, _isConsumed, _consumedExpiryFor,
   REPLAY_TTL_MS, REPLAY_MAX_ENTRIES, MAX_VALIDITY_LEDGERS, LEDGER_CLOSE_MS, REPLAY_EXPIRY_MARGIN_MS,

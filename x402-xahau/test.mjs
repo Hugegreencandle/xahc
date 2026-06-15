@@ -357,17 +357,26 @@ assert.equal(__test.replayKeyFor({ Account: PAYER, Sequence: 7 }), `acct:${PAYER
   assert.equal(__test.consumed.size, 0, "no slot consumed for an over-window tx");
 
   // And a tx whose window is WITHIN the bound passes the window check (it then
-  // proceeds to submit, which our stub makes fail -> 'submit failed', proving the
-  // window gate was cleared and a reservation was attempted+released).
+  // proceeds to submit). A PRELIMINARY tem* (provably not applied) releases the
+  // reservation so a corrected re-sign can proceed.
   __test.consumed.clear();
   const okLast = curLedger + 5; // small, in-bounds window
+  const temDeps = {
+    client: {
+      isConnected: () => true,
+      request: async () => ({ result: { account_objects: [] } }),
+      submitAndWait: async () => { const e = new Error("temMALFORMED"); e.data = { engine_result: "temMALFORMED" }; throw e; },
+    },
+    currentValidatedLedger: async () => curLedger,
+    now: () => 1_000_000_000,
+  };
   const out2 = await __test.settle(
-    { txBlob: blob({ LastLedgerSequence: okLast }) }, req, deps
+    { txBlob: blob({ LastLedgerSequence: okLast }) }, req, temDeps
   );
   assert.equal(out2.success, false);
-  assert.match(out2.errorReason, /submit failed/, "in-window tx clears the window gate");
-  // submit failed -> reservation released, store empty again.
-  assert.equal(__test.consumed.size, 0, "failed submit releases the reservation");
+  assert.match(out2.errorReason, /not applied|tem/, "in-window tem clears the window gate");
+  // preliminary tem -> reservation released, store empty again.
+  assert.equal(__test.consumed.size, 0, "preliminary tem releases the reservation");
 
   if (prev === undefined) delete process.env.XAHAU_WSS; else process.env.XAHAU_WSS = prev;
 }
@@ -447,6 +456,126 @@ assert.equal(__test.replayKeyFor({ Account: PAYER, Sequence: 7 }), `acct:${PAYER
   store.clear();
   if (prev === undefined) delete process.env.XAHAU_WSS; else process.env.XAHAU_WSS = prev;
 }
+
+// ---- AUDIT FIX (MEDIUM-1): ambiguous submit failure FAILS CLOSED -----------
+// A submitAndWait that throws for any reason OTHER than a preliminary tem* may be
+// (or become) applied on-ledger. Releasing the reservation there is a double-settle
+// hole. The reservation must be RETAINED on LLS-passed / disconnect / generic
+// throws, and a second settle of the same payment must be blocked.
+{
+  const prev = process.env.XAHAU_WSS;
+  process.env.XAHAU_WSS = "wss://invalid.example";
+  __test.consumed.clear();
+  const curLedger = 100;
+  const okLast = curLedger + 5;
+
+  // (i) LastLedgerSequence-passed style throw (maybe-applied) -> retain.
+  // Use the real clock so the retained binding's expiry is genuinely in the future
+  // for the dup re-settle's isConsumed() check (which reads Date.now()).
+  const llsDeps = {
+    client: {
+      isConnected: () => true,
+      request: async () => ({ result: { account_objects: [] } }),
+      submitAndWait: async () => { throw new Error("The latest ledger sequence 9999 is greater than the transaction's LastLedgerSequence (105).\n Preliminary result: tesSUCCESS"); },
+    },
+    currentValidatedLedger: async () => curLedger,
+    now: () => Date.now(),
+  };
+  const out = await __test.settle({ txBlob: blob({ LastLedgerSequence: okLast, Sequence: 51 }) }, req, llsDeps);
+  assert.equal(out.success, false);
+  assert.match(out.errorReason, /reservation retained|result unknown/);
+  assert.equal(__test.consumed.size, 1, "ambiguous (LLS-passed) failure RETAINS the replay reservation");
+  // A second settle of the SAME payment is now blocked as already-consumed.
+  const dup = await __test.settle({ txBlob: blob({ LastLedgerSequence: okLast, Sequence: 51 }) }, req, llsDeps);
+  assert.equal(dup.success, false);
+  assert.match(dup.errorReason, /already consumed/, "retained binding blocks a re-settle (no double-spend)");
+
+  // (ii) disconnect/timeout style generic throw -> also retain.
+  __test.consumed.clear();
+  const discDeps = {
+    client: {
+      isConnected: () => true,
+      request: async () => ({ result: { account_objects: [] } }),
+      submitAndWait: async () => { throw new Error("connect ECONNRESET / disconnected mid-wait"); },
+    },
+    currentValidatedLedger: async () => curLedger,
+    now: () => 1_000_000_000,
+  };
+  const out3 = await __test.settle({ txBlob: blob({ LastLedgerSequence: okLast, Sequence: 52 }) }, req, discDeps);
+  assert.equal(out3.success, false);
+  assert.equal(__test.consumed.size, 1, "disconnect/timeout failure RETAINS the reservation (fail closed)");
+  __test.consumed.clear();
+  if (prev === undefined) delete process.env.XAHAU_WSS; else process.env.XAHAU_WSS = prev;
+}
+
+// submitDefinitelyNotApplied classifier: tem* (structured or message) => release;
+// everything else (tes/tec/LLS/disconnect/incidental words) => keep (fail closed).
+{
+  const f = __test.submitDefinitelyNotApplied;
+  assert.equal(f({ data: { engine_result: "temMALFORMED" } }), true, "structured tem* -> not applied");
+  assert.equal(f(new Error("temBAD_AMOUNT: bad amount")), true, "tem* token in message -> not applied");
+  assert.equal(f({ data: { engine_result: "tesSUCCESS" } }), false, "tesSUCCESS -> maybe applied (keep)");
+  assert.equal(f({ data: { engine_result: "tecPATH_DRY" } }), false, "tec* -> applied (keep)");
+  assert.equal(f(new Error("The latest ledger sequence 9 is greater than the transaction's LastLedgerSequence (5).")), false, "LLS-passed -> keep");
+  assert.equal(f(new Error("connect ECONNRESET")), false, "disconnect -> keep");
+  assert.equal(f(new Error("item system temporary")), false, "incidental 'tem' words -> keep (no tem* code)");
+}
+
+// ---- AUDIT FIX (MEDIUM-2): /verify is rate-limited -------------------------
+// rateLimitOk unit contract: RATE_MAX allowed, then refused, per IP.
+{
+  const buckets = __test._sweepBuckets(0); // grab the live map
+  buckets.clear();
+  const ip = "203.0.113.7";
+  let allowed = 0;
+  for (let i = 0; i < __test.RATE_MAX; i++) if (__test.rateLimitOk(ip)) allowed++;
+  assert.equal(allowed, __test.RATE_MAX, "first RATE_MAX requests allowed");
+  assert.equal(__test.rateLimitOk(ip), false, "RATE_MAX+1th request from same IP refused");
+  buckets.clear();
+}
+
+// /verify rate-limit WIRING (integration): a child with X402_RATE_MAX=1 returns
+// 200 for the first /verify and 429 for the second from the same IP — proving the
+// limiter is actually applied to the route (not just defined).
+await new Promise((resolveTest, rejectTest) => {
+  (async () => {
+    const { spawn } = await import("node:child_process");
+    const PORT = 4098;
+    const child = spawn(process.execPath, ["server.mjs"], {
+      env: { ...process.env, PORT: String(PORT), X402_RATE_MAX: "1" },
+      stdio: ["ignore", "ignore", "ignore"],
+    });
+    const post = (path) => new Promise((res) => {
+      const body = "{}";
+      const r = http.request(
+        { host: "127.0.0.1", port: PORT, path, method: "POST", headers: { "content-type": "application/json", "content-length": Buffer.byteLength(body) } },
+        (resp) => { resp.resume(); resp.on("end", () => res(resp.statusCode)); }
+      );
+      r.on("error", () => res(null));
+      r.write(body); r.end();
+    });
+    const waitListen = async () => {
+      for (let i = 0; i < 50; i++) {
+        const ok = await new Promise((res) => {
+          const r = http.request({ host: "127.0.0.1", port: PORT, path: "/supported", method: "GET" }, (resp) => { resp.resume(); res(resp.statusCode === 200); });
+          r.on("error", () => res(false)); r.end();
+        });
+        if (ok) return true;
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      return false;
+    };
+    try {
+      assert.equal(await waitListen(), true, "facilitator should start for the rate-limit test");
+      const s1 = await post("/verify");
+      const s2 = await post("/verify");
+      assert.equal(s1, 200, `first /verify allowed (got ${s1})`);
+      assert.equal(s2, 429, `second /verify rate-limited (got ${s2})`);
+      resolveTest();
+    } catch (e) { rejectTest(e); }
+    finally { child.kill("SIGKILL"); }
+  })().catch(rejectTest);
+});
 
 // ---- RE-AUDIT FIX 3: oversize body -> clean 413, not a socket reset --------
 await new Promise((resolveTest, rejectTest) => {
