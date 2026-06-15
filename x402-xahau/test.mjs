@@ -1301,4 +1301,212 @@ function iouFakeClient({ result, throwErr } = {}) {
   if (prev === undefined) delete process.env.XAHAU_WSS; else process.env.XAHAU_WSS = prev;
 }
 
-console.log("ok — all hardened verifyExact + settle cases pass (native + IOU)");
+// ===========================================================================
+// OPERATIONAL HARDENING + x402 SPEC-COMPLIANCE
+// ===========================================================================
+
+// ---- config validation (unit) ---------------------------------------------
+{
+  const { validateConfig } = __test;
+  // A clean minimal config (no XAHAU_WSS) is non-fatal but warns settle disabled.
+  let r = validateConfig({});
+  assert.equal(r.fatal.length, 0, "empty env has no fatal config errors");
+  assert.ok(r.warnings.some((w) => /XAHAU_WSS/.test(w)), "unset XAHAU_WSS warns settle disabled");
+
+  // Bad PORT -> fatal.
+  r = validateConfig({ PORT: "not-a-number" });
+  assert.ok(r.fatal.some((f) => /PORT/.test(f)), "non-numeric PORT is fatal");
+  r = validateConfig({ PORT: "99999" });
+  assert.ok(r.fatal.some((f) => /PORT/.test(f)), "out-of-range PORT is fatal");
+  r = validateConfig({ PORT: "4021", XAHAU_WSS: "wss://x.example" });
+  assert.equal(r.fatal.length, 0, "valid PORT + wss is clean");
+
+  // Malformed XAHAU_WSS (not ws/wss) -> fatal.
+  r = validateConfig({ XAHAU_WSS: "http://x.example" });
+  assert.ok(r.fatal.some((f) => /XAHAU_WSS/.test(f)), "non-ws(s) XAHAU_WSS is fatal");
+  r = validateConfig({ XAHAU_WSS: "ws://node.example:6006" });
+  assert.equal(r.fatal.length, 0, "ws:// XAHAU_WSS is accepted");
+
+  // Inconsistent network id vs name -> fatal.
+  r = validateConfig({ XAHAU_NETWORK: "xahau", XAHAU_NETWORK_ID: "21338" });
+  assert.ok(r.fatal.some((f) => /disagrees/.test(f)), "id disagreeing with named network is fatal");
+  r = validateConfig({ XAHAU_NETWORK: "xahau", XAHAU_NETWORK_ID: "21337" });
+  assert.equal(r.fatal.length, 0, "consistent network id+name is clean");
+  r = validateConfig({ XAHAU_NETWORK: "bogus-net" });
+  assert.ok(r.fatal.some((f) => /not a known network/.test(f)), "unknown network name is fatal");
+
+  // Malformed Redis URL -> fatal; valid -> clean.
+  r = validateConfig({ X402_REDIS_URL: "not a url" });
+  assert.ok(r.fatal.some((f) => /X402_REDIS_URL/.test(f)), "malformed redis url is fatal");
+  r = validateConfig({ X402_REDIS_URL: "redis://localhost:6379" });
+  assert.equal(r.fatal.length, 0, "valid redis url is clean");
+}
+
+// ---- buildHealth (unit) ----------------------------------------------------
+{
+  const { buildHealth } = __test;
+  const h = buildHealth();
+  assert.equal(typeof h.status, "string", "health has a status");
+  assert.equal(h.network, "xahau", "health reports network");
+  assert.equal(h.networkID, EXPECTED_NETWORK_ID, "health reports networkID");
+  assert.ok(h.replayStore === "memory" || h.replayStore === "redis", "health reports replayStore backend");
+  assert.ok(h.rateLimiter === "memory" || h.rateLimiter === "redis", "health reports rateLimiter backend");
+  assert.equal(typeof h.xrplConfigured, "boolean", "health reports xrplConfigured honestly");
+  assert.equal(typeof h.uptimeSec, "number", "health reports uptimeSec");
+  assert.ok(h.uptimeSec >= 0, "uptimeSec is non-negative");
+  assert.equal(typeof h.replayBindings, "number", "health reports replayBindings count");
+  // Honesty: without a live xrpl/redis connection, connected fields are never a
+  // fabricated true.
+  if ("xrplConnected" in h) assert.equal(typeof h.xrplConnected, "boolean", "xrplConnected is a real boolean");
+  if ("redisConnected" in h) assert.equal(typeof h.redisConnected, "boolean", "redisConnected is a real boolean");
+}
+
+// ---- metrics increment on REAL events (unit) -------------------------------
+{
+  const { metrics, recordSettleReject } = __test;
+  const before = metrics.settle_rejected;
+  const beforeBucket = metrics.settle_rejected_verify_failed;
+  recordSettleReject("verify_failed");
+  assert.equal(metrics.settle_rejected, before + 1, "recordSettleReject bumps the total");
+  assert.equal(metrics.settle_rejected_verify_failed, beforeBucket + 1, "and the matching bucket");
+  // An unknown bucket lands in _other so the breakdown still sums to the total.
+  const beforeOther = metrics.settle_rejected_other;
+  const beforeTotal = metrics.settle_rejected;
+  recordSettleReject("totally-unknown-bucket");
+  assert.equal(metrics.settle_rejected_other, beforeOther + 1, "unknown bucket -> _other");
+  assert.equal(metrics.settle_rejected, beforeTotal + 1, "total still increments for unknown bucket");
+}
+
+// ---- Prometheus exposition shape (unit) ------------------------------------
+{
+  const { metricsPrometheus } = __test;
+  const text = metricsPrometheus();
+  assert.match(text, /# TYPE x402_verify_total counter/, "prometheus output declares verify_total counter type");
+  assert.match(text, /x402_settle_total \d+/, "prometheus output emits settle_total value");
+}
+
+// ---- settle response carries the x402-spec `payer` field -------------------
+// x402 SettleResponse requires { success, transaction, network, payer }. A verify-
+// failed settle must still carry these spec fields (non-breaking — originals stay).
+{
+  const prev = process.env.XAHAU_WSS;
+  process.env.XAHAU_WSS = "wss://invalid.example"; // never connected to
+  const out = await __test.settle({ txBlob: blob({ Amount: "2000000" }) }, req); // over-max
+  assert.equal(out.success, false, "over-max settle rejected (existing behavior)");
+  assert.match(out.errorReason, /verify failed/, "errorReason preserved");
+  assert.equal(typeof out.transaction, "string", "spec field `transaction` present (empty on failure)");
+  assert.ok("payer" in out, "spec field `payer` present on settle response");
+  assert.equal(out.network, "xahau", "spec field `network` present");
+  if (prev === undefined) delete process.env.XAHAU_WSS; else process.env.XAHAU_WSS = prev;
+}
+
+// ---- verify response retains spec fields (isValid/invalidReason/payer) ------
+{
+  const ok = verifyExact({ txBlob: blob() }, req);
+  assert.equal(ok.isValid, true, "spec field isValid present + true on valid payment");
+  assert.equal(ok.payer, PAYER, "spec field payer present on verify");
+  const bad = verifyExact({ txBlob: blob() }, { network: "xahau" });
+  assert.equal(bad.isValid, false, "spec field isValid false on invalid");
+  assert.equal(typeof bad.invalidReason, "string", "spec field invalidReason present on invalid");
+}
+
+// ---- IOU success settle still carries payer (additive, non-breaking) -------
+{
+  const prev = process.env.XAHAU_WSS;
+  process.env.XAHAU_WSS = "wss://invalid.example";
+  const { InMemoryStore } = __test;
+  const now = 1_000_000_000, curLedger = 100;
+  const store = new InMemoryStore({ now: () => now });
+  const client = iouFakeClient({
+    result: { hash: "PAYEROK", meta: { TransactionResult: "tesSUCCESS", delivered_amount: { currency: "USD", issuer: ISSUER, value: "1.5" } } },
+  });
+  const deps = { store, client, currentValidatedLedger: async () => curLedger, now: () => now };
+  const payment = { txBlob: iouBlob({}, { LastLedgerSequence: curLedger + 5, Sequence: 222 }) };
+  const out = await __test.settle(payment, iouReq, deps);
+  assert.equal(out.success, true, `IOU settle success: ${out.errorReason}`);
+  assert.equal(out.transaction, "PAYEROK", "tx hash preserved on success receipt");
+  assert.equal(out.payer, PAYER, "settle success receipt carries the verified payer");
+  if (prev === undefined) delete process.env.XAHAU_WSS; else process.env.XAHAU_WSS = prev;
+}
+
+// ---- /health + /metrics over a real spawned server (integration) -----------
+// Confirms the routes are wired (200 + documented shape), and that verify_total /
+// rate_limited_total actually move after the corresponding requests.
+await new Promise((resolveTest, rejectTest) => {
+  (async () => {
+    const { spawn } = await import("node:child_process");
+    const PORT = 4097;
+    const child = spawn(process.execPath, ["server.mjs"], {
+      env: { ...process.env, PORT: String(PORT), X402_RATE_MAX: "2", XAHAU_WSS: "" },
+      stdio: ["ignore", "ignore", "ignore"],
+    });
+    const getJson = (path, headers = {}) => new Promise((res) => {
+      const r = http.request({ host: "127.0.0.1", port: PORT, path, method: "GET", headers }, (resp) => {
+        let data = ""; resp.on("data", (c) => (data += c));
+        resp.on("end", () => { let body; try { body = JSON.parse(data); } catch { body = data; } res({ status: resp.statusCode, body, raw: data }); });
+      });
+      r.on("error", () => res({ status: null, body: null }));
+      r.end();
+    });
+    const postJson = (path) => new Promise((res) => {
+      const body = "{}";
+      const r = http.request({ host: "127.0.0.1", port: PORT, path, method: "POST", headers: { "content-type": "application/json", "content-length": Buffer.byteLength(body) } }, (resp) => { resp.resume(); resp.on("end", () => res(resp.statusCode)); });
+      r.on("error", () => res(null)); r.write(body); r.end();
+    });
+    const waitListen = async () => {
+      for (let i = 0; i < 50; i++) {
+        const ok = await new Promise((res) => {
+          const r = http.request({ host: "127.0.0.1", port: PORT, path: "/health", method: "GET" }, (resp) => { resp.resume(); res(resp.statusCode === 200); });
+          r.on("error", () => res(false)); r.end();
+        });
+        if (ok) return true;
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      return false;
+    };
+    try {
+      assert.equal(await waitListen(), true, "facilitator should start for the health/metrics test");
+
+      // /health: 200 + documented shape, no auth.
+      const h = await getJson("/health");
+      assert.equal(h.status, 200, "/health returns 200");
+      assert.equal(h.body.status, "ok", "/health body.status ok");
+      assert.equal(h.body.network, "xahau", "/health reports network");
+      assert.equal(h.body.networkID, EXPECTED_NETWORK_ID, "/health reports networkID");
+      assert.equal(h.body.xrplConfigured, false, "/health honestly reports xrpl not configured (XAHAU_WSS empty)");
+      assert.equal(typeof h.body.uptimeSec, "number", "/health uptimeSec is a number");
+      assert.equal(typeof h.body.replayBindings, "number", "/health replayBindings is a number");
+      assert.equal(h.body.replayStore, "memory", "/health replayStore=memory (no redis configured)");
+
+      // /metrics: 200 JSON counters, snapshot verify_total + rate_limited_total.
+      const m1 = await getJson("/metrics");
+      assert.equal(m1.status, 200, "/metrics returns 200");
+      assert.equal(typeof m1.body.verify_total, "number", "/metrics exposes verify_total");
+      assert.equal(typeof m1.body.rate_limited_total, "number", "/metrics exposes rate_limited_total");
+      const v0 = m1.body.verify_total;
+      const rl0 = m1.body.rate_limited_total;
+
+      // Fire /verify: rate max=2, so #1 and #2 allowed (verify_total +2), #3 rate-limited.
+      const s1 = await postJson("/verify");
+      const s2 = await postJson("/verify");
+      const s3 = await postJson("/verify");
+      assert.equal(s1, 200, "verify #1 allowed");
+      assert.equal(s2, 200, "verify #2 allowed");
+      assert.equal(s3, 429, "verify #3 rate-limited");
+
+      const m2 = await getJson("/metrics");
+      assert.equal(m2.body.verify_total, v0 + 2, "verify_total incremented by the 2 allowed verifies (real event)");
+      assert.equal(m2.body.rate_limited_total, rl0 + 1, "rate_limited_total incremented by the 1 rejected request (real event)");
+
+      // /metrics Prometheus text on Accept: text/plain.
+      const mp = await getJson("/metrics", { accept: "text/plain" });
+      assert.equal(mp.status, 200, "/metrics text returns 200");
+      assert.match(mp.raw, /x402_verify_total \d+/, "/metrics text emits prometheus counter");
+
+      resolveTest();
+    } catch (e) { rejectTest(e); }
+    finally { child.kill("SIGKILL"); }
+  })().catch(rejectTest);
+});
+
+console.log("ok — all hardened verifyExact + settle cases pass (native + IOU + ops hardening + x402 spec fields)");

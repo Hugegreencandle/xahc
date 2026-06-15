@@ -8,9 +8,11 @@ into working code so the design can be exercised and ratified.
 
 | Endpoint | Purpose |
 |---|---|
-| `GET /supported` | Advertise `{scheme:"exact", network:"xahau"}` |
+| `GET /supported` | Advertise `{kinds:[{x402Version:2, scheme:"exact", network:"xahau"}]}` |
 | `POST /verify` | Offline checks on a signed Xahau Payment vs the x402 requirements |
 | `POST /settle` | Submit the signed tx to Xahau (`submitAndWait`) |
+| `GET /health` | Liveness/readiness JSON (no auth, cheap, never throws) |
+| `GET /metrics` | Counters as JSON (or Prometheus text on `Accept: text/plain`) |
 
 `/verify` decodes the payload with Xahau's binary codec and enforces (every
 check is mandatory — a missing bound is a **failure**, never a skip):
@@ -86,6 +88,17 @@ XAHAU_WSS=wss://… npm start   # enable /settle against a Xahau node
 #   XAHAU_NETWORK=xahau-testnet   expect NetworkID 21338 instead of 21337
 #   X402_REDIS_URL=redis://…      use a SHARED, durable replay store + limiter
 #                                 (needs `npm i ioredis`; fails fast if missing)
+# operational (optional env):
+#   X402_CONNECT_TIMEOUT_MS=8000  per-attempt xrpl connect timeout
+#   X402_CONNECT_ATTEMPTS=3       bounded reconnect attempts (then fail closed)
+#   X402_CONNECT_BACKOFF_MS=500   backoff between connect attempts
+#   X402_SHUTDOWN_DRAIN_MS=10000  graceful-shutdown in-flight drain budget
+```
+
+```sh
+curl localhost:4021/health     # liveness/readiness (no auth)
+curl localhost:4021/metrics    # counters (JSON)
+curl -H 'Accept: text/plain' localhost:4021/metrics   # Prometheus text
 ```
 
 ```sh
@@ -105,6 +118,65 @@ curl -X POST localhost:4021/verify -d '{
   }
 }'
 ```
+
+## Operational hardening
+
+- **`GET /health`** — unauthenticated, cheap, never throws. Returns `{ status,
+  network, networkID, replayStore: "memory"|"redis", rateLimiter: "memory"|"redis",
+  redisConnected?, xrplConfigured, xrplConnected?, uptimeSec, replayBindings }`.
+  **Honest by design:** connectivity it cannot cheaply determine is reported
+  falsy/absent, never fabricated as healthy (`xrplConnected` is only `true` if a
+  pooled client reports `isConnected()`; `redisConnected` only if ioredis status is
+  `ready`). It does not open a connection to answer.
+- **`GET /metrics`** — JSON counters by default, Prometheus exposition text on
+  `Accept: text/plain`. Counters move on **real events only**, wired at the exact
+  code points: `verify_total`, `settle_total`, `settle_success`, `settle_replayed`,
+  `settle_rejected` (+ breakdown buckets `verify_failed`, `replay_inflight`,
+  `store_full`, `submit_ambiguous`, `tem_rejected`, `on_ledger_failure`,
+  `delivered_short`, `other`), `rate_limited_total`, `body_too_large_total`. **No
+  PII** (no addresses/amounts) is ever recorded.
+- **Structured logging** — dependency-free JSON lines to **stderr**
+  (`{ ts, level, event, ... }`), honest level (error/warn/info). Never logs secrets,
+  full tx blobs, or signatures.
+- **Resilient xrpl client** — reconnects on disconnect; each connect attempt is
+  bounded by `X402_CONNECT_TIMEOUT_MS` with a bounded backoff retry
+  (`X402_CONNECT_ATTEMPTS`). **Not** an unbounded in-request retry loop: after the
+  bounded attempts it **fails closed** and `/settle` returns a clear `errorReason`.
+- **Graceful shutdown** — `SIGTERM`/`SIGINT` stop accepting new connections, drain
+  in-flight requests within `X402_SHUTDOWN_DRAIN_MS`, then close the xrpl client and
+  Redis connection and exit. **Handlers are attached only inside `serve()`** (never
+  at import) so importing the module for tests installs no signal handlers / exit.
+- **Boot-time config validation** — on `serve()`, validates `PORT`, the `XAHAU_WSS`
+  ws/wss URL form, `XAHAU_NETWORK`/`XAHAU_NETWORK_ID` consistency, and the
+  `X402_REDIS_URL` form. A **fatal** misconfig logs a structured error and exits
+  non-zero (fail fast); a **non-fatal** gap (e.g. `XAHAU_WSS` unset → `/settle`
+  disabled) logs a warning and runs on. Validation runs only in `serve()`, never at
+  import.
+
+## x402 spec compliance (and intentional divergences)
+
+Field names follow the x402 facilitator interface (source:
+[docs.payai.network/x402/reference §7](https://docs.payai.network/x402/reference),
+corroborated by [docs.x402.org/core-concepts/facilitator](https://docs.x402.org/core-concepts/facilitator)
+and the x402 OpenAPI `VerifyResponse`/`SettleResponse` shapes). Changes are
+**additive and non-breaking** — every field the tests already assert is retained:
+
+- **`GET /supported`** → `{ kinds: [{ x402Version: 2, scheme: "exact", network }] }`
+  (added the spec's `x402Version` alongside the original `{scheme, network}`).
+- **`POST /verify`** → spec requires `{ isValid, invalidReason?, payer }` — already
+  present and unchanged.
+- **`POST /settle`** → spec requires `{ success, transaction, network, payer,
+  errorReason? }`. **Added `payer`** (the signature-bound `tx.Account`) and ensured
+  `transaction` is always present (empty string on failure, per spec) on every
+  settlement result, alongside the exact-xahau extras (`delivered`,
+  `guardrailHookPresent`, and the idempotency flags `replayed`/`inFlight`/`retryable`).
+
+**Documented divergences** (exact-xahau is a *proposed* x402 scheme for Xahau, not
+EVM/SVM): `network` is the bare string `"xahau"` (not a CAIP-2 id like
+`eip155:8453`); the payment payload is a **raw signed Xahau transaction blob** (not
+an EIP-3009 `transferWithAuthorization` or a Solana partially-signed tx); and the
+`guardrailHookPresent`/`delivered`/idempotency fields are exact-xahau extensions
+not present in the canonical schema.
 
 ## Status
 

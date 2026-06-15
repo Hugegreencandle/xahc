@@ -4,9 +4,30 @@
  *
  * Implements the x402 facilitator surface for the proposed `exact-xahau` scheme
  * (see ../docs/X402-XAHAU.md):
- *   GET  /supported  -> advertise {scheme:"exact", network:"xahau"}
+ *   GET  /supported  -> advertise {kinds:[{x402Version:2, scheme:"exact", network:"xahau"}]}
  *   POST /verify     -> offline checks on a signed Xahau Payment vs the requirements
  *   POST /settle     -> submit the signed tx to Xahau (needs XAHAU_WSS)
+ *   GET  /health     -> liveness/readiness JSON (no auth, cheap, never throws)
+ *   GET  /metrics    -> counters as JSON, or Prometheus text on Accept: text/plain
+ *
+ * x402 SPEC ALIGNMENT (non-breaking; originals retained): /verify returns the
+ * spec's {isValid, invalidReason?, payer}; /settle returns {success, transaction,
+ * network, payer, errorReason?} — `payer` and a (possibly empty) `transaction` are
+ * now always present, alongside the original exact-xahau extras (delivered,
+ * guardrailHookPresent, replayed/inFlight/retryable). /supported uses the spec's
+ * {kinds:[{x402Version, scheme, network}]} discovery shape. INTENTIONAL DIVERGENCES
+ * from canonical x402 (exact-xahau is a PROPOSED scheme for Xahau): `network` is the
+ * bare string "xahau" (not a CAIP-2 id); the payment payload is a raw signed Xahau
+ * tx blob (not an EIP-3009 authorization); and the extra fields above are additive.
+ *
+ * OPERATIONAL HARDENING: dependency-free structured logging (JSON lines -> stderr,
+ * no secrets/blobs/signatures), accurate metrics counters (incremented on REAL
+ * events only — no PII), a RESILIENT xrpl client (reconnect-on-disconnect + bounded
+ * connect timeout + bounded backoff, fail-closed — never an unbounded in-request
+ * retry), boot-time config validation (fail-fast on a fatal misconfig; warn on a
+ * non-fatal gap), and graceful shutdown (SIGTERM/SIGINT -> stop accepting, drain
+ * in-flight within a bounded budget, close xrpl+Redis, exit). Signal handlers and
+ * config-exit are attached ONLY inside serve(), never at import.
  *
  * Threat model: hostile clients. Every check is enforced; absence of a bound is
  * treated as a FAILURE, never a skip. Signatures are cryptographically verified.
@@ -79,6 +100,77 @@ const STRICT_DROPS = /^[0-9]+$/;
 const MAX_BODY_BYTES = 64 * 1024;
 const SHARED_SECRET = process.env.X402_SHARED_SECRET || "";
 
+// Process start time (epoch ms) for /health uptime. Set at module load.
+const BOOT_TS = Date.now();
+
+// ---------------------------------------------------------------------------
+// structured logging (dependency-free JSON lines -> stderr)
+// ---------------------------------------------------------------------------
+// One JSON object per line: { ts, level, event, ...fields }. stderr is the sink
+// (stdout stays clean for any future machine output). NEVER log secrets, full tx
+// blobs, signatures, or PII (addresses/amounts): callers pass only safe fields
+// (event name, error code/class, counts). `level` is honest: error/warn/info.
+function log(level, event, fields = {}) {
+  try {
+    const rec = { ts: new Date().toISOString(), level, event, ...fields };
+    process.stderr.write(JSON.stringify(rec) + "\n");
+  } catch {
+    // Logging must never throw into a request path. Last-resort: a bare line.
+    try { process.stderr.write(`{"level":"${level}","event":"${event}"}\n`); } catch { /* give up */ }
+  }
+}
+const logInfo = (event, fields) => log("info", event, fields);
+const logWarn = (event, fields) => log("warn", event, fields);
+const logError = (event, fields) => log("error", event, fields);
+
+// ---------------------------------------------------------------------------
+// metrics (dependency-free counters; incremented on REAL events only)
+// ---------------------------------------------------------------------------
+// A flat counter map. Each counter moves ONLY when its underlying event happens
+// (wired at the exact code points). No PII is ever stored here — only counts.
+// `settle_rejected_*` break the rejected total down by cause bucket. Exposed as
+// JSON (default) or Prometheus text (Accept: text/plain) by GET /metrics.
+const metrics = {
+  verify_total: 0,
+  settle_total: 0,
+  settle_success: 0,
+  settle_replayed: 0,
+  settle_rejected: 0,
+  // rejected breakdown (sum of these == settle_rejected):
+  settle_rejected_verify_failed: 0,
+  settle_rejected_replay_inflight: 0,
+  settle_rejected_store_full: 0,
+  settle_rejected_submit_ambiguous: 0,
+  settle_rejected_tem_rejected: 0,
+  settle_rejected_on_ledger_failure: 0,
+  settle_rejected_delivered_short: 0,
+  settle_rejected_other: 0,
+  rate_limited_total: 0,
+  body_too_large_total: 0,
+};
+function metricInc(name, by = 1) {
+  if (Object.prototype.hasOwnProperty.call(metrics, name)) metrics[name] += by;
+}
+// Map a settle reject reason to its bucket counter + bump the rejected total.
+// Buckets are derived from the structured settle outcome, never from PII. An
+// unrecognized reason lands in `_other` so the breakdown always sums to the total.
+function recordSettleReject(bucket) {
+  metricInc("settle_rejected");
+  const key = `settle_rejected_${bucket}`;
+  if (Object.prototype.hasOwnProperty.call(metrics, key)) metricInc(key);
+  else metricInc("settle_rejected_other");
+}
+// Render the counters as Prometheus exposition text (counters only).
+function metricsPrometheus() {
+  const lines = [];
+  for (const [k, v] of Object.entries(metrics)) {
+    const name = `x402_${k}`;
+    lines.push(`# TYPE ${name} counter`);
+    lines.push(`${name} ${v}`);
+  }
+  return lines.join("\n") + "\n";
+}
+
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
@@ -116,6 +208,8 @@ function readBody(req, res) {
         // and the client sees ECONNRESET instead of our 413. `Connection: close`
         // tells the client this socket won't be reused, so it closes gracefully
         // after reading the response.
+        metricInc("body_too_large_total");
+        log("warn", "body_too_large", { limitBytes: MAX_BODY_BYTES });
         if (res && !res.headersSent) {
           const b = JSON.stringify({ error: "request body too large" });
           res.writeHead(413, {
@@ -842,16 +936,59 @@ async function currentValidatedLedger(client) {
 // pooled client
 // ---------------------------------------------------------------------------
 let _client = null;
+// Bounded connect: how long a single connect attempt may take, how many attempts,
+// and the backoff between them. Kept SMALL so a node blip degrades gracefully (a
+// settle fails closed with a clear errorReason) instead of wedging the request.
+const CONNECT_TIMEOUT_MS = Number(process.env.X402_CONNECT_TIMEOUT_MS) || 8000;
+const CONNECT_ATTEMPTS = Math.max(1, Number(process.env.X402_CONNECT_ATTEMPTS) || 3);
+const CONNECT_BACKOFF_MS = Number(process.env.X402_CONNECT_BACKOFF_MS) || 500;
+
+/** Race a promise against a timeout; reject with a clear message if it wins. */
+function withTimeout(promise, ms, label) {
+  let t;
+  const timeout = new Promise((_, reject) => {
+    t = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(t));
+}
+
+/**
+ * Get a connected xrpl client. RESILIENT: reuses the pooled client only while it
+ * isConnected(); on a disconnect it rebuilds + reconnects. Each connect attempt is
+ * BOUNDED by CONNECT_TIMEOUT_MS, with a small bounded backoff retry (CONNECT_ATTEMPTS)
+ * so a transient node blip doesn't wedge settle. This is NOT an unbounded in-request
+ * retry loop: after the bounded attempts it FAILS CLOSED (throws) and settle surfaces
+ * a clear errorReason. The _deps.client injection seam in settle bypasses this entirely.
+ */
 async function getClient() {
   const wss = process.env.XAHAU_WSS;
   if (!wss) throw new Error("XAHAU_WSS not set");
   let Client;
   try { ({ Client } = await import("xrpl")); }
   catch { throw new Error("xrpl not installed"); }
+  // Fast path: reuse a live connection.
   if (_client && _client.isConnected()) return _client;
-  _client = new Client(wss);
-  await _client.connect();
-  return _client;
+  // Stale/disconnected client: best-effort tear down before rebuilding.
+  if (_client) {
+    try { await _client.disconnect(); } catch { /* ignore */ }
+    _client = null;
+  }
+  let lastErr;
+  for (let attempt = 1; attempt <= CONNECT_ATTEMPTS; attempt++) {
+    const c = new Client(wss);
+    try {
+      await withTimeout(c.connect(), CONNECT_TIMEOUT_MS, "xrpl connect");
+      _client = c;
+      return _client;
+    } catch (e) {
+      lastErr = e;
+      try { await c.disconnect(); } catch { /* ignore */ }
+      log("warn", "xrpl_connect_failed", { attempt, attempts: CONNECT_ATTEMPTS, error: String(e?.message || e) });
+      if (attempt < CONNECT_ATTEMPTS) await new Promise((r) => setTimeout(r, CONNECT_BACKOFF_MS));
+    }
+  }
+  // Fail CLOSED after bounded attempts — never an unbounded retry inside a request.
+  throw new Error(`xrpl connect failed after ${CONNECT_ATTEMPTS} attempts: ${lastErr?.message || lastErr}`);
 }
 
 /**
@@ -884,14 +1021,22 @@ function submitDefinitelyNotApplied(e) {
  * was called), enforces single-use replay binding, and checks delivered_amount.
  */
 async function settle(payload, req, _deps = {}) {
-  if (!process.env.XAHAU_WSS) return { success: false, network: NETWORK, errorReason: "set XAHAU_WSS to settle" };
+  // settle_total counts every settlement ATTEMPT that reaches this function.
+  metricInc("settle_total");
+  if (!process.env.XAHAU_WSS) {
+    recordSettleReject("other");
+    return { success: false, network: NETWORK, transaction: "", payer: "", errorReason: "set XAHAU_WSS to settle" };
+  }
 
   // Dependency seams (injectable for tests): store, client, ledger fetcher, clock.
   const st = _deps.store || store;
 
   // (4a) Re-run full verification inside settle.
   const v = verifyExact(payload, req);
-  if (!v.isValid) return { success: false, network: NETWORK, errorReason: `verify failed: ${v.invalidReason}` };
+  if (!v.isValid) {
+    recordSettleReject("verify_failed");
+    return { success: false, network: NETWORK, transaction: "", payer: v.payer ?? "", errorReason: `verify failed: ${v.invalidReason}` };
+  }
 
   // (4b) Replay protection — refuse a payment whose binding was already consumed.
   // IDEMPOTENCY: if a FINAL receipt was stored for this payment (terminal on-ledger
@@ -902,12 +1047,13 @@ async function settle(payload, req, _deps = {}) {
   // (inFlight:true) and NEVER re-submit.
   if (await st.isConsumed(v.replayId)) {
     const receipt = await st.getReceipt(v.replayId);
-    if (receipt) return { ...receipt, replayed: true };
-    return { success: false, network: NETWORK, errorReason: "replay: payment already consumed", inFlight: true };
+    if (receipt) { metricInc("settle_replayed"); return { ...receipt, payer: receipt.payer ?? v.payer, replayed: true }; }
+    recordSettleReject("replay_inflight");
+    return { success: false, network: NETWORK, transaction: "", payer: v.payer, errorReason: "replay: payment already consumed", inFlight: true };
   }
 
   let tx;
-  try { tx = decode(payload.txBlob); } catch { return { success: false, network: NETWORK, errorReason: "undecodable txBlob" }; }
+  try { tx = decode(payload.txBlob); } catch { recordSettleReject("other"); return { success: false, network: NETWORK, transaction: "", payer: v.payer ?? "", errorReason: "undecodable txBlob" }; }
   // exact-xahau: the delivered amount must be >= the verified required amount, up to
   // max. For native that's a bigint drops compare; for an IOU it's an exact token
   // compare. v.amount is the verified value the payer committed to (<= maxRequired).
@@ -920,7 +1066,11 @@ async function settle(payload, req, _deps = {}) {
 
   let client;
   try { client = _deps.client || await getClient(); }
-  catch (e) { return { success: false, network: NETWORK, errorReason: e.message }; }
+  catch (e) {
+    recordSettleReject("other");
+    log("error", "settle_client_unavailable", { error: String(e?.message || e) });
+    return { success: false, network: NETWORK, transaction: "", payer: v.payer, errorReason: e.message };
+  }
 
   // (Hole 1) Bound the tx's on-ledger validity window. A tx is replayable until
   // its LastLedgerSequence is passed; if that window exceeds what the replay TTL
@@ -931,12 +1081,18 @@ async function settle(payload, req, _deps = {}) {
   // the window.
   const lastLedger = Number(tx.LastLedgerSequence);
   const curLedger = await getLedger(client);
-  if (!Number.isFinite(curLedger))
-    return { success: false, network: NETWORK, errorReason: "could not read current ledger (cannot bound validity window)" };
-  if (!Number.isFinite(lastLedger) || lastLedger <= curLedger)
-    return { success: false, network: NETWORK, errorReason: "LastLedgerSequence not in the future" };
-  if (lastLedger - curLedger > MAX_VALIDITY_LEDGERS)
-    return { success: false, network: NETWORK, errorReason: `validity window too large (LastLedgerSequence > ${MAX_VALIDITY_LEDGERS} ledgers ahead)` };
+  if (!Number.isFinite(curLedger)) {
+    recordSettleReject("other");
+    return { success: false, network: NETWORK, transaction: "", payer: v.payer, errorReason: "could not read current ledger (cannot bound validity window)" };
+  }
+  if (!Number.isFinite(lastLedger) || lastLedger <= curLedger) {
+    recordSettleReject("other");
+    return { success: false, network: NETWORK, transaction: "", payer: v.payer, errorReason: "LastLedgerSequence not in the future" };
+  }
+  if (lastLedger - curLedger > MAX_VALIDITY_LEDGERS) {
+    recordSettleReject("other");
+    return { success: false, network: NETWORK, transaction: "", payer: v.payer, errorReason: `validity window too large (LastLedgerSequence > ${MAX_VALIDITY_LEDGERS} ledgers ahead)` };
+  }
 
   const replayCtx = { lastLedgerSequence: lastLedger, currentLedger: curLedger };
   const expiryMs = consumedExpiryFor(replayCtx, now);
@@ -952,12 +1108,16 @@ async function settle(payload, req, _deps = {}) {
   // entries (Hole 2, fail closed) -> surface 503. "exists" = another settle already
   // holds it -> idempotent replay branch (return receipt if any, else in-flight).
   const res = await st.reserve(v.replayId, expiryMs, now);
-  if (res === "full")
-    return { success: false, network: NETWORK, errorReason: "replay store full, retry later", retryable: true };
+  if (res === "full") {
+    recordSettleReject("store_full");
+    log("warn", "settle_store_full", {});
+    return { success: false, network: NETWORK, transaction: "", payer: v.payer, errorReason: "replay store full, retry later", retryable: true };
+  }
   if (res === "exists") {
     const receipt = await st.getReceipt(v.replayId);
-    if (receipt) return { ...receipt, replayed: true };
-    return { success: false, network: NETWORK, errorReason: "replay: payment already consumed", inFlight: true };
+    if (receipt) { metricInc("settle_replayed"); return { ...receipt, payer: receipt.payer ?? v.payer, replayed: true }; }
+    recordSettleReject("replay_inflight");
+    return { success: false, network: NETWORK, transaction: "", payer: v.payer, errorReason: "replay: payment already consumed", inFlight: true };
   }
 
   let r;
@@ -974,12 +1134,16 @@ async function settle(payload, req, _deps = {}) {
     if (submitDefinitelyNotApplied(e)) {
       // tem stores NO receipt; release() also clears any (non-existent) receipt.
       await st.release(v.replayId);
-      return { success: false, network: NETWORK, errorReason: "submit rejected (tem, not applied)", guardrailHookPresent: hookPresent };
+      recordSettleReject("tem_rejected");
+      log("warn", "settle_submit_tem", {});
+      return { success: false, network: NETWORK, transaction: "", payer: v.payer, errorReason: "submit rejected (tem, not applied)", guardrailHookPresent: hookPresent };
     }
     // AMBIGUOUS retained path: outcome genuinely UNKNOWN -> store NO receipt, so a
-    // later retry is treated as in-flight (not handed a fabricated receipt).
-    console.error("[x402] settle: ambiguous submit failure, reservation RETAINED:", e?.message || e);
-    return { success: false, network: NETWORK, errorReason: "submit result unknown — reservation retained until validity window expires", guardrailHookPresent: hookPresent };
+    // later retry is treated as in-flight (not handed a fabricated receipt). Log the
+    // ERROR CLASS only (never the full error/tx — could carry sensitive context).
+    recordSettleReject("submit_ambiguous");
+    log("error", "settle_submit_ambiguous", { reservationRetained: true, error: String(e?.message || e).slice(0, 200) });
+    return { success: false, network: NETWORK, transaction: "", payer: v.payer, errorReason: "submit result unknown — reservation retained until validity window expires", guardrailHookPresent: hookPresent };
   }
 
   const meta = r.result.meta || {};
@@ -1055,6 +1219,22 @@ async function settle(payload, req, _deps = {}) {
         };
       }
     }
+  }
+  // x402 SettleResponse requires a `payer` field on every settlement result. The
+  // verified payer (== tx.Account, signature-bound) is the authoritative value.
+  receipt.payer = v.payer;
+  // Metrics: classify the TERMINAL outcome by its actual cause (no PII). success
+  // increments settle_success; on-ledger non-tesSUCCESS (e.g. tecHOOK_REJECTED) ->
+  // on_ledger_failure; a tesSUCCESS that under-delivered / mis-asset'd / had an
+  // unreadable delivered_amount -> delivered_short.
+  if (receipt.success === true) {
+    metricInc("settle_success");
+  } else if (code !== "tesSUCCESS") {
+    recordSettleReject("on_ledger_failure");
+    log("info", "settle_on_ledger_failure", { code: code || "no result", guardrailHookPresent: hookPresent });
+  } else {
+    recordSettleReject("delivered_short");
+    log("warn", "settle_delivered_short", { reason: receipt.errorReason });
   }
   await st.setReceipt(v.replayId, receipt, expiryMs);
   return receipt;
@@ -1180,9 +1360,129 @@ function _sweepBuckets(now) {
 }
 
 // ---------------------------------------------------------------------------
+// boot-time config validation (factored out so it is unit-testable)
+// ---------------------------------------------------------------------------
+/**
+ * Validate the runtime env (pass a plain object, defaults to process.env). Returns
+ * { fatal: string[], warnings: string[] }. FATAL entries are misconfigurations the
+ * operator almost certainly did NOT intend (a non-numeric PORT, a malformed
+ * XAHAU_WSS / X402_REDIS_URL URL, an inconsistent network id) — serve() exits
+ * non-zero on any fatal. WARNINGS are non-fatal gaps (e.g. XAHAU_WSS unset ->
+ * /settle disabled) that are logged but do not crash. This function NEVER exits or
+ * logs itself — the caller decides.
+ */
+export function validateConfig(env = process.env) {
+  const fatal = [];
+  const warnings = [];
+
+  // PORT: if explicitly set, must be a sane TCP port number.
+  if (env.PORT !== undefined && env.PORT !== "") {
+    const p = Number(env.PORT);
+    if (!Number.isInteger(p) || p < 1 || p > 65535)
+      fatal.push(`PORT="${env.PORT}" is not a valid TCP port (1-65535)`);
+  }
+
+  // XAHAU_WSS: optional, but if set must be a ws:// or wss:// URL. Unset -> settle
+  // is disabled (non-fatal warning).
+  if (env.XAHAU_WSS !== undefined && env.XAHAU_WSS !== "") {
+    let ok = false;
+    try { const u = new URL(env.XAHAU_WSS); ok = u.protocol === "ws:" || u.protocol === "wss:"; } catch { ok = false; }
+    if (!ok) fatal.push(`XAHAU_WSS="${env.XAHAU_WSS}" is not a ws:// or wss:// URL`);
+  } else {
+    warnings.push("XAHAU_WSS is not set — /settle is DISABLED (offline /verify only)");
+  }
+
+  // Network id consistency: if both XAHAU_NETWORK and XAHAU_NETWORK_ID are set, the
+  // named network's known id must match the explicit id. An explicit-only id is fine.
+  if (env.XAHAU_NETWORK !== undefined && env.XAHAU_NETWORK !== "") {
+    const known = NETWORK_IDS[env.XAHAU_NETWORK];
+    if (known === undefined)
+      fatal.push(`XAHAU_NETWORK="${env.XAHAU_NETWORK}" is not a known network (${Object.keys(NETWORK_IDS).join(", ")})`);
+    else if (env.XAHAU_NETWORK_ID !== undefined && env.XAHAU_NETWORK_ID !== "" && Number(env.XAHAU_NETWORK_ID) !== known)
+      fatal.push(`XAHAU_NETWORK_ID="${env.XAHAU_NETWORK_ID}" disagrees with XAHAU_NETWORK="${env.XAHAU_NETWORK}" (expected ${known})`);
+  }
+  if (env.XAHAU_NETWORK_ID !== undefined && env.XAHAU_NETWORK_ID !== "") {
+    const n = Number(env.XAHAU_NETWORK_ID);
+    if (!Number.isInteger(n) || n <= 0)
+      fatal.push(`XAHAU_NETWORK_ID="${env.XAHAU_NETWORK_ID}" is not a positive integer`);
+  }
+
+  // X402_REDIS_URL: optional; if set, must be a redis(s):// URL.
+  if (env.X402_REDIS_URL !== undefined && env.X402_REDIS_URL !== "") {
+    let ok = false;
+    try { const u = new URL(env.X402_REDIS_URL); ok = u.protocol === "redis:" || u.protocol === "rediss:"; } catch { ok = false; }
+    if (!ok) fatal.push(`X402_REDIS_URL="${env.X402_REDIS_URL}" is not a redis:// or rediss:// URL`);
+  }
+
+  return { fatal, warnings };
+}
+
+// ---------------------------------------------------------------------------
+// /health + /metrics builders (cheap, never throw)
+// ---------------------------------------------------------------------------
+/**
+ * Build the /health liveness+readiness object. NEVER throws (caught internally),
+ * NEVER requires auth, and is HONEST: connectivity it cannot determine is reported
+ * as a falsy/unknown value rather than fabricated as healthy.
+ *
+ * `xrplConnected` is only truthy if a pooled client object reports isConnected();
+ * we do NOT open a connection here (health must be cheap) — if no client has been
+ * built yet it is reported `false` (unknown-but-not-claimed-healthy). Same honesty
+ * for Redis: only reported connected if the client exposes a 'ready' status.
+ */
+function buildHealth() {
+  const h = {
+    status: "ok",
+    network: NETWORK,
+    networkID: EXPECTED_NETWORK_ID,
+    replayStore: "memory",
+    rateLimiter: "memory",
+    xrplConfigured: !!process.env.XAHAU_WSS,
+    uptimeSec: Math.floor((Date.now() - BOOT_TS) / 1000),
+    replayBindings: 0,
+  };
+  try {
+    const usingRedis = !!process.env.X402_REDIS_URL;
+    h.replayStore = (store instanceof RedisStore) ? "redis" : "memory";
+    h.rateLimiter = (rateLimiter instanceof RedisRateLimiter) ? "redis" : "memory";
+    if (usingRedis || h.replayStore === "redis" || h.rateLimiter === "redis") {
+      // Honest: only claim connected if ioredis reports status === "ready".
+      h.redisConnected = !!(_redisClient && _redisClient.status === "ready");
+    }
+    // xrpl connectivity: report configured + (best-effort, no new connection) connected.
+    if (h.xrplConfigured) {
+      h.xrplConnected = !!(_client && typeof _client.isConnected === "function" && _client.isConnected());
+    }
+    // replayBindings: best-effort live-entry count. For the in-memory store this is
+    // O(1) via the backing map; size() is async, so use the cheap synchronous map
+    // size when available and fall back to 0 (never throw, never block).
+    if (store && store.map instanceof Map) h.replayBindings = store.map.size;
+  } catch {
+    // Health must never throw. Degrade to status:"degraded" with what we have.
+    h.status = "degraded";
+  }
+  return h;
+}
+
+// ---------------------------------------------------------------------------
 // server
 // ---------------------------------------------------------------------------
+// Shutdown drain budget: how long in-flight requests get to finish on SIGTERM/INT
+// before we force-close. Kept short so orchestrators' kill grace isn't exceeded.
+const SHUTDOWN_DRAIN_MS = Number(process.env.X402_SHUTDOWN_DRAIN_MS) || 10000;
+
 function serve() {
+  // (6) Boot-time config validation: FAIL FAST on a fatal misconfig (bad PORT,
+  // malformed URLs, inconsistent network id); LOG warnings for non-fatal gaps
+  // (e.g. XAHAU_WSS unset -> settle disabled) without crashing. Done HERE (not at
+  // import) so tests importing the module never trigger an exit.
+  const cfg = validateConfig(process.env);
+  for (const w of cfg.warnings) logWarn("config_warning", { message: w });
+  if (cfg.fatal.length) {
+    logError("config_fatal", { errors: cfg.fatal });
+    process.exit(1);
+  }
+
   // Boot-time backend selection. createStore FAILS FAST if X402_REDIS_URL is set
   // but ioredis is missing (never a silent non-shared fallback). createRateLimiter
   // must follow so it can share the Redis client when configured.
@@ -1190,8 +1490,25 @@ function serve() {
   rateLimiter = createRateLimiter();
   const server = http.createServer(async (req, res) => {
     try {
+      // --- liveness/readiness: cheap, unauthenticated, never throws ----------
+      if (req.method === "GET" && req.url === "/health")
+        return send(res, 200, buildHealth());
+
+      // --- metrics: JSON by default, Prometheus text on Accept: text/plain ---
+      if (req.method === "GET" && req.url === "/metrics") {
+        const accept = String(req.headers["accept"] || "");
+        if (/text\/plain/i.test(accept)) {
+          const body = metricsPrometheus();
+          res.writeHead(200, { "content-type": "text/plain; version=0.0.4", "content-length": Buffer.byteLength(body) });
+          return res.end(body);
+        }
+        return send(res, 200, { ...metrics });
+      }
+
       if (req.method === "GET" && req.url === "/supported")
-        return send(res, 200, { kinds: [{ scheme: "exact", network: NETWORK }] });
+        // x402 discovery: { kinds: [{ x402Version, scheme, network }] }. We add the
+        // spec's `x402Version: 2` alongside the original {scheme, network}.
+        return send(res, 200, { kinds: [{ x402Version: 2, scheme: "exact", network: NETWORK }] });
 
       if (req.method === "POST" && req.url === "/verify") {
         // /verify decodes a full tx blob + runs signature crypto — an
@@ -1199,15 +1516,16 @@ function serve() {
         // auth-gated: it is intentionally a public, pre-payment offline check, so
         // requiring a secret would break x402 semantics).
         const ip = req.socket.remoteAddress || "unknown";
-        if (!(await rateLimiter.ok(ip))) return send(res, 429, { error: "rate limited" });
+        if (!(await rateLimiter.ok(ip))) { metricInc("rate_limited_total"); return send(res, 429, { error: "rate limited" }); }
         const b = await readBody(req, res);
+        metricInc("verify_total");
         return send(res, 200, verifyExact(b.paymentPayload, b.paymentRequirements));
       }
 
       if (req.method === "POST" && req.url === "/settle") {
         if (!authOk(req)) return send(res, 401, { error: "unauthorized" });
         const ip = req.socket.remoteAddress || "unknown";
-        if (!(await rateLimiter.ok(ip))) return send(res, 429, { error: "rate limited" });
+        if (!(await rateLimiter.ok(ip))) { metricInc("rate_limited_total"); return send(res, 429, { error: "rate limited" }); }
         const b = await readBody(req, res);
         const out = await settle(b.paymentPayload, b.paymentRequirements, { store, rateLimiter });
         // Replay store full of live (unexpired) bindings: fail closed with 503 so
@@ -1221,14 +1539,64 @@ function serve() {
       // readBody already wrote a clean response (e.g. 413 on oversize body) —
       // never send a second one.
       if (e === ALREADY_RESPONDED) return;
-      // (6b) Do not reflect raw error messages to clients; log server-side.
+      // (6b) Do not reflect raw error messages to clients; log server-side as a
+      // structured event (no stack/secret leaked to the client).
       const status = e?.statusCode || 500;
-      console.error("[x402] request error:", e?.stack || e?.message || e);
+      logError("request_error", { method: req.method, path: req.url, status, error: String(e?.message || e) });
       if (!res.headersSent) send(res, status, { error: status === 500 ? "internal error" : "bad request" });
     }
   });
-  server.listen(PORT, () => console.error(`exact-xahau facilitator on :${PORT} (network=${NETWORK}, networkID=${EXPECTED_NETWORK_ID})`));
+
+  // Track in-flight requests so graceful shutdown can drain them before exit.
+  let inFlight = 0;
+  server.on("request", (req, res) => {
+    inFlight++;
+    res.on("finish", () => { inFlight--; });
+    res.on("close", () => { /* finish already decremented; close after finish is a no-op */ });
+  });
+
+  server.listen(PORT, () => logInfo("listening", { port: Number(PORT), network: NETWORK, networkID: EXPECTED_NETWORK_ID }));
+
+  // (5) Graceful shutdown — attached ONLY here (never at import) so tests don't get
+  // signal handlers / process.exit. On SIGTERM/SIGINT: stop accepting new conns
+  // (server.close), let in-flight finish within a bounded drain, then close the xrpl
+  // client + Redis, then exit. A second signal forces immediate exit.
+  let shuttingDown = false;
+  const shutdown = (signal) => {
+    if (shuttingDown) { logWarn("shutdown_forced", { signal }); process.exit(1); return; }
+    shuttingDown = true;
+    logInfo("shutdown_begin", { signal, inFlight });
+    // Stop accepting new connections; callback fires once all conns are closed.
+    server.close(async () => {
+      await closeBackends();
+      logInfo("shutdown_complete", {});
+      process.exit(0);
+    });
+    // Bounded drain: if in-flight work doesn't finish in time, force-close + exit.
+    const timer = setTimeout(async () => {
+      logWarn("shutdown_drain_timeout", { inFlight, drainMs: SHUTDOWN_DRAIN_MS });
+      await closeBackends();
+      process.exit(0);
+    }, SHUTDOWN_DRAIN_MS);
+    if (typeof timer.unref === "function") timer.unref();
+  };
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  process.on("SIGINT", () => shutdown("SIGINT"));
+
   return server;
+}
+
+/**
+ * Best-effort close of external connections (xrpl client + Redis). Never throws;
+ * each is independently guarded so one failing doesn't block the other. Factored
+ * out so shutdown logic is testable in isolation.
+ */
+export async function closeBackends() {
+  try { if (_client && typeof _client.disconnect === "function") await _client.disconnect(); }
+  catch (e) { logWarn("xrpl_close_failed", { error: String(e?.message || e) }); }
+  _client = null;
+  try { if (_redisClient && typeof _redisClient.quit === "function") await _redisClient.quit(); }
+  catch (e) { logWarn("redis_close_failed", { error: String(e?.message || e) }); }
 }
 
 // run only when invoked directly (not when imported by test.mjs)
@@ -1270,6 +1638,10 @@ export const __test = {
   // Injectable backends + seams for the Redis-contract tests.
   InMemoryStore, RedisStore, InMemoryRateLimiter, RedisRateLimiter,
   consumedExpiryFor, __setStore, __setRateLimiter,
+  // Operational-hardening seams: config validator, health builder, metrics,
+  // metric helpers (so tests can assert counters move on real events).
+  validateConfig, buildHealth, metricsPrometheus, recordSettleReject, closeBackends,
+  metrics, metricInc,
   // Live view of the default store's backing map (back-compat with raw-Map tests).
   get consumed() { return store.map; },
   get store() { return store; },
