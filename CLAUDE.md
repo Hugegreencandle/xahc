@@ -23,7 +23,7 @@ first leg of the trifecta: **xahc (write) → xahau-mcp (simulate one) → xahc-
 `build` (clang→wasm → clean → lint) · `clean` (strip illegal exports) · `lint` (export/import
 allowlist, guard presence, stack budget, semantic safety) · `sim` (local wasmtime run) · `test`
 (TOML suite) · `install-tx` (unsigned SetHook) · `verify` (local sim vs a hosted xahau-mcp
-`/execute`) · `prove` (→ xahc-prover; `--invariant limit|guardrail|termination|monotonic|nospend|conservation|limit-iou|authz|validate|overflow|foreign-authz|reserve|time-nonce`) · `doctor` · `new`.
+`/execute`) · `prove` (→ xahc-prover; `--invariant limit|guardrail|termination|monotonic|nospend|conservation|limit-iou|authz|validate|overflow|foreign-authz|reserve|time-nonce|emission`) · `doctor` · `new`.
 
 ## Build / test
 ```sh
