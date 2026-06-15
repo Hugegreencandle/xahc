@@ -14,5 +14,12 @@
     "ripple-keypairs": "^2.0.0",
     "xrpl": "^4.6.0",
     "xrpl-binary-codec-prerelease": "^9.2.0"
+  },
+  "//ioredis": "OPTIONAL — only loaded for the shared/durable Redis replay store + limiter (set X402_REDIS_URL). The default in-memory path runs with ZERO extra deps. Declared as an optionalDependency so `npm install` never fails on a platform that can't build it, and as an optional peer so it is never silently required.",
+  "optionalDependencies": {
+    "ioredis": "^5.4.0"
+  },
+  "peerDependenciesMeta": {
+    "ioredis": { "optional": true }
   }
 }

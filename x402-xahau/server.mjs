@@ -15,21 +15,32 @@
  * (b) re-validates everything at /settle and checks delivered_amount — it never
  * trusts that /verify was called, and it refuses to settle the same payment twice.
  *
- * This is REFERENCE-GRADE HARDENED, not production: the replay store is in-memory
- * (does not survive restart, not shared across instances) and rate-limiting is a
- * single-process token bucket. Both in-memory stores are BOUNDED so they can't
- * grow without bound under load / IP-spray. The replay store is also REPLAY-SAFE:
- * each binding's expiry is tied to the tx's actual on-ledger validity window (so a
- * binding never expires while its tx is still submittable), settle rejects any tx
- * whose window exceeds the bound, and the hard-cap eviction is fail-CLOSED (drops
- * only EXPIRED entries; refuses new reservations with 503 when full of live ones —
- * never evicts a live binding). A submit that fails AMBIGUOUSLY (LastLedgerSequence
- * passed mid-wait / disconnect / timeout) RETAINS the reservation — only a
- * provably-not-applied preliminary `tem*` result releases it, so a maybe-applied tx
- * can never be settled twice. Both public POST paths (/verify and /settle) are
- * rate-limited; /settle additionally requires the shared secret. A production
- * deployment still needs a shared/durable nonce store (e.g. Redis/DB) and a
- * distributed rate limiter.
+ * The replay store and the rate limiter are INJECTABLE behind a small ASYNC
+ * interface. The DEFAULT backends are in-memory (zero extra deps): a bounded replay
+ * store + a single-process token bucket — reference-grade, NOT shared across
+ * instances and NOT durable across restarts (the long-standing production gap). An
+ * OPTIONAL Redis backend (gated on env X402_REDIS_URL, lazy-loading `ioredis`)
+ * closes that gap with a SHARED, DURABLE store + a shared limiter; if X402_REDIS_URL
+ * is set but `ioredis` is missing the server FAILS FAST at boot rather than silently
+ * falling back to a non-shared store (which would reopen replay across instances).
+ *
+ * Whichever backend is active, the replay store is REPLAY-SAFE and the SAME security
+ * properties hold: reserve() is an ATOMIC test-and-set (in-memory: check-then-set on
+ * the single-threaded event loop; Redis: SET NX PX) so two concurrent / multi-
+ * instance settles of the same payment can't BOTH win; each binding's expiry is tied
+ * to the tx's actual on-ledger validity window (Hole 1 — a binding never expires
+ * while its tx is still submittable); settle rejects any tx whose window exceeds the
+ * bound; and the hard cap is fail-CLOSED (only EXPIRED entries reclaimed; refuses new
+ * reservations with 503 when full of live ones — never evicts a live binding, Hole 2).
+ * A submit that fails AMBIGUOUSLY (LastLedgerSequence passed mid-wait / disconnect /
+ * timeout) RETAINS the reservation and stores NO receipt — only a provably-not-applied
+ * preliminary `tem*` result releases it, so a maybe-applied tx can never be settled
+ * twice. settle is also IDEMPOTENT: terminal outcomes (tesSUCCESS, or an on-ledger
+ * failure that spent the sequence) memoize a receipt keyed by the replay id; a retry
+ * returns that receipt (replayed:true) — never a re-submit — while an in-flight /
+ * ambiguous payment returns "already consumed" (inFlight:true) with no fabricated
+ * receipt. Both public POST paths (/verify and /settle) are rate-limited; /settle
+ * additionally requires the shared secret.
  * Signatures are bound to Account (deriveAddress == Account); RegularKey/multisig
  * are offline-unverifiable and are flagged (signatureVerified:false), not passed.
  */
@@ -308,22 +319,38 @@ function replayKeyFor(tx) {
 }
 
 // ---------------------------------------------------------------------------
-// replay store (reference-grade, in-memory — does NOT survive restart)
+// replay store + receipts (INJECTABLE, async — default in-memory, optional Redis)
 // ---------------------------------------------------------------------------
-// Map<key, expiryEpochMs>. Entries (replayId + tx hash) expire so the store cannot
-// grow without bound (slow memory-exhaustion DoS). A tx is (re)submittable until
-// its LastLedgerSequence is passed by the validated ledger, so each entry's expiry
-// is bound to that REAL on-ledger window (consumedExpiryFor: now + ledgerGap*~4s +
-// margin), NOT a flat TTL — a flat TTL shorter than the window would expire the
-// binding while the tx is still replayable (Hole 1). settle independently REJECTS
-// any tx whose window exceeds MAX_VALIDITY_LEDGERS (derived so the longest accepted
-// window still fits inside REPLAY_TTL_MS), so the flat TTL is a safe outer bound.
-// Eviction under the HARD CAP is expiry-aware + fail-CLOSED: only EXPIRED entries
-// are reclaimed; if the store is full of live bindings a new reservation is
-// REFUSED (503) rather than dropping a live binding (Hole 2).
+// The replay store is abstracted behind an ASYNC interface so a durable, SHARED
+// backend (Redis) can be plugged in for multi-instance deployments, while the
+// DEFAULT remains a zero-dependency in-memory store that reproduces the previous
+// semantics EXACTLY. The async shape is required because Redis is async; the
+// in-memory backend simply resolves synchronously.
+//
+// Store contract (all methods async):
+//   reserve(key, expiryMs) -> "reserved" | "exists" | "full"
+//       Atomic test-and-set. "reserved" iff the key was newly bound (this caller
+//       won the race); "exists" iff a LIVE binding already held the key (caller
+//       must NOT proceed — replay); "full" iff the store is at its hard cap with
+//       only LIVE entries (fail-CLOSED — never evict a live binding, surface 503).
+//       Atomicity is what makes two concurrent / multi-instance settles of the
+//       same payment unable to BOTH win (the old check-then-mark race is gone).
+//   get(key) -> expiryMs | undefined        (raw expiry of a live binding)
+//   isConsumed(key) -> bool                  (true iff a live binding exists)
+//   release(key) -> void                     (drop a reservation; also its receipt)
+//   set(key, expiryMs) -> void               (unconditional upsert; used for the
+//                                             redundant tx-hash binding)
+//   size() -> number                         (live-entry count; best-effort)
+//   getReceipt(key) -> receipt | undefined   (final settle receipt, if stored)
+//   setReceipt(key, receipt, expiryMs) -> void
+//
+// Hole 1 (expiry bound to the tx's REAL on-ledger window), Hole 2 (fail-closed
+// hard cap — refuse, never evict a live binding), and the validity-window bound
+// (MAX_VALIDITY_LEDGERS, settle rejects over-window txs) are PRESERVED across both
+// backends: consumedExpiryFor computes the same window-bound expiry, settle passes
+// it as `expiryMs` into reserve, and each backend enforces the cap fail-closed.
 const REPLAY_TTL_MS = Number(process.env.X402_REPLAY_TTL_MS) || 60 * 60 * 1000; // 1h
 const REPLAY_MAX_ENTRIES = Number(process.env.X402_REPLAY_MAX) || 100_000;
-const consumed = new Map(); // key -> expiry (epoch ms)
 
 // --- Hole 1: bind validity window to the replay TTL ------------------------
 // A Xahau/XRPL tx is (re)submittable until its LastLedgerSequence is passed by
@@ -367,48 +394,164 @@ function consumedExpiryFor({ lastLedgerSequence, currentLedger } = {}, now = Dat
 }
 
 /**
- * Drop expired replay entries. Returns true if the store has room for a new
- * reservation (size < cap) AFTER expired entries are reclaimed. Eviction is
- * fail-CLOSED: we NEVER drop an unexpired (still-binding) entry to make room —
- * doing so would reopen replay for a live payment (Hole 2). If the store is at
- * the cap with all-unexpired entries, the caller must REFUSE the reservation.
+ * Default in-memory backend. Reproduces TODAY's exact semantics: a Map<key,
+ * expiryEpochMs> of live bindings, sweep-on-access expiry, a fail-CLOSED hard cap
+ * (only EXPIRED entries reclaimed; refuse when full of live ones — Hole 2), and an
+ * expiry tied to the tx's real on-ledger window (Hole 1, via the expiryMs passed
+ * by settle). Receipts live in a parallel Map sharing the same key + expiry. Does
+ * NOT survive restart, NOT shared across instances — that is the production gap the
+ * optional Redis backend closes.
+ *
+ * A clock seam (`_now`) keeps the deterministic test hooks (which pass an explicit
+ * `now`) working: callers may pass `now` to any method; it defaults to _now().
  */
-function sweepConsumed(now = Date.now()) {
-  for (const [k, exp] of consumed) {
-    if (exp <= now) consumed.delete(k);
+export class InMemoryStore {
+  constructor({ maxEntries = REPLAY_MAX_ENTRIES, now = Date.now } = {}) {
+    this.map = new Map();       // key -> expiry (epoch ms)
+    this.receipts = new Map();  // key -> { receipt, expiry }
+    this.maxEntries = maxEntries;
+    this._now = now;
   }
-  return consumed.size < REPLAY_MAX_ENTRIES;
-}
-
-/** True if `key` is an unexpired consumed binding (lazily evicts if expired). */
-function isConsumed(key, now = Date.now()) {
-  const exp = consumed.get(key);
-  if (exp === undefined) return false;
-  if (exp <= now) { consumed.delete(key); return false; }
-  return true;
+  /** Drop expired bindings + receipts; return true iff there is room for one more. */
+  _sweep(now) {
+    for (const [k, exp] of this.map) if (exp <= now) this.map.delete(k);
+    for (const [k, v] of this.receipts) if (v.expiry <= now) this.receipts.delete(k);
+    return this.map.size < this.maxEntries;
+  }
+  async reserve(key, expiryMs, now = this._now()) {
+    // Live binding already held -> replay; do NOT overwrite, do NOT extend.
+    const exp = this.map.get(key);
+    if (exp !== undefined && exp > now) return "exists";
+    // Either absent or expired. Sweep (reclaims the expired one for cap accounting).
+    const hasRoom = this._sweep(now);
+    if (!hasRoom && !this.map.has(key)) return "full"; // fail closed, never evict live
+    this.map.set(key, expiryMs);
+    return "reserved";
+  }
+  async get(key, now = this._now()) {
+    const exp = this.map.get(key);
+    if (exp === undefined) return undefined;
+    if (exp <= now) { this.map.delete(key); return undefined; }
+    return exp;
+  }
+  async isConsumed(key, now = this._now()) {
+    return (await this.get(key, now)) !== undefined;
+  }
+  /** Unconditional upsert (used for the redundant tx-hash binding). Honors the cap fail-closed. */
+  async set(key, expiryMs, now = this._now()) {
+    const hasRoom = this._sweep(now);
+    if (!hasRoom && !this.map.has(key)) return false;
+    this.map.set(key, expiryMs);
+    return true;
+  }
+  async release(key) { this.map.delete(key); this.receipts.delete(key); }
+  async size() { return this.map.size; }
+  async getReceipt(key, now = this._now()) {
+    const v = this.receipts.get(key);
+    if (v === undefined) return undefined;
+    if (v.expiry <= now) { this.receipts.delete(key); return undefined; }
+    return v.receipt;
+  }
+  async setReceipt(key, receipt, expiryMs) { this.receipts.set(key, { receipt, expiry: expiryMs }); }
 }
 
 /**
- * Record `key` as consumed. `ctx` may carry { lastLedgerSequence, currentLedger }
- * to bind the expiry to the tx's real on-ledger window (Hole 1). Sweeps expired
- * entries first; if the store is still full of UNEXPIRED entries, refuses
- * fail-closed (Hole 2) and returns false WITHOUT recording — the caller must
- * surface a 503 rather than evict a live binding. Returns true on success.
+ * Optional Redis backend (multi-instance SHARED + DURABLE). Lazy-loads `ioredis`
+ * only when X402_REDIS_URL is set (mirrors the lazy require_ pattern; ioredis is an
+ * OPTIONAL peer dep — the default in-memory path needs zero new deps). If
+ * X402_REDIS_URL is set but ioredis is missing we FAIL FAST at boot (createStore)
+ * rather than silently falling back to a non-shared store — a silent fallback would
+ * reopen replay across instances.
  *
- * Re-marking an existing key (e.g. hash after replayId) always succeeds and does
- * not count against the cap (it overwrites, never grows the store).
+ * Reserve atomicity comes from Redis-native `SET key val NX PX <window>`: the reply
+ * is "OK" iff the key was newly set (reserved); a nil reply means a LIVE binding
+ * already exists (exists). Redis-native PX TTL implements the Hole-1 window expiry
+ * server-side. The hard cap (Hole 2) is enforced fail-CLOSED via DBSIZE before a
+ * new reserve: if at/over the cap and the key is absent, refuse ("full") — Redis
+ * never evicts a live binding to satisfy us (assuming no maxmemory-allkeys policy;
+ * documented honestly). Receipts are a second Redis key (`r:<key>`) with the same
+ * PX expiry.
  */
-function markConsumed(key, ctx = {}, now = Date.now()) {
-  const hasRoom = sweepConsumed(now);
-  if (!hasRoom && !consumed.has(key)) return false; // fail closed, never evict live
-  consumed.set(key, consumedExpiryFor(ctx, now));
-  return true;
+export class RedisStore {
+  constructor(redis, { maxEntries = REPLAY_MAX_ENTRIES, now = Date.now } = {}) {
+    this.redis = redis;
+    this.maxEntries = maxEntries;
+    this._now = now;
+  }
+  _px(expiryMs, now) { return Math.max(1, Math.floor(expiryMs - now)); } // ms TTL from absolute expiry
+  async reserve(key, expiryMs, now = this._now()) {
+    // Fail-closed hard cap (Hole 2): refuse when at the cap and the key is absent.
+    // DBSIZE is a coarse, shared-store approximation of "live entries"; we count
+    // hash+receipt keys against it, which only makes the cap MORE conservative.
+    const px = this._px(expiryMs, now);
+    // Atomic test-and-set: OK iff newly reserved, nil iff a live binding exists.
+    const r = await this.redis.set(key, "1", "NX", "PX", px);
+    if (r === "OK") {
+      // Newly reserved. Enforce the cap AFTER the fact would be racy; instead check
+      // before committing to a brand-new key. We already committed, so if we are now
+      // over the cap, roll back this fresh reservation and report "full" (fail
+      // closed). This never deletes a DIFFERENT live binding.
+      const n = await this.redis.dbsize();
+      if (n > this.maxEntries) { await this.redis.del(key); return "full"; }
+      return "reserved";
+    }
+    return "exists";
+  }
+  async get(key, now = this._now()) {
+    const pttl = await this.redis.pttl(key); // ms remaining, -2 if absent, -1 if no TTL
+    if (pttl === -2) return undefined;
+    if (pttl === -1) return now + REPLAY_TTL_MS; // no TTL set: treat as flat-TTL live
+    return now + pttl;
+  }
+  async isConsumed(key) { return (await this.redis.exists(key)) === 1; }
+  async set(key, expiryMs, now = this._now()) {
+    await this.redis.set(key, "1", "PX", this._px(expiryMs, now));
+    return true;
+  }
+  async release(key) { await this.redis.del(key); await this.redis.del(`r:${key}`); }
+  async size() { return await this.redis.dbsize(); }
+  async getReceipt(key) {
+    const v = await this.redis.get(`r:${key}`);
+    if (v == null) return undefined;
+    try { return JSON.parse(v); } catch { return undefined; }
+  }
+  async setReceipt(key, receipt, expiryMs, now = this._now()) {
+    await this.redis.set(`r:${key}`, JSON.stringify(receipt), "PX", this._px(expiryMs, now));
+  }
 }
 
-/** Release a reservation (e.g. submit failed before the tx was applied). */
-function unmarkConsumed(key) {
-  consumed.delete(key);
+// Lazily-constructed singleton store (chosen by env at first use / boot).
+let _store = null;
+let _redisClient = null;
+/**
+ * Build the configured store. With X402_REDIS_URL set -> RedisStore (lazy ioredis,
+ * FAIL FAST if the module is missing — never silently fall back). Otherwise the
+ * default InMemoryStore. Idempotent: returns the same singleton.
+ */
+export function createStore() {
+  if (_store) return _store;
+  const url = process.env.X402_REDIS_URL;
+  if (url) {
+    let Redis;
+    try { Redis = require_("ioredis"); }
+    catch {
+      // FAIL FAST: a silent in-memory fallback would reopen replay across instances.
+      throw new Error(
+        "X402_REDIS_URL is set but 'ioredis' is not installed. Install it (npm i ioredis) " +
+        "or unset X402_REDIS_URL. Refusing to fall back to a non-shared in-memory store."
+      );
+    }
+    _redisClient = new (Redis.default || Redis)(url);
+    _store = new RedisStore(_redisClient);
+  } else {
+    _store = new InMemoryStore();
+  }
+  return _store;
 }
+
+// Module-level default store used by the production code paths. Tests inject their
+// own via _deps.store; serve() reassigns it via createStore() at boot.
+let store = new InMemoryStore();
 
 // ---------------------------------------------------------------------------
 // guardrail-Hook presence check
@@ -492,19 +635,30 @@ function submitDefinitelyNotApplied(e) {
 async function settle(payload, req, _deps = {}) {
   if (!process.env.XAHAU_WSS) return { success: false, network: NETWORK, errorReason: "set XAHAU_WSS to settle" };
 
+  // Dependency seams (injectable for tests): store, client, ledger fetcher, clock.
+  const st = _deps.store || store;
+
   // (4a) Re-run full verification inside settle.
   const v = verifyExact(payload, req);
   if (!v.isValid) return { success: false, network: NETWORK, errorReason: `verify failed: ${v.invalidReason}` };
 
   // (4b) Replay protection — refuse a payment whose binding was already consumed.
-  if (isConsumed(v.replayId))
-    return { success: false, network: NETWORK, errorReason: "replay: payment already consumed" };
+  // IDEMPOTENCY: if a FINAL receipt was stored for this payment (terminal on-ledger
+  // outcome), return THAT receipt with replayed:true — an x402 client retrying gets
+  // the real tx hash + delivered amount instead of a bare "already consumed". If the
+  // binding exists but no receipt yet (in-flight, or the ambiguous-retained case),
+  // the outcome is genuinely unknown: return the existing "already consumed" reply
+  // (inFlight:true) and NEVER re-submit.
+  if (await st.isConsumed(v.replayId)) {
+    const receipt = await st.getReceipt(v.replayId);
+    if (receipt) return { ...receipt, replayed: true };
+    return { success: false, network: NETWORK, errorReason: "replay: payment already consumed", inFlight: true };
+  }
 
   let tx;
   try { tx = decode(payload.txBlob); } catch { return { success: false, network: NETWORK, errorReason: "undecodable txBlob" }; }
   const required = BigInt(v.amount); // exact-xahau: client pays >= server's price up to max
 
-  // Dependency seams (injectable for tests): client, ledger fetcher, clock.
   const now = typeof _deps.now === "function" ? _deps.now() : Date.now();
   const getLedger = _deps.currentValidatedLedger || currentValidatedLedger;
 
@@ -529,18 +683,26 @@ async function settle(payload, req, _deps = {}) {
     return { success: false, network: NETWORK, errorReason: `validity window too large (LastLedgerSequence > ${MAX_VALIDITY_LEDGERS} ledgers ahead)` };
 
   const replayCtx = { lastLedgerSequence: lastLedger, currentLedger: curLedger };
+  const expiryMs = consumedExpiryFor(replayCtx, now);
 
   // (3) Honestly report whether the payer's guardrail Hook is installed.
   const hookPresent = await guardrailHookPresent(client, tx.Account);
 
-  // Reserve the replay slot before submission so two concurrent /settle calls for
-  // the same payment can't both proceed. The expiry is bound to the tx's REAL
-  // on-ledger window (replayCtx), never the flat TTL (Hole 1). markConsumed fails
-  // CLOSED if the store is full of unexpired entries (Hole 2) — surface 503.
-  if (isConsumed(v.replayId, now))
-    return { success: false, network: NETWORK, errorReason: "replay: payment already consumed" };
-  if (!markConsumed(v.replayId, replayCtx, now))
+  // ATOMIC reserve before submission: two concurrent / multi-instance /settle calls
+  // for the same payment can't BOTH win. reserve() is a single atomic test-and-set
+  // (in-memory: check-then-set under the single-threaded event loop; Redis: SET NX
+  // PX) — this replaces the old check-then-mark race. The expiry is bound to the
+  // tx's REAL on-ledger window (Hole 1). "full" = store at cap with only LIVE
+  // entries (Hole 2, fail closed) -> surface 503. "exists" = another settle already
+  // holds it -> idempotent replay branch (return receipt if any, else in-flight).
+  const res = await st.reserve(v.replayId, expiryMs, now);
+  if (res === "full")
     return { success: false, network: NETWORK, errorReason: "replay store full, retry later", retryable: true };
+  if (res === "exists") {
+    const receipt = await st.getReceipt(v.replayId);
+    if (receipt) return { ...receipt, replayed: true };
+    return { success: false, network: NETWORK, errorReason: "replay: payment already consumed", inFlight: true };
+  }
 
   let r;
   try {
@@ -554,9 +716,12 @@ async function settle(payload, req, _deps = {}) {
     // (tied to the tx's real on-ledger validity window) reopen the slot once the tx
     // can no longer apply. Releasing on a maybe-applied throw is a double-settle hole.
     if (submitDefinitelyNotApplied(e)) {
-      unmarkConsumed(v.replayId);
+      // tem stores NO receipt; release() also clears any (non-existent) receipt.
+      await st.release(v.replayId);
       return { success: false, network: NETWORK, errorReason: "submit rejected (tem, not applied)", guardrailHookPresent: hookPresent };
     }
+    // AMBIGUOUS retained path: outcome genuinely UNKNOWN -> store NO receipt, so a
+    // later retry is treated as in-flight (not handed a fabricated receipt).
     console.error("[x402] settle: ambiguous submit failure, reservation RETAINED:", e?.message || e);
     return { success: false, network: NETWORK, errorReason: "submit result unknown — reservation retained until validity window expires", guardrailHookPresent: hookPresent };
   }
@@ -566,37 +731,45 @@ async function settle(payload, req, _deps = {}) {
   const hash = r.result.hash;
   // The hash binding shares the tx's window. If the store is momentarily full it
   // is fine to skip the redundant hash entry — replayId already holds the slot.
-  if (hash) markConsumed(`hash:${hash}`, replayCtx, now);
+  if (hash) await st.set(`hash:${hash}`, expiryMs, now);
 
+  // Build the terminal receipt + persist it keyed by replayId (same window expiry),
+  // so a retry of this terminal payment returns the real outcome (replayed:true)
+  // instead of re-submitting. ALL branches below are TERMINAL: the tx is on-ledger
+  // and its sequence is spent (tecHOOK_REJECTED / delivered<required / unreadable
+  // delivered / tesSUCCESS) — final outcomes, safe to memoize. The ambiguous
+  // retained path above is the ONLY non-terminal one and stores no receipt.
+  let receipt;
   if (code !== "tesSUCCESS") {
     // tecHOOK_REJECTED here == the payer's guardrail Hook blocked an over-policy
     // payment. The tx is on-ledger (sequence consumed) so keep the replay slot.
-    return {
+    receipt = {
       success: false,
       transaction: hash,
       network: NETWORK,
       errorReason: code || "no result",
       guardrailHookPresent: hookPresent,
     };
+  } else {
+    // (4c) Validate delivered_amount >= required (not just tesSUCCESS).
+    const delivered = deliveredDrops(meta);
+    if (delivered === null) {
+      receipt = { success: false, transaction: hash, network: NETWORK, errorReason: "could not read delivered_amount", guardrailHookPresent: hookPresent };
+    } else if (delivered < required) {
+      receipt = { success: false, transaction: hash, network: NETWORK, errorReason: "delivered_amount < required", guardrailHookPresent: hookPresent };
+    } else {
+      receipt = {
+        success: true,
+        transaction: hash,
+        network: NETWORK,
+        errorReason: null,
+        delivered: delivered.toString(),
+        guardrailHookPresent: hookPresent,
+      };
+    }
   }
-
-  // (4c) Validate delivered_amount >= required (not just tesSUCCESS).
-  const delivered = deliveredDrops(meta);
-  if (delivered === null) {
-    return { success: false, transaction: hash, network: NETWORK, errorReason: "could not read delivered_amount", guardrailHookPresent: hookPresent };
-  }
-  if (delivered < required) {
-    return { success: false, transaction: hash, network: NETWORK, errorReason: "delivered_amount < required", guardrailHookPresent: hookPresent };
-  }
-
-  return {
-    success: true,
-    transaction: hash,
-    network: NETWORK,
-    errorReason: null,
-    delivered: delivered.toString(),
-    guardrailHookPresent: hookPresent,
-  };
+  await st.setReceipt(v.replayId, receipt, expiryMs);
+  return receipt;
 }
 
 /** delivered_amount (native XAH) as bigint drops, or null. */
@@ -621,42 +794,99 @@ function authOk(req) {
 
 const RATE_MAX = Number(process.env.X402_RATE_MAX) || 20; // tokens
 const RATE_WINDOW_MS = Number(process.env.X402_RATE_WINDOW_MS) || 60_000;
-const buckets = new Map(); // ip -> { tokens, ts }
-// A bucket that has had RATE_WINDOW_MS pass since last touch is fully refilled and
-// indistinguishable from a fresh one, so it can be dropped. Without eviction an
-// attacker spraying distinct source IPs grows this map without bound (memory DoS).
-let _lastBucketSweep = 0;
-const BUCKET_SWEEP_INTERVAL_MS = RATE_WINDOW_MS;
-function sweepBuckets(now = Date.now()) {
-  for (const [ip, b] of buckets) {
-    // Fully-refilled-and-idle buckets carry no state worth keeping.
-    if (now - b.ts >= RATE_WINDOW_MS) buckets.delete(ip);
+
+/**
+ * Default in-process token-bucket limiter. EXACTLY the previous behavior: per-IP
+ * continuous-refill token bucket (RATE_MAX tokens / RATE_WINDOW_MS), with idle
+ * fully-refilled buckets swept so an IP-spray can't grow the map without bound.
+ * `ok(ip)` is async to match the injectable interface (a Redis limiter is async);
+ * it resolves synchronously here.
+ */
+export class InMemoryRateLimiter {
+  constructor({ max = RATE_MAX, windowMs = RATE_WINDOW_MS } = {}) {
+    this.max = max;
+    this.windowMs = windowMs;
+    this.buckets = new Map(); // ip -> { tokens, ts }
+    this._lastSweep = 0;
+  }
+  sweep(now = Date.now()) {
+    for (const [ip, b] of this.buckets) {
+      if (now - b.ts >= this.windowMs) this.buckets.delete(ip);
+    }
+  }
+  async ok(ip) {
+    const now = Date.now();
+    if (now - this._lastSweep >= this.windowMs) { this.sweep(now); this._lastSweep = now; }
+    let b = this.buckets.get(ip);
+    if (!b) { b = { tokens: this.max, ts: now }; this.buckets.set(ip, b); }
+    const refill = ((now - b.ts) / this.windowMs) * this.max;
+    b.tokens = Math.min(this.max, b.tokens + refill);
+    b.ts = now;
+    if (b.tokens < 1) return false;
+    b.tokens -= 1;
+    return true;
   }
 }
-function rateLimitOk(ip) {
-  const now = Date.now();
-  // Periodic sweep (amortized, on access) so the map stays bounded under IP-spray.
-  if (now - _lastBucketSweep >= BUCKET_SWEEP_INTERVAL_MS) {
-    sweepBuckets(now);
-    _lastBucketSweep = now;
+
+/**
+ * Optional Redis fixed-window limiter (multi-instance SHARED). SEMANTICS, stated
+ * honestly: this is a FIXED-WINDOW counter, NOT a continuous-refill token bucket.
+ * Each IP gets a per-window key (`rl:<ip>:<windowIndex>`); the first request in a
+ * window INCRs to 1 and PEXPIREs the key to the window length; subsequent requests
+ * INCR and are allowed while the count <= max. At a window boundary the counter
+ * resets to 0, so the worst-case burst is up to 2*max across a boundary — the
+ * standard, accepted trade-off for a cheap distributed limiter. (A Lua token bucket
+ * would smooth this but is heavier; fixed-window is sufficient and documented.)
+ */
+export class RedisRateLimiter {
+  constructor(redis, { max = RATE_MAX, windowMs = RATE_WINDOW_MS } = {}) {
+    this.redis = redis;
+    this.max = max;
+    this.windowMs = windowMs;
   }
-  let b = buckets.get(ip);
-  if (!b) { b = { tokens: RATE_MAX, ts: now }; buckets.set(ip, b); }
-  // refill
-  const refill = ((now - b.ts) / RATE_WINDOW_MS) * RATE_MAX;
-  b.tokens = Math.min(RATE_MAX, b.tokens + refill);
-  b.ts = now;
-  if (b.tokens < 1) return false;
-  b.tokens -= 1;
-  return true;
+  async ok(ip) {
+    const now = Date.now();
+    const windowIndex = Math.floor(now / this.windowMs);
+    const key = `rl:${ip}:${windowIndex}`;
+    const n = await this.redis.incr(key);
+    if (n === 1) await this.redis.pexpire(key, this.windowMs);
+    return n <= this.max;
+  }
 }
-// test hook: expose the bucket sweeper + store for assertions.
-function _sweepBuckets(now) { sweepBuckets(now); return buckets; }
+
+// Module-level default limiter used by the production code paths (overridable via
+// _deps.rateLimiter in settle/handler, and rebuilt by createRateLimiter at boot).
+let rateLimiter = new InMemoryRateLimiter();
+/**
+ * Build the configured limiter. With X402_REDIS_URL set -> RedisRateLimiter sharing
+ * the store's Redis client (so multi-instance rate limiting is also shared); else
+ * the default in-process token bucket. Must be called AFTER createStore so the
+ * Redis client exists.
+ */
+export function createRateLimiter() {
+  if (process.env.X402_REDIS_URL && _redisClient) {
+    return new RedisRateLimiter(_redisClient);
+  }
+  return new InMemoryRateLimiter();
+}
+
+// Back-compat shim for the existing rate-limit unit test (sync-feeling .ok()).
+async function rateLimitOk(ip) { return rateLimiter.ok(ip); }
+// test hook: expose the in-memory limiter's bucket sweeper + map for assertions.
+function _sweepBuckets(now) {
+  if (rateLimiter instanceof InMemoryRateLimiter) { rateLimiter.sweep(now); return rateLimiter.buckets; }
+  return new Map();
+}
 
 // ---------------------------------------------------------------------------
 // server
 // ---------------------------------------------------------------------------
 function serve() {
+  // Boot-time backend selection. createStore FAILS FAST if X402_REDIS_URL is set
+  // but ioredis is missing (never a silent non-shared fallback). createRateLimiter
+  // must follow so it can share the Redis client when configured.
+  store = createStore();
+  rateLimiter = createRateLimiter();
   const server = http.createServer(async (req, res) => {
     try {
       if (req.method === "GET" && req.url === "/supported")
@@ -668,7 +898,7 @@ function serve() {
         // auth-gated: it is intentionally a public, pre-payment offline check, so
         // requiring a secret would break x402 semantics).
         const ip = req.socket.remoteAddress || "unknown";
-        if (!rateLimitOk(ip)) return send(res, 429, { error: "rate limited" });
+        if (!(await rateLimiter.ok(ip))) return send(res, 429, { error: "rate limited" });
         const b = await readBody(req, res);
         return send(res, 200, verifyExact(b.paymentPayload, b.paymentRequirements));
       }
@@ -676,9 +906,9 @@ function serve() {
       if (req.method === "POST" && req.url === "/settle") {
         if (!authOk(req)) return send(res, 401, { error: "unauthorized" });
         const ip = req.socket.remoteAddress || "unknown";
-        if (!rateLimitOk(ip)) return send(res, 429, { error: "rate limited" });
+        if (!(await rateLimiter.ok(ip))) return send(res, 429, { error: "rate limited" });
         const b = await readBody(req, res);
-        const out = await settle(b.paymentPayload, b.paymentRequirements);
+        const out = await settle(b.paymentPayload, b.paymentRequirements, { store, rateLimiter });
         // Replay store full of live (unexpired) bindings: fail closed with 503 so
         // the client retries later, rather than evicting a live binding (Hole 2).
         const status = out && out.retryable === true ? 503 : 200;
@@ -703,16 +933,39 @@ function serve() {
 // run only when invoked directly (not when imported by test.mjs)
 if (import.meta.url === `file://${process.argv[1]}`) serve();
 
+// ---------------------------------------------------------------------------
 // test hooks
-function _sweepConsumed(now) { sweepConsumed(now); return consumed; }
-function _markConsumed(key, ctx, now) { return markConsumed(key, ctx, now); }
-function _isConsumed(key, now) { return isConsumed(key, now); }
+// ---------------------------------------------------------------------------
+// The replay-store internals are now methods on the default InMemoryStore `store`.
+// These shims preserve the previous hook surface but are ASYNC where the store is
+// (tests await them). `consumed` is exposed as a live getter onto store.map so the
+// existing tests that manipulate the raw Map directly (.set/.clear/.has/.size) keep
+// working against whichever in-memory store is current.
+//
+// _markConsumed maps to the store's unconditional, cap-honoring upsert (`set`) —
+// EXACTLY the previous markConsumed semantics (overwrite an existing key -> true;
+// full + key absent -> false). `reserve` is the separate ATOMIC test-and-set
+// primitive used by settle (returns "reserved"|"exists"|"full").
+async function _sweepConsumed(now) { store._sweep(now ?? Date.now()); return store.map; }
+async function _markConsumed(key, ctx, now) { return store.set(key, consumedExpiryFor(ctx, now), now); }
+async function _isConsumed(key, now) { return store.isConsumed(key, now); }
 function _consumedExpiryFor(ctx, now) { return consumedExpiryFor(ctx, now); }
+async function _reserveConsumed(key, ctx, now) { return store.reserve(key, consumedExpiryFor(ctx, now), now); }
+// Swap the default store/limiter (e.g. tests injecting a fresh InMemoryStore).
+function __setStore(s) { store = s; }
+function __setRateLimiter(l) { rateLimiter = l; }
+
 export const __test = {
   parseStrictDrops, isValidRAddress, verifyTxSignature, deriveAddressFromPubKey,
-  replayKeyFor, settle, consumed, _sweepBuckets, rateLimitOk, submitDefinitelyNotApplied,
+  replayKeyFor, settle, _sweepBuckets, rateLimitOk, submitDefinitelyNotApplied,
   RATE_MAX,
   // Hole-1/Hole-2 hooks: replay-store internals + the chosen bounds.
-  _sweepConsumed, _markConsumed, _isConsumed, _consumedExpiryFor,
+  _sweepConsumed, _markConsumed, _isConsumed, _consumedExpiryFor, _reserveConsumed,
   REPLAY_TTL_MS, REPLAY_MAX_ENTRIES, MAX_VALIDITY_LEDGERS, LEDGER_CLOSE_MS, REPLAY_EXPIRY_MARGIN_MS,
+  // Injectable backends + seams for the Redis-contract tests.
+  InMemoryStore, RedisStore, InMemoryRateLimiter, RedisRateLimiter,
+  consumedExpiryFor, __setStore, __setRateLimiter,
+  // Live view of the default store's backing map (back-compat with raw-Map tests).
+  get consumed() { return store.map; },
+  get store() { return store; },
 };

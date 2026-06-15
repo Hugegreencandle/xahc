@@ -317,11 +317,11 @@ assert.equal(__test.replayKeyFor({ Account: PAYER, Sequence: 7 }), `acct:${PAYER
 
   // Marked entry is present before the window closes and gone after.
   store.clear();
-  __test._markConsumed("hole1-live", { lastLedgerSequence: lls, currentLedger: cur }, now);
-  assert.equal(__test._isConsumed("hole1-live", now), true, "binding present right after mark");
-  assert.equal(__test._isConsumed("hole1-live", windowCloses - 1), true,
+  await __test._markConsumed("hole1-live", { lastLedgerSequence: lls, currentLedger: cur }, now);
+  assert.equal(await __test._isConsumed("hole1-live", now), true, "binding present right after mark");
+  assert.equal(await __test._isConsumed("hole1-live", windowCloses - 1), true,
     "binding STILL present while tx is submittable (must not expire early)");
-  assert.equal(__test._isConsumed("hole1-live", exp + 1), false,
+  assert.equal(await __test._isConsumed("hole1-live", exp + 1), false,
     "binding reclaimable only AFTER the window+margin has passed");
   store.clear();
 }
@@ -396,7 +396,7 @@ assert.equal(__test.replayKeyFor({ Account: PAYER, Sequence: 7 }), `acct:${PAYER
   assert.equal(store.size, CAP, "store filled to cap with live entries");
 
   // A new reservation must be REFUSED (fail closed) — not by evicting a live one.
-  const ok = __test._markConsumed("newcomer", { lastLedgerSequence: 200, currentLedger: 100 }, now);
+  const ok = await __test._markConsumed("newcomer", { lastLedgerSequence: 200, currentLedger: 100 }, now);
   assert.equal(ok, false, "new reservation refused when store full of live bindings");
   assert.equal(store.has("newcomer"), false, "newcomer NOT recorded");
   assert.equal(store.size, CAP, "no live binding was evicted to make room");
@@ -406,14 +406,14 @@ assert.equal(__test.replayKeyFor({ Account: PAYER, Sequence: 7 }), `acct:${PAYER
 
   // Now expire ONE entry; the sweep should reclaim it and admit the newcomer.
   store.set("live-0", now - 1); // expired
-  const ok2 = __test._markConsumed("newcomer2", { lastLedgerSequence: 200, currentLedger: 100 }, now);
+  const ok2 = await __test._markConsumed("newcomer2", { lastLedgerSequence: 200, currentLedger: 100 }, now);
   assert.equal(ok2, true, "expired entry reclaimed -> newcomer admitted");
   assert.equal(store.has("live-0"), false, "expired entry was reclaimed");
   assert.equal(store.has("newcomer2"), true, "newcomer admitted into the freed slot");
   assert.equal(store.size, CAP, "size back at cap (one out, one in)");
 
   // Re-marking an EXISTING key must always succeed (overwrite, no growth) even at cap.
-  const ok3 = __test._markConsumed("newcomer2", { lastLedgerSequence: 300, currentLedger: 100 }, now);
+  const ok3 = await __test._markConsumed("newcomer2", { lastLedgerSequence: 300, currentLedger: 100 }, now);
   assert.equal(ok3, true, "re-marking an existing key at cap succeeds (overwrite)");
   assert.equal(store.size, CAP, "re-mark does not grow the store");
   store.clear();
@@ -521,6 +521,271 @@ assert.equal(__test.replayKeyFor({ Account: PAYER, Sequence: 7 }), `acct:${PAYER
   assert.equal(f(new Error("item system temporary")), false, "incidental 'tem' words -> keep (no tem* code)");
 }
 
+// ===========================================================================
+// UPGRADE 1 — injectable async store: InMemoryStore reproduces TODAY's exact
+// semantics (Hole-1 present-then-expire, Hole-2 fail-closed cap, reserve atomicity)
+// ===========================================================================
+{
+  const { InMemoryStore, consumedExpiryFor, MAX_VALIDITY_LEDGERS } = __test;
+  const now = 1_000_000_000;
+  const s = new InMemoryStore({ now: () => now });
+
+  // reserve atomicity: a SECOND reserve of a LIVE key returns "exists" (the second
+  // concurrent settle of the same payment cannot also win). First wins -> "reserved".
+  const exp = consumedExpiryFor({ lastLedgerSequence: 105, currentLedger: 100 }, now);
+  assert.equal(await s.reserve("k1", exp, now), "reserved", "first reserve of a key wins");
+  assert.equal(await s.reserve("k1", exp, now), "exists", "second reserve of a LIVE key loses (atomic test-and-set)");
+  assert.equal(await s.isConsumed("k1", now), true, "reserved key is consumed");
+
+  // Hole-1: present right after reserve, present while the tx is still submittable,
+  // reclaimable only AFTER window+margin (expiry tied to the real on-ledger window).
+  const LC = __test.LEDGER_CLOSE_MS, MARGIN = __test.REPLAY_EXPIRY_MARGIN_MS;
+  const gap = MAX_VALIDITY_LEDGERS, cur = 100, lls = cur + gap;
+  const exp2 = consumedExpiryFor({ lastLedgerSequence: lls, currentLedger: cur }, now);
+  const windowCloses = now + gap * LC;
+  await s.reserve("k2", exp2, now);
+  assert.equal(await s.isConsumed("k2", now), true, "present right after reserve");
+  assert.equal(await s.isConsumed("k2", windowCloses - 1), true, "present while tx still submittable");
+  assert.ok(exp2 >= windowCloses + MARGIN - 1, "expiry includes the on-ledger window + margin");
+  assert.equal(await s.isConsumed("k2", exp2 + 1), false, "reclaimable only after window+margin");
+
+  // Hole-2: fill to cap with LIVE entries -> a NEW reserve is REFUSED ("full"),
+  // never by evicting a live binding. An EXPIRED entry IS reclaimed.
+  const small = new InMemoryStore({ maxEntries: 3, now: () => now });
+  const far = now + 10 * __test.REPLAY_TTL_MS;
+  assert.equal(await small.reserve("a", far, now), "reserved");
+  assert.equal(await small.reserve("b", far, now), "reserved");
+  assert.equal(await small.reserve("c", far, now), "reserved");
+  assert.equal(await small.reserve("d", far, now), "full", "cap full of LIVE entries -> refuse (Hole 2)");
+  assert.equal(await small.isConsumed("a", now), true, "no live binding evicted to admit a newcomer");
+  small.map.set("a", now - 1); // expire one
+  assert.equal(await small.reserve("d", far, now), "reserved", "expired entry reclaimed -> newcomer admitted");
+  assert.equal(await small.size(), 3, "size back at cap (one out, one in)");
+}
+
+// ===========================================================================
+// UPGRADE 2 — IDEMPOTENT settle (terminal-vs-ambiguous)
+// ===========================================================================
+// Helper: a fake xrpl client whose submitAndWait is scripted, counting calls.
+function fakeClient({ result, throwErr } = {}) {
+  const c = {
+    submitCount: 0,
+    isConnected: () => true,
+    request: async () => ({ result: { account_objects: [] } }),
+    submitAndWait: async () => {
+      c.submitCount++;
+      if (throwErr) throw throwErr;
+      return { result };
+    },
+  };
+  return c;
+}
+
+// (A) Idempotent SUCCESS: settle a tesSUCCESS+delivered payment -> success receipt;
+//     a SECOND settle of the SAME payment returns the SAME receipt with replayed:true
+//     and does NOT call submitAndWait again (submitCount stays 1).
+{
+  const prev = process.env.XAHAU_WSS;
+  process.env.XAHAU_WSS = "wss://invalid.example";
+  const { InMemoryStore } = __test;
+  const now = 1_000_000_000;
+  const curLedger = 100;
+  const store = new InMemoryStore({ now: () => now });
+  const client = fakeClient({
+    result: { hash: "ABC123HASH", meta: { TransactionResult: "tesSUCCESS", delivered_amount: "1000000" } },
+  });
+  const deps = { store, client, currentValidatedLedger: async () => curLedger, now: () => now };
+  const payment = { txBlob: blob({ LastLedgerSequence: curLedger + 5, Sequence: 71 }) };
+
+  const out1 = await __test.settle(payment, req, deps);
+  assert.equal(out1.success, true, `first settle should succeed: ${out1.errorReason}`);
+  assert.equal(out1.transaction, "ABC123HASH");
+  assert.equal(out1.delivered, "1000000");
+  assert.equal(out1.replayed, undefined, "first settle is not a replay");
+  assert.equal(client.submitCount, 1, "submitted exactly once");
+
+  const out2 = await __test.settle(payment, req, deps);
+  assert.equal(out2.success, true, "replayed settle returns the success receipt");
+  assert.equal(out2.transaction, "ABC123HASH", "replayed receipt carries the REAL tx hash");
+  assert.equal(out2.delivered, "1000000", "replayed receipt carries the REAL delivered amount");
+  assert.equal(out2.replayed, true, "replayed flag set on the returned original receipt");
+  assert.equal(client.submitCount, 1, "NO re-submit on the idempotent replay (submitCount stays 1)");
+
+  if (prev === undefined) delete process.env.XAHAU_WSS; else process.env.XAHAU_WSS = prev;
+}
+
+// (B) Idempotent TERMINAL FAILURE: tecHOOK_REJECTED is on-ledger (sequence spent) ->
+//     final. The receipt is memoized; a retry returns it (replayed:true), no re-submit.
+{
+  const prev = process.env.XAHAU_WSS;
+  process.env.XAHAU_WSS = "wss://invalid.example";
+  const { InMemoryStore } = __test;
+  const now = 1_000_000_000, curLedger = 100;
+  const store = new InMemoryStore({ now: () => now });
+  const client = fakeClient({ result: { hash: "HOOKREJHASH", meta: { TransactionResult: "tecHOOK_REJECTED" } } });
+  const deps = { store, client, currentValidatedLedger: async () => curLedger, now: () => now };
+  const payment = { txBlob: blob({ LastLedgerSequence: curLedger + 5, Sequence: 72 }) };
+
+  const out1 = await __test.settle(payment, req, deps);
+  assert.equal(out1.success, false);
+  assert.match(out1.errorReason, /tecHOOK_REJECTED/);
+  assert.equal(client.submitCount, 1);
+  const out2 = await __test.settle(payment, req, deps);
+  assert.equal(out2.replayed, true, "terminal on-ledger failure is memoized + replayed");
+  assert.equal(out2.transaction, "HOOKREJHASH", "replayed failure receipt keeps the real hash");
+  assert.match(out2.errorReason, /tecHOOK_REJECTED/);
+  assert.equal(client.submitCount, 1, "no re-submit of a terminal failure");
+
+  if (prev === undefined) delete process.env.XAHAU_WSS; else process.env.XAHAU_WSS = prev;
+}
+
+// (C) AMBIGUOUS in-flight replay: after the ambiguous-retained submit failure, a
+//     second settle returns "already consumed" with NO fabricated receipt (inFlight),
+//     and STILL no re-submit (submitCount stays 1).
+{
+  const prev = process.env.XAHAU_WSS;
+  process.env.XAHAU_WSS = "wss://invalid.example";
+  const { InMemoryStore } = __test;
+  const now = 1_000_000_000, curLedger = 100;
+  const store = new InMemoryStore({ now: () => now });
+  const client = fakeClient({ throwErr: new Error("connect ECONNRESET / disconnected mid-wait") });
+  const deps = { store, client, currentValidatedLedger: async () => curLedger, now: () => now };
+  const payment = { txBlob: blob({ LastLedgerSequence: curLedger + 5, Sequence: 73 }) };
+
+  const out1 = await __test.settle(payment, req, deps);
+  assert.equal(out1.success, false);
+  assert.match(out1.errorReason, /result unknown|reservation retained/);
+  assert.equal(client.submitCount, 1, "submitted once (ambiguous)");
+  // No receipt was stored for the ambiguous outcome.
+  assert.equal(await store.getReceipt("acct:" + PAYER + ":73"), undefined, "ambiguous outcome stores NO receipt");
+
+  const out2 = await __test.settle(payment, req, deps);
+  assert.equal(out2.success, false);
+  assert.match(out2.errorReason, /already consumed/, "ambiguous retry -> already consumed (no fabricated receipt)");
+  assert.equal(out2.inFlight, true, "ambiguous retry flagged inFlight");
+  assert.equal(out2.replayed, undefined, "no replayed receipt for an unknown outcome");
+  assert.equal(client.submitCount, 1, "ambiguous retry does NOT re-submit");
+
+  if (prev === undefined) delete process.env.XAHAU_WSS; else process.env.XAHAU_WSS = prev;
+}
+
+// (D) tem release clears any (non-existent) receipt + frees the slot for a re-sign.
+{
+  const prev = process.env.XAHAU_WSS;
+  process.env.XAHAU_WSS = "wss://invalid.example";
+  const { InMemoryStore } = __test;
+  const now = 1_000_000_000, curLedger = 100;
+  const store = new InMemoryStore({ now: () => now });
+  const temErr = new Error("temMALFORMED"); temErr.data = { engine_result: "temMALFORMED" };
+  const client = fakeClient({ throwErr: temErr });
+  const deps = { store, client, currentValidatedLedger: async () => curLedger, now: () => now };
+  const payment = { txBlob: blob({ LastLedgerSequence: curLedger + 5, Sequence: 74 }) };
+
+  const out = await __test.settle(payment, req, deps);
+  assert.equal(out.success, false);
+  assert.match(out.errorReason, /not applied|tem/);
+  assert.equal(await store.isConsumed("acct:" + PAYER + ":74"), false, "preliminary tem releases the reservation");
+  assert.equal(await store.getReceipt("acct:" + PAYER + ":74"), undefined, "tem stores no receipt");
+
+  if (prev === undefined) delete process.env.XAHAU_WSS; else process.env.XAHAU_WSS = prev;
+}
+
+// (E) FAKE injected store exercises the async store CONTRACT via _deps.store: a
+//     custom backend that records calls proves settle drives the async interface
+//     (reserve/isConsumed/getReceipt/set/setReceipt) without a live Redis.
+{
+  const prev = process.env.XAHAU_WSS;
+  process.env.XAHAU_WSS = "wss://invalid.example";
+  const now = 1_000_000_000, curLedger = 100;
+  const calls = [];
+  const inner = new __test.InMemoryStore({ now: () => now });
+  const fake = {
+    async reserve(k, e, n) { calls.push(["reserve", k]); return inner.reserve(k, e, n); },
+    async isConsumed(k, n) { calls.push(["isConsumed", k]); return inner.isConsumed(k, n); },
+    async getReceipt(k, n) { calls.push(["getReceipt", k]); return inner.getReceipt(k, n); },
+    async setReceipt(k, r, e) { calls.push(["setReceipt", k]); return inner.setReceipt(k, r, e); },
+    async set(k, e, n) { calls.push(["set", k]); return inner.set(k, e, n); },
+    async get(k, n) { return inner.get(k, n); },
+    async release(k) { calls.push(["release", k]); return inner.release(k); },
+    async size() { return inner.size(); },
+  };
+  const client = fakeClient({ result: { hash: "FAKEHASH", meta: { TransactionResult: "tesSUCCESS", delivered_amount: "1000000" } } });
+  const deps = { store: fake, client, currentValidatedLedger: async () => curLedger, now: () => now };
+  const out = await __test.settle({ txBlob: blob({ LastLedgerSequence: curLedger + 5, Sequence: 75 }) }, req, deps);
+  assert.equal(out.success, true, `fake-store settle succeeds: ${out.errorReason}`);
+  const names = calls.map((c) => c[0]);
+  assert.ok(names.includes("isConsumed"), "settle consulted the injected store's isConsumed");
+  assert.ok(names.includes("reserve"), "settle reserved via the injected store");
+  assert.ok(names.includes("setReceipt"), "settle persisted a receipt via the injected store");
+  if (prev === undefined) delete process.env.XAHAU_WSS; else process.env.XAHAU_WSS = prev;
+}
+
+// (F) RedisStore adapter unit test against a minimal in-process FAKE ioredis,
+//     proving the adapter calls SET NX PX / PTTL / DEL / GET correctly without a
+//     live Redis.
+{
+  const { RedisStore } = __test;
+  // Minimal fake ioredis: a Map of key->{val,expireAt}; honors NX + PX semantics.
+  function fakeRedis() {
+    const kv = new Map(); // key -> { val, expireAt|null }
+    const live = (k, now) => { const e = kv.get(k); if (!e) return undefined; if (e.expireAt != null && e.expireAt <= now) { kv.delete(k); return undefined; } return e; };
+    return {
+      kv,
+      async set(key, val, ...opts) {
+        const now = Date.now();
+        const nx = opts.includes("NX");
+        const pxIdx = opts.indexOf("PX");
+        const ttl = pxIdx >= 0 ? Number(opts[pxIdx + 1]) : null;
+        if (nx && live(key, now)) return null; // NX: refuse if a live key exists
+        kv.set(key, { val, expireAt: ttl != null ? now + ttl : null });
+        return "OK";
+      },
+      async get(key) { const e = live(key, Date.now()); return e ? e.val : null; },
+      async del(key) { kv.delete(key); return 1; },
+      async exists(key) { return live(key, Date.now()) ? 1 : 0; },
+      async pttl(key) { const e = live(key, Date.now()); if (!e) return -2; if (e.expireAt == null) return -1; return e.expireAt - Date.now(); },
+      async dbsize() { let n = 0; const now = Date.now(); for (const k of kv.keys()) if (live(k, now)) n++; return n; },
+    };
+  }
+  const redis = fakeRedis();
+  const s = new RedisStore(redis, { maxEntries: 100 });
+  const exp = Date.now() + 60_000;
+
+  // reserve uses SET NX PX -> "reserved"; a second reserve of the same LIVE key -> "exists".
+  assert.equal(await s.reserve("rk1", exp), "reserved", "RedisStore.reserve uses SET NX PX (OK -> reserved)");
+  assert.equal(await s.reserve("rk1", exp), "exists", "RedisStore.reserve on a live key (nil -> exists)");
+  assert.equal(await s.isConsumed("rk1"), true, "RedisStore.isConsumed reads EXISTS");
+  assert.ok((await s.get("rk1")) > Date.now(), "RedisStore.get derives expiry from PTTL");
+
+  // receipts round-trip through r:<key>.
+  const rcpt = { success: true, transaction: "RHASH", delivered: "1000000" };
+  await s.setReceipt("rk1", rcpt, exp);
+  assert.deepEqual(await s.getReceipt("rk1"), rcpt, "RedisStore receipt round-trips (JSON in r:<key>)");
+
+  // release clears both the binding and its receipt.
+  await s.release("rk1");
+  assert.equal(await s.isConsumed("rk1"), false, "RedisStore.release DELs the binding");
+  assert.equal(await s.getReceipt("rk1"), undefined, "RedisStore.release DELs the receipt");
+
+  // fail-closed cap: at the cap, a brand-new reserve is rolled back -> "full".
+  const capped = new RedisStore(fakeRedis(), { maxEntries: 1 });
+  assert.equal(await capped.reserve("c1", exp), "reserved");
+  assert.equal(await capped.reserve("c2", exp), "full", "RedisStore reserve fails closed at the cap (rolls back, returns full)");
+  assert.equal(await capped.isConsumed("c2"), false, "the over-cap reserve was rolled back (DEL), no live c2");
+  assert.equal(await capped.isConsumed("c1"), true, "the pre-existing live binding was NOT evicted");
+
+  // RedisRateLimiter fixed-window: INCR + PEXPIRE; allowed while count <= max.
+  const { RedisRateLimiter } = __test;
+  const rl = new RedisRateLimiter(
+    { incr: async (k) => { const e = redis.kv.get(k); const v = (e ? Number(e.val) : 0) + 1; redis.kv.set(k, { val: String(v), expireAt: null }); return v; },
+      pexpire: async () => 1 },
+    { max: 2, windowMs: 60_000 }
+  );
+  assert.equal(await rl.ok("9.9.9.9"), true, "fixed-window: 1st request allowed");
+  assert.equal(await rl.ok("9.9.9.9"), true, "fixed-window: 2nd request allowed (== max)");
+  assert.equal(await rl.ok("9.9.9.9"), false, "fixed-window: 3rd request (> max) refused");
+}
+
 // ---- AUDIT FIX (MEDIUM-2): /verify is rate-limited -------------------------
 // rateLimitOk unit contract: RATE_MAX allowed, then refused, per IP.
 {
@@ -528,9 +793,9 @@ assert.equal(__test.replayKeyFor({ Account: PAYER, Sequence: 7 }), `acct:${PAYER
   buckets.clear();
   const ip = "203.0.113.7";
   let allowed = 0;
-  for (let i = 0; i < __test.RATE_MAX; i++) if (__test.rateLimitOk(ip)) allowed++;
+  for (let i = 0; i < __test.RATE_MAX; i++) if (await __test.rateLimitOk(ip)) allowed++;
   assert.equal(allowed, __test.RATE_MAX, "first RATE_MAX requests allowed");
-  assert.equal(__test.rateLimitOk(ip), false, "RATE_MAX+1th request from same IP refused");
+  assert.equal(await __test.rateLimitOk(ip), false, "RATE_MAX+1th request from same IP refused");
   buckets.clear();
 }
 

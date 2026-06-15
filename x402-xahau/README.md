@@ -66,6 +66,8 @@ XAHAU_WSS=wss://… npm start   # enable /settle against a Xahau node
 #   X402_SHARED_SECRET=…   require an x-x402-secret header on /settle
 #   X402_RATE_MAX=20       per-IP token-bucket size (default 20 / 60s)
 #   XAHAU_NETWORK=xahau-testnet   expect NetworkID 21338 instead of 21337
+#   X402_REDIS_URL=redis://…      use a SHARED, durable replay store + limiter
+#                                 (needs `npm i ioredis`; fails fast if missing)
 ```
 
 ```sh
@@ -83,19 +85,41 @@ amounts and the exact payload schema are open items in the spec doc). The hostil
 client checks above (mandatory bounds, real signature verification, NetworkID +
 partial-payment guards, settle re-validation, delivered_amount check, auth +
 rate-limit, signature-bound-to-Account, oversize-body→clean-413) are enforced and
-tested. The in-memory stores are now **bounded**: the replay store evicts entries
-after a TTL (`X402_REPLAY_TTL_MS`, default 1h) with a hard cap
-(`X402_REPLAY_MAX`, default 100k, oldest-evicted), and the rate-limit buckets are
-swept of fully-refilled idle IPs — so neither grows without bound under load or
-IP-spray. The replay TTL is safe because a tx is only valid inside its
-`LastLedgerSequence` window (minutes), so a binding older than the TTL can no
-longer be (re)applied on-ledger.
+tested.
 
-**Limitations to close before production (architectural, not solved here):** the
-replay/nonce store is still **in-memory** — bounded, but it does not survive a
-restart and is not shared across instances (a restart or a second instance could
-allow one reuse); the rate limiter is single-process; **RegularKey** and
-**multisig (`Signers`)** signatures cannot be validated offline (reported
-`signatureVerified:false`, deferred to on-chain settle); issued-asset settlement
-is unimplemented. Use a durable shared nonce store (Redis/DB) and a distributed
-rate limiter for production. Not audited.
+**Injectable store + limiter (Upgrade).** The replay store and the rate limiter sit
+behind a small **async interface** with two backends:
+
+- **Default — in-memory (zero extra deps).** Bounded: the replay store evicts
+  entries after a TTL (`X402_REPLAY_TTL_MS`, default 1h) with a fail-closed hard cap
+  (`X402_REPLAY_MAX`, default 100k — refuses, never evicts a live binding), and the
+  rate-limit buckets are swept of fully-refilled idle IPs. The replay TTL is safe
+  because a tx is only valid inside its `LastLedgerSequence` window (minutes); a
+  binding older than the TTL can no longer be (re)applied on-ledger. **Caveat: this
+  default does NOT survive a restart and is NOT shared across instances** — a
+  restart or a second instance could allow one reuse. Single-process only.
+- **Optional — Redis (shared + durable).** Set `X402_REDIS_URL` to switch to a
+  shared store (atomic `SET key val NX PX <window>` reservation; Redis-native PX TTL
+  for the on-ledger window expiry) and a shared **fixed-window** rate limiter
+  (`INCR` + `PEXPIRE`; worst case ~2×max across a window boundary — the standard
+  cheap-distributed-limiter trade-off). This closes the multi-instance / durability
+  gap. `ioredis` is an **optional** dependency, lazy-loaded only when
+  `X402_REDIS_URL` is set; if it is set but `ioredis` is missing the server
+  **fails fast at boot** rather than silently falling back to a non-shared store
+  (which would reopen replay across instances).
+
+`reserve()` is an **atomic test-and-set** in both backends, so two concurrent /
+multi-instance settles of the same payment can't both win. `/settle` is also
+**idempotent**: a terminal outcome (`tesSUCCESS`, or an on-ledger failure that spent
+the sequence — e.g. `tecHOOK_REJECTED`) memoizes a receipt keyed by the replay id;
+a retry returns that receipt with `replayed:true` (the real tx hash + delivered
+amount) and never re-submits, while an in-flight / ambiguous payment returns
+`already consumed` (`inFlight:true`) with no fabricated receipt.
+
+**Limitations to close before production (architectural):** with the **default
+in-memory backend**, the replay/nonce store does not survive a restart and is not
+shared across instances, and the rate limiter is single-process — use the optional
+Redis backend (`X402_REDIS_URL`) for a durable, shared deployment; **RegularKey**
+and **multisig (`Signers`)** signatures cannot be validated offline (reported
+`signatureVerified:false`, deferred to on-chain settle); issued-asset settlement is
+unimplemented. Not audited.
