@@ -2,6 +2,14 @@
 
 > Also available as a standalone repo: **[github.com/Hugegreencandle/x402-xahau](https://github.com/Hugegreencandle/x402-xahau)** (history-preserved mirror of this directory). Part of the Xahau Hooks quartet: written with [xahc](https://github.com/Hugegreencandle/xahc), simulated with [xahau-mcp](https://github.com/Hugegreencandle/xahau-mcp), proven safe with [xahc-prover](https://github.com/Hugegreencandle/xahc-prover).
 
+## Positioning
+
+x402-xahau is the **provable spending-authority / agent-governance layer** for x402 on Xahau — not a general high-throughput facilitator. Its job is to make an AI agent's budget an **on-chain rule**: a [xahc](https://github.com/Hugegreencandle/xahc) guardrail Hook, **formally proven** by [xahc-prover](https://github.com/Hugegreencandle/xahc-prover), and readable live via `GET /policy/:account`. The agent **provably cannot overspend** — a governance/safety guarantee, not a throughput claim.
+
+**On throughput, use a channel facilitator.** [Dhali](https://dhali.io) is the incumbent x402 facilitator on Xahau and uses **payment channels** (XRPL / Xahau / Ethereum PayChan) to settle micropayments off-chain — far higher API throughput than any on-chain, per-payment scheme can match. For raw pay-per-call volume, that is the right tool. x402-xahau settles **on-chain per payment** (`verify` + `submitAndWait`); it is deliberately not competing on throughput.
+
+**The two compose — fast *and* provably safe.** The agent's account runs the guardrail Hook (its provable cap) and funds channel facilitators **within that cap**. The Hook governs how much value can flow into channels, xahc-prover proves the agent can't exceed budget, and a channel facilitator handles the fast micropayments inside it. Full stack: a provable on-chain budget on top, channel-speed micropayments underneath.
+
 A runnable reference for the proposed `exact-xahau` x402 scheme (spec:
 [`X402-XAHAU.md` in the xahc repo](https://github.com/Hugegreencandle/xahc/blob/main/docs/X402-XAHAU.md)).
 It turns that proposal into working code so the design can be exercised and ratified.
