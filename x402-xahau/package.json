@@ -4,22 +4,26 @@
   "private": true,
   "type": "module",
   "description": "Reference x402 facilitator for the proposed exact-xahau scheme: /verify offline (signature-verified), /settle on Xahau (replay-protected, delivered_amount-checked). The payer's xahc guardrail Hook is the L1 spending authority.",
-  "bin": { "x402-xahau": "./server.mjs" },
+  "bin": {
+    "x402-xahau": "./server.mjs"
+  },
   "scripts": {
     "start": "node server.mjs",
     "test": "node test.mjs"
   },
   "dependencies": {
-    "ripple-address-codec": "^5.0.0",
-    "ripple-keypairs": "^2.0.0",
-    "xrpl": "^4.6.0",
-    "xrpl-binary-codec-prerelease": "^9.2.0"
+    "xahau": "^4.0.4",
+    "xahau-address-codec": "^5.0.0",
+    "xahau-binary-codec": "^2.1.3",
+    "xahau-keypairs": "^2.0.0"
   },
   "//ioredis": "OPTIONAL — only loaded for the shared/durable Redis replay store + limiter (set X402_REDIS_URL). The default in-memory path runs with ZERO extra deps. Declared as an optionalDependency so `npm install` never fails on a platform that can't build it, and as an optional peer so it is never silently required.",
   "optionalDependencies": {
     "ioredis": "^5.4.0"
   },
   "peerDependenciesMeta": {
-    "ioredis": { "optional": true }
+    "ioredis": {
+      "optional": true
+    }
   }
 }

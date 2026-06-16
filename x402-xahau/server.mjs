@@ -102,7 +102,7 @@
  */
 import http from "node:http";
 import crypto from "node:crypto";
-import { decode } from "xrpl-binary-codec-prerelease";
+import { decode } from "xahau-binary-codec";
 
 const PORT = process.env.PORT || 4021;
 export const NETWORK = "xahau";
@@ -267,7 +267,7 @@ function isValidRAddress(addr) {
   if (_isValidAddress === null) {
     try {
       // ripple-address-codec ships transitively with the codec; load once.
-      const m = require_("ripple-address-codec");
+      const m = require_("xahau-address-codec");
       _isValidAddress = m.isValidClassicAddress;
     } catch {
       _isValidAddress = false;
@@ -682,7 +682,7 @@ export function verifyReceipt(receipt, { expectedPubkey } = {}) {
 let _xrplVerify = undefined;
 function verifyTxSignature(txBlob) {
   if (_xrplVerify === undefined) {
-    try { _xrplVerify = require_("xrpl").verifySignature; }
+    try { _xrplVerify = require_("xahau").verifySignature; }
     catch { _xrplVerify = null; }
   }
   if (typeof _xrplVerify !== "function") return null;
@@ -701,7 +701,7 @@ let _deriveAddress = undefined;
 function deriveAddressFromPubKey(pubKey) {
   if (typeof pubKey !== "string" || pubKey.length === 0) return null;
   if (_deriveAddress === undefined) {
-    try { _deriveAddress = require_("ripple-keypairs").deriveAddress; }
+    try { _deriveAddress = require_("xahau-keypairs").deriveAddress; }
     catch { _deriveAddress = null; }
   }
   if (typeof _deriveAddress !== "function") return null;
@@ -720,7 +720,7 @@ function deriveAddressFromPubKey(pubKey) {
 let _kpVerify = undefined;
 function keypairVerify(messageHex, signatureHex, publicKeyHex) {
   if (_kpVerify === undefined) {
-    try { _kpVerify = require_("ripple-keypairs").verify; }
+    try { _kpVerify = require_("xahau-keypairs").verify; }
     catch { _kpVerify = null; }
   }
   if (typeof _kpVerify !== "function") return null;
@@ -739,7 +739,7 @@ function keypairVerify(messageHex, signatureHex, publicKeyHex) {
 let _encodeForMultisigning = undefined;
 function encodeForMultisigning(tx, signerAccount) {
   if (_encodeForMultisigning === undefined) {
-    try { _encodeForMultisigning = require_("xrpl-binary-codec-prerelease").encodeForMultisigning; }
+    try { _encodeForMultisigning = require_("xahau-binary-codec").encodeForMultisigning; }
     catch { _encodeForMultisigning = null; }
   }
   if (typeof _encodeForMultisigning !== "function") return null;
@@ -1264,7 +1264,7 @@ let _encodeAccountID = undefined;
 function accountIdHexToRAddress(hex) {
   if (typeof hex !== "string" || !/^[0-9a-fA-F]{40}$/.test(hex)) return null;
   if (_encodeAccountID === undefined) {
-    try { _encodeAccountID = require_("ripple-address-codec").encodeAccountID; }
+    try { _encodeAccountID = require_("xahau-address-codec").encodeAccountID; }
     catch { _encodeAccountID = null; }
   }
   if (typeof _encodeAccountID !== "function") return null;
@@ -1635,8 +1635,8 @@ async function getClient() {
   const wss = process.env.XAHAU_WSS;
   if (!wss) throw new Error("XAHAU_WSS not set");
   let Client;
-  try { ({ Client } = await import("xrpl")); }
-  catch { throw new Error("xrpl not installed"); }
+  try { ({ Client } = await import("xahau")); }
+  catch { throw new Error("xahau not installed"); }
   // Fast path: reuse a live connection.
   if (_client && _client.isConnected()) return _client;
   // Stale/disconnected client: best-effort tear down before rebuilding.

@@ -41,7 +41,7 @@ const SHARED_SECRET = process.env.X402_SHARED_SECRET || "";
 process.env.XAHAU_WSS = WSS;
 process.env.XAHAU_NETWORK_ID = String(NETWORK_ID);
 
-const { Client } = require_("xrpl");
+const { Client } = require_("xahau");
 const { verifyExact, EXPECTED_NETWORK_ID, __test } = await import("../server.mjs");
 const settle = __test.settle; // production settle(), exposed for the _deps seam
 

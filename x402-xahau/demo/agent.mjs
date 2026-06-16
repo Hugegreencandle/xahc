@@ -28,9 +28,9 @@ import { createRequire } from "node:module";
 import { readFileSync, existsSync } from "node:fs";
 
 const require_ = createRequire(import.meta.url);
-const kp = require_("ripple-keypairs");
-const { Client } = require_("xrpl");
-const { encode, encodeForSigning } = require_("xrpl-binary-codec-prerelease");
+const kp = require_("xahau-keypairs");
+const { Client } = require_("xahau");
+const { encode, encodeForSigning } = require_("xahau-binary-codec");
 
 const RESOURCE_URL = (process.env.RESOURCE_URL || "http://127.0.0.1:4022").replace(/\/$/, "");
 const WSS = process.env.XAHAU_WSS || "wss://xahau-test.net";

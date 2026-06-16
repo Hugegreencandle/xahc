@@ -3,12 +3,12 @@
 // facilitator's hardened offline verification. Run: npm test (after npm i).
 import assert from "node:assert";
 import http from "node:http";
-import { encode, encodeForSigning } from "xrpl-binary-codec-prerelease";
+import { encode, encodeForSigning } from "xahau-binary-codec";
 import { createRequire } from "node:module";
 import { verifyExact, EXPECTED_NETWORK_ID, __test } from "./server.mjs";
 
 const require_ = createRequire(import.meta.url);
-const kp = require_("ripple-keypairs");
+const kp = require_("xahau-keypairs");
 
 // Deterministic test keypair (entropy fixed) -> stable PAYER address.
 const seed = kp.generateSeed({ entropy: new Uint8Array(16).fill(7) });
@@ -1009,7 +1009,7 @@ for (const failOn of ["isConsumed", "reserve"]) {
 // --- (3.1) pure decision fn: MULTISIG quorum ------------------------------
 {
   const { authorizeOnLedger_decide } = __test;
-  const codec = require_("xrpl-binary-codec-prerelease");
+  const codec = require_("xahau-binary-codec");
   // Two real signer keypairs.
   const s1 = kp.deriveKeypair(kp.generateSeed({ entropy: new Uint8Array(16).fill(11) }));
   const s2 = kp.deriveKeypair(kp.generateSeed({ entropy: new Uint8Array(16).fill(12) }));
