@@ -15,7 +15,7 @@ It turns that proposal into working code so the design can be exercised and rati
 | `POST /settle` | Submit the signed tx to Xahau (`submitAndWait`) |
 | `GET /health` | Liveness JSON. **Minimal** `{ status, network, uptimeSec }` unauthenticated (LB probe); verbose internals require the shared secret |
 | `GET /metrics` | Counters as JSON (or Prometheus text on `Accept: text/plain`). **Auth-gated** behind the shared secret (open in reference mode) |
-| `GET /policy/:account` | **On-ledger budget introspection** — read the account's installed xahc guardrail Hook and surface its spending policy (per-tx `LIM` cap + `DST` allowlist) straight from the chain. Read-only, public. Needs `XAHAU_WSS` (503 if unset). Fail-transparent |
+| `GET /policy/:account` | **On-ledger budget introspection** — read the account's installed xahc guardrail Hook and surface its spending policy straight from the chain. For the **per-tx** guardrail: the `LIM` cap + `DST` allowlist (`stateful:false`). For the **stateful period-budget** guardrail: also the `PLM`/`PER` caps **and the agent's REAL remaining budget** read live from the Hook's on-chain `HookState` (`stateful:true`). Read-only, keyless, public. Needs `XAHAU_WSS` (503 if unset). Fail-transparent |
 | `GET /pubkey` | The facilitator's **ed25519 receipt verification key** (`{ alg, pubkey }`, raw 32-byte hex). Public. Lets a resource server verify signed receipts **offline** |
 | `GET /status/:id` | Look up a stored settlement by its `replayId` (or `hash:<txhash>`). **Auth-gated** (exposes payment data; open in reference mode). Honest `unknown` when not found/expired |
 | `POST /simulate` | **(Optional, config-gated)** Predict the guardrail Hook's accept/rollback for a payment **without submitting** (advisory). Only enabled when `X402_MCP_URL` is set (else 404) |
@@ -24,12 +24,42 @@ It turns that proposal into working code so the design can be exercised and rati
 
 - **On-ledger policy (`GET /policy/:account`)** — the agent's spending policy *lives in a
   Hook*, so this is the one thing no other x402 facilitator can report. We read
-  `account_objects type:hook`, identify the `agent_guardrail` Hook by its `LIM`
-  HookParameter, and decode `LIM` (8-byte big-endian drops per-tx cap) + `DST` (20-byte
-  account-id → r-address allowlist). The `agent_guardrail` Hook is **stateless** (a per-tx
-  cap, not a running budget): we report `stateful:false` and never invent a `remaining`.
-  **Fail-transparent:** any node/decode error returns `policy:null` + an honest `note` —
-  **never** a fabricated limit. A wrong policy readout would be a credibility bug.
+  `account_objects type:hook`, identify the guardrail Hook by its `LIM` HookParameter, and
+  decode it. There are **two guardrail variants**, distinguished by their HookParameters:
+
+  - **Per-tx guardrail** (`LIM` + optional `DST`, **no** `PLM`/`PER`) — a *stateless* per-tx
+    cap. We decode `LIM` (8-byte big-endian drops per-tx cap) + `DST` (20-byte account-id →
+    r-address allowlist) and report `stateful:false`. There is no running budget, so we
+    **never invent a `remaining`**. *(Output unchanged.)*
+
+  - **Stateful period-budget guardrail** (`LIM` + `PLM` + `PER`, optional `DST`) — a *running*
+    per-period budget. The presence of `PLM` (8-byte BE drops, the cumulative cap per period)
+    and `PER` (4-or-8-byte BE period length, in **ledgers**) is what marks it stateful. We
+    decode those caps **and read the agent's REAL remaining budget** from the Hook's single
+    on-chain `HookState` entry — `ledger_entry { hook_state: { account, key, namespace_id } }`
+    (the canonical Xahau RPC; `key` = `0x01` left-padded to 32 bytes, `namespace_id` = the
+    Hook's `HookNamespace`), with an `account_namespace` scan as a fallback. The 16-byte state
+    value decodes to `periodStart` (u64 ledger) + `spent` (u64 drops); from `now` (the current
+    validated ledger) we compute, per the Hook's contract:
+
+    ```
+    periodLive     = now >= periodStart && now - periodStart < PER
+    remaining      = periodLive ? (spent <= PLM ? PLM - spent : 0) : PLM
+    resetInLedgers = periodLive ? periodStart + PER - now : 0
+    maxNextPayment = min(LIM, remaining)
+    ```
+
+    and report `{ stateful:true, perTxLimitDrops, periodLimitDrops, periodLedgers, allowlist?,
+    spentThisPeriod, remaining, periodStartLedger, resetInLedgers, maxNextPayment,
+    source:"on-ledger" }`. Once `PER` ledgers elapse the next payment resets `spent` on-chain,
+    so the *effective* `remaining` is the full `PLM` again even though the stored `spent` is
+    stale — we report that honestly. An **absent** state key means no period has opened yet
+    (`spent:0`, full `PLM`, a note).
+
+  **Fail-transparent (critical — never fabricate a budget):** a node-down / unreadable state,
+  a corrupt (non-16-byte) state value, or an undecodable `PLM`/`PER` returns the decoded caps
+  with `remaining:null` + an honest `note` — **never** a guessed number. Read-only and keyless
+  throughout (no signing). A wrong `remaining` readout would be a credibility bug.
 - **Signed receipts + `GET /pubkey`** — every **successful** settlement attaches a
   facilitator-signed `proof` (ed25519) over a **canonical, deterministic** serialization of
   the receipt's load-bearing fields, so a resource server can verify it **offline** with just
@@ -221,11 +251,26 @@ curl -X POST localhost:4021/verify -d '{
 ```sh
 # On-ledger spending policy (reads the payer's guardrail Hook). Needs XAHAU_WSS.
 curl localhost:4021/policy/rMWaeQoWNZoKvuaiUh59z7eHWz6qsToPbg
+# PER-TX guardrail (stateless cap, no PLM/PER):
 # -> { "account":"r...", "guardrailHookPresent":true,
 #      "policy": { "perTxLimitDrops":"5000000", "allowlist":["rPsf6..."],
 #                  "stateful":false, "note":"per-tx spend cap (stateless guardrail)..." },
 #      "source":"on-ledger", "asOfLedger": 9720000 }
-# Fail-transparent: node down / undecodable -> { ..., "policy":null, "note":"... unknown" }.
+#
+# STATEFUL period-budget guardrail (PLM+PER present) — REAL remaining budget read
+# from on-chain HookState:
+# -> { "account":"r...", "guardrailHookPresent":true,
+#      "policy": { "stateful":true, "perTxLimitDrops":"5000000",
+#                  "periodLimitDrops":"100000000", "periodLedgers":"1000",
+#                  "allowlist":["rPsf6..."],
+#                  "spentThisPeriod":"30000000", "remaining":"70000000",
+#                  "periodStartLedger":"10000", "resetInLedgers":"500",
+#                  "maxNextPayment":"5000000", "source":"on-ledger",
+#                  "note":"period budget read live from HookState" },
+#      "source":"on-ledger", "asOfLedger": 10500 }
+# Fail-transparent: node down / unreadable or corrupt state / undecodable PLM|PER ->
+#   policy keeps the decoded caps but "remaining":null + an honest "note" (NEVER a
+#   fabricated budget). No Hook / unrecognized Hook -> policy:null + note.
 
 # Facilitator receipt public key (for OFFLINE receipt verification).
 curl localhost:4021/pubkey            # -> { "alg":"ed25519", "pubkey":"<64-hex>" }

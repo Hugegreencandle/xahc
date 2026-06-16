@@ -1258,6 +1258,19 @@ async function guardrailHookPresent(client, account) {
 // stateful:false and expose the raw state for transparency only.
 const HOOK_PARAM_LIM = Buffer.from("LIM", "ascii").toString("hex").toUpperCase(); // 4C494D
 const HOOK_PARAM_DST = Buffer.from("DST", "ascii").toString("hex").toUpperCase(); // 445354
+// STATEFUL period-budget guardrail (agent_guardrail_stateful.c) adds two params on
+// top of LIM/DST. Their PRESENCE is what distinguishes the stateful Hook from the
+// per-tx-only one (which has LIM/DST but NO PLM/PER).
+//   - PLM = 8-byte BE u64 drops: the cumulative spend cap per PERIOD.
+//   - PER = 8-byte OR 4-byte BE integer: the period length, measured in LEDGERS (>0).
+const HOOK_PARAM_PLM = Buffer.from("PLM", "ascii").toString("hex").toUpperCase(); // 504C4D
+const HOOK_PARAM_PER = Buffer.from("PER", "ascii").toString("hex").toUpperCase(); // 504552
+
+// The stateful Hook keeps ONE HookState entry under a fixed 1-byte key 0x01. On the
+// ledger a state key is stored LEFT-PADDED to 32 bytes, so the on-ledger HookStateKey
+// is 0x00..0001 (62 hex zeros + "01"). The value is 16 bytes BE: [0..8) periodStart
+// (ledger u64), [8..16) spent (drops u64). See agent_guardrail_stateful.STATE.md.
+const STATEFUL_STATE_KEY_HEX = "01".padStart(64, "0"); // 62 zeros + "01" (32-byte key)
 
 /** Encode a 20-byte account-id hex to a classic r-address, or null on failure. */
 let _encodeAccountID = undefined;
@@ -1280,6 +1293,135 @@ function decode8ByteDropsHex(hex) {
     if (n < 0n || n > MAX_DROPS) return null;
     return n.toString();
   } catch { return null; }
+}
+
+/**
+ * Decode an 8-byte big-endian hex drops value to a BigInt, or null. Same range
+ * guard as decode8ByteDropsHex but returns the bigint for arithmetic (budget math).
+ */
+function decode8ByteDropsBig(hex) {
+  const s = decode8ByteDropsHex(hex);
+  if (s === null) return null;
+  try { return BigInt(s); } catch { return null; }
+}
+
+/**
+ * Decode the PER (period-length, in LEDGERS) parameter. PER is a 4-byte OR 8-byte
+ * big-endian unsigned integer (per the stateful Hook contract); any other length is
+ * rejected (the Hook itself rolls back on a bad PER length, so we treat it as
+ * undecodable). Must be > 0. Returns a BigInt, or null if malformed / out of range.
+ */
+function decodePerLedgers(hex) {
+  if (typeof hex !== "string") return null;
+  if (!/^[0-9a-fA-F]+$/.test(hex)) return null;
+  if (hex.length !== 8 && hex.length !== 16) return null; // 4-byte or 8-byte only
+  let n;
+  try { n = BigInt("0x" + hex); } catch { return null; }
+  if (n <= 0n) return null;
+  // u64 ceiling — a ledger count never approaches this, but stay in range.
+  if (n > 0xFFFFFFFFFFFFFFFFn) return null;
+  return n;
+}
+
+/**
+ * Decode the stateful Hook's 16-byte HookState VALUE (big-endian) into
+ * { periodStart, spent } as BigInts, or null if the value is not exactly 16 bytes /
+ * not hex. Layout: [0..8) periodStart (ledger u64), [8..16) spent (drops u64). A
+ * non-16-byte value is CORRUPT (the Hook rolls back on it) -> null (caller fails
+ * transparent with remaining:null, never fabricates).
+ */
+function decodeStatefulStateValue(hex) {
+  if (typeof hex !== "string" || !/^[0-9a-fA-F]{32}$/.test(hex)) return null; // 16 bytes
+  try {
+    const periodStart = BigInt("0x" + hex.slice(0, 16));
+    const spent = BigInt("0x" + hex.slice(16, 32));
+    return { periodStart, spent };
+  } catch { return null; }
+}
+
+/**
+ * Read the stateful guardrail Hook's single HookState entry from the node.
+ * Returns one of:
+ *   { ok:true, value:<hex> }    a present state value (raw hex; caller decodes/validates)
+ *   { ok:true, absent:true }    the state key is confirmed ABSENT (no period opened yet)
+ *   { ok:false }                the state could not be read (node error / shape unknown)
+ *
+ * Primary path: the canonical `ledger_entry { hook_state:{ account, key, namespace_id } }`
+ * (the same RPC xahau-mcp uses), with `key` = the 32-byte left-padded 0x01 and
+ * `namespace_id` = the Hook's HookNamespace. A node that reports the entry missing
+ * (entryNotFound) is a CONFIRMED absent -> {absent}. Fallback path: `account_namespace
+ * { account, namespace_id }` and scan namespace_entries for the matching HookStateKey
+ * (tolerant of the on-ledger key form). Read-only; never throws; fails transparent.
+ */
+async function readStatefulHookState(client, account, namespaceHex) {
+  if (typeof namespaceHex !== "string" || !/^[0-9a-fA-F]{64}$/.test(namespaceHex)) return { ok: false };
+  const ns = namespaceHex.toUpperCase();
+  // Primary: direct ledger_entry hook_state lookup (canonical, single round-trip).
+  try {
+    const r = await client.request({
+      command: "ledger_entry",
+      hook_state: { account, key: STATEFUL_STATE_KEY_HEX.toUpperCase(), namespace_id: ns },
+      ledger_index: "validated",
+    });
+    const data = r?.result?.node?.HookStateData;
+    if (typeof data === "string" && data.length > 0) return { ok: true, value: data.toUpperCase() };
+    // A node may answer the lookup with no node/HookStateData but no error -> fall through.
+  } catch (e) {
+    // entryNotFound == the entry is CONFIRMED absent at the validated ledger (no period
+    // opened yet) — a meaningful, non-error answer. Other errors -> unreadable.
+    const msg = String(e?.message || e?.data?.error || e?.error || "");
+    if (/entryNotFound|entry_not_found/i.test(msg)) return { ok: true, absent: true };
+    // fall through to the account_namespace fallback before giving up.
+  }
+  // Fallback: scan the account's namespace entries for our key. This avoids any
+  // dependence on the exact ledger_entry key form a given node build accepts.
+  try {
+    const r = await client.request({ command: "account_namespace", account, namespace_id: ns, ledger_index: "validated" });
+    const entries = r?.result?.namespace_entries;
+    if (!Array.isArray(entries)) return { ok: false };
+    const wantKey = STATEFUL_STATE_KEY_HEX.toUpperCase();
+    for (const e of entries) {
+      const k = typeof e?.HookStateKey === "string" ? e.HookStateKey.toUpperCase() : null;
+      const v = typeof e?.HookStateData === "string" ? e.HookStateData.toUpperCase() : null;
+      if (k === null || v === null) continue;
+      // Match the canonical 32-byte key, or a node that returns the unpadded "01".
+      if (k === wantKey || k === "01" || (/^0*01$/.test(k) && BigInt("0x" + k) === 1n)) {
+        return { ok: true, value: v };
+      }
+    }
+    // The namespace was read but our key isn't there -> CONFIRMED absent.
+    return { ok: true, absent: true };
+  } catch {
+    return { ok: false };
+  }
+}
+
+/**
+ * Compute the live period-budget fields from decoded params + state, per the
+ * STATE.md reader formulas. All BigInt. `now` is the current validated ledger index.
+ *   periodLive     = now >= periodStart && now - periodStart < PER
+ *   remaining      = periodLive ? (spent <= PLM ? PLM - spent : 0) : PLM
+ *   resetInLedgers = periodLive ? (periodStart + PER - now) : 0
+ *   maxNextPayment = min(LIM, remaining)
+ * Returns all values as decimal STRINGS (callers serialize JSON; BigInts keep exact).
+ */
+function computeBudget({ now, periodStart, spent, lim, plm, per }) {
+  const periodLive = now >= periodStart && (now - periodStart) < per;
+  let remaining;
+  if (!periodLive) {
+    remaining = plm; // a new payment now opens a fresh period -> full PLM available
+  } else {
+    remaining = spent <= plm ? plm - spent : 0n;
+  }
+  const resetInLedgers = periodLive ? (periodStart + per - now) : 0n;
+  const maxNextPayment = lim < remaining ? lim : remaining;
+  return {
+    periodLive,
+    spentThisPeriod: spent.toString(),
+    remaining: remaining.toString(),
+    resetInLedgers: resetInLedgers.toString(),
+    maxNextPayment: maxNextPayment.toString(),
+  };
 }
 
 /**
@@ -1343,8 +1485,10 @@ async function getPolicy(client, account) {
 
   // Find a Hook that carries the guardrail's LIM parameter. account_objects may list
   // the Hook object directly, or nested under a Hooks[] array per the SetHook layout;
-  // we scan both, collecting every HookParameters set we can see.
-  let limHex = null, dstHex = null, matched = false;
+  // we scan both, collecting every HookParameters set we can see. We ALSO capture the
+  // matched Hook's PLM/PER params (presence => the STATEFUL period-budget guardrail)
+  // and its HookNamespace (needed to read the period-budget HookState).
+  let limHex = null, dstHex = null, plmHex = null, perHex = null, namespaceHex = null, matched = false;
   for (const h of hooks) {
     // A hook entry may expose HookParameters directly, or under Hooks[].Hook.
     const candidates = [];
@@ -1356,6 +1500,11 @@ async function getPolicy(client, account) {
         matched = true;
         limHex = params.get(HOOK_PARAM_LIM);
         dstHex = params.get(HOOK_PARAM_DST) || null;
+        plmHex = params.get(HOOK_PARAM_PLM) || null;
+        perHex = params.get(HOOK_PARAM_PER) || null;
+        // HookNamespace lives on the Hook object (Hash256). Capture it for state reads.
+        const nsRaw = c?.HookNamespace;
+        namespaceHex = typeof nsRaw === "string" && /^[0-9a-fA-F]{64}$/.test(nsRaw) ? nsRaw.toUpperCase() : null;
         break;
       }
     }
@@ -1377,17 +1526,140 @@ async function getPolicy(client, account) {
     return out;
   }
 
+  // Decode the (optional) DST destination-lock once; both guardrail variants use it.
+  let allowlist = null, dstNote = "";
+  if (dstHex) {
+    const dstAddr = accountIdHexToRAddress(dstHex);
+    allowlist = dstAddr ? [dstAddr] : [];
+    if (!dstAddr) dstNote = " (DST destination-lock present but its account-id could not be decoded)";
+  }
+
+  // STATEFUL detection: the period-budget guardrail carries BOTH PLM and PER in
+  // ADDITION to LIM. If EITHER is present we are looking at the stateful Hook; we then
+  // require BOTH to decode soundly (a half-decoded stateful policy would be misleading).
+  if (plmHex !== null || perHex !== null) {
+    return await getStatefulPolicy(client, account, out, {
+      lim: BigInt(perTxLimitDrops), limStr: perTxLimitDrops, plmHex, perHex, namespaceHex, allowlist, dstNote,
+    });
+  }
+
+  // PER-TX-ONLY guardrail (no PLM/PER) — unchanged behavior: a stateless per-tx cap.
   const policy = {
     perTxLimitDrops,
     stateful: false, // agent_guardrail is a per-tx cap, NOT a running budget — no fabricated "remaining"
     note: "per-tx spend cap (stateless guardrail). This is the maximum per transaction, NOT a cumulative remaining budget.",
   };
   if (dstHex) {
-    const dstAddr = accountIdHexToRAddress(dstHex);
     // If DST is present but undecodable, say so rather than dropping it silently.
-    policy.allowlist = dstAddr ? [dstAddr] : [];
-    if (!dstAddr) policy.note += " (DST destination-lock present but its account-id could not be decoded)";
+    policy.allowlist = allowlist;
+    if (allowlist && allowlist.length === 0) policy.note += dstNote;
   }
+  out.policy = policy;
+  return out;
+}
+
+/**
+ * Build the /policy response for the STATEFUL period-budget guardrail. Decodes
+ * PLM (period drops cap) + PER (period length in ledgers), reads the Hook's single
+ * HookState entry, and computes the agent's REAL remaining budget per the STATE.md
+ * formulas. FAIL-TRANSPARENT throughout — a value we cannot decode/read SOUNDLY is
+ * reported with remaining:null + an honest note, NEVER a fabricated budget.
+ *
+ * `params`: { lim (BigInt), limStr, plmHex, perHex, namespaceHex, allowlist, dstNote }.
+ * `out` is the partially-filled response (account/guardrailHookPresent/source/asOfLedger).
+ */
+async function getStatefulPolicy(client, account, out, params) {
+  const { lim, limStr, plmHex, perHex, namespaceHex, allowlist, dstNote } = params;
+
+  // Both PLM and PER must be present for a well-formed stateful policy.
+  if (plmHex === null || perHex === null) {
+    out.note = `stateful guardrail detected but ${plmHex === null ? "PLM" : "PER"} parameter is missing — period budget unknown`;
+    out.policy = { stateful: true, perTxLimitDrops: limStr, periodLimitDrops: null, periodLedgers: null, remaining: null,
+      note: out.note, ...(allowlist ? { allowlist } : {}) };
+    return out;
+  }
+
+  const plm = decode8ByteDropsBig(plmHex);
+  const per = decodePerLedgers(perHex);
+  const periodLimitDrops = plm === null ? null : plm.toString();
+  const periodLedgers = per === null ? null : per.toString();
+
+  // The base policy shell (params we CAN decode). remaining is filled below (or stays null).
+  const policy = {
+    stateful: true,
+    perTxLimitDrops: limStr,
+    periodLimitDrops,
+    periodLedgers,
+    remaining: null,
+  };
+  if (allowlist) policy.allowlist = allowlist;
+
+  if (plm === null || per === null) {
+    policy.note = `stateful guardrail: ${plm === null ? "PLM" : "PER"} parameter present but could not be decoded — remaining budget unknown` + dstNote;
+    out.policy = policy;
+    out.note = policy.note;
+    return out;
+  }
+
+  // We need the current validated ledger to evaluate the period. asOfLedger was read at
+  // entry; if it's unavailable we cannot soundly compute remaining -> fail transparent.
+  const now = typeof out.asOfLedger === "number" && out.asOfLedger > 0 ? BigInt(out.asOfLedger) : null;
+  if (now === null) {
+    policy.note = "stateful guardrail: could not read the current validated ledger — remaining budget unknown" + dstNote;
+    out.policy = policy;
+    return out;
+  }
+
+  // We need the Hook's namespace to read its state. Absent it, we can report the caps
+  // but not the live remaining.
+  if (namespaceHex === null) {
+    policy.note = "stateful guardrail: Hook namespace unavailable — could not read period-budget state, remaining unknown" + dstNote;
+    out.policy = policy;
+    return out;
+  }
+
+  const st = await readStatefulHookState(client, account, namespaceHex);
+  if (!st.ok) {
+    // Node down / unreadable state -> report the decoded caps but remaining:null.
+    policy.note = "stateful guardrail: could not read hook state — remaining budget unknown" + dstNote;
+    out.policy = policy;
+    return out;
+  }
+
+  if (st.absent) {
+    // No period has opened yet: a fresh period -> spent 0, full PLM remaining. (The
+    // next payment opens the period at `now`, so there is no live reset countdown.)
+    policy.spentThisPeriod = "0";
+    policy.remaining = plm.toString();
+    policy.periodStartLedger = null;
+    policy.resetInLedgers = "0";
+    policy.maxNextPayment = (lim < plm ? lim : plm).toString();
+    policy.source = "on-ledger";
+    policy.note = "no period opened yet — full period budget available" + dstNote;
+    out.policy = policy;
+    return out;
+  }
+
+  const decoded = decodeStatefulStateValue(st.value);
+  if (decoded === null) {
+    // Corrupt / non-16-byte value -> fail transparent (the Hook itself rolls back on it).
+    policy.note = "stateful guardrail: hook state value is malformed (not 16 bytes) — remaining budget unknown" + dstNote;
+    out.policy = policy;
+    return out;
+  }
+
+  const { periodStart, spent } = decoded;
+  const b = computeBudget({ now, periodStart, spent, lim, plm, per });
+  policy.spentThisPeriod = b.spentThisPeriod;
+  policy.remaining = b.remaining;
+  policy.periodStartLedger = periodStart.toString();
+  policy.resetInLedgers = b.resetInLedgers;
+  policy.maxNextPayment = b.maxNextPayment;
+  policy.source = "on-ledger";
+  policy.note = (b.periodLive
+    ? "period budget read live from HookState"
+    : "stored period has elapsed — the next payment opens a fresh period, so the full period budget is available")
+    + dstNote;
   out.policy = policy;
   return out;
 }
@@ -2916,6 +3188,10 @@ export const __test = {
   // FEATURE 1 — on-ledger policy introspection seams.
   getPolicy, hookParamsMap, decode8ByteDropsHex, accountIdHexToRAddress,
   HOOK_PARAM_LIM, HOOK_PARAM_DST,
+  // FEATURE 1b — STATEFUL period-budget guardrail seams.
+  getStatefulPolicy, readStatefulHookState, decode8ByteDropsBig, decodePerLedgers,
+  decodeStatefulStateValue, computeBudget,
+  HOOK_PARAM_PLM, HOOK_PARAM_PER, STATEFUL_STATE_KEY_HEX,
   // FEATURE 2 — receipt signing/verification seams.
   canonicalJSONStringify, receiptSignablePayload, signReceipt, verifyReceipt,
   receiptPubkey, initReceiptKey, parseReceiptSecret, ed25519KeyFromSeed,

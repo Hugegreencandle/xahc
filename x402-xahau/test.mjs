@@ -2126,6 +2126,187 @@ await new Promise((resolveTest, rejectTest) => {
   assert.match(pol.note, /could not be decoded/, "honest note for undecodable LIM");
 }
 
+// ===========================================================================
+// FEATURE 1b — STATEFUL period-budget guardrail (PLM/PER + on-chain HookState)
+// ===========================================================================
+// The stateful Hook (agent_guardrail_stateful.c) carries PLM (period drops cap) +
+// PER (period length in ledgers) ON TOP OF LIM/DST. /policy reads its single 16-byte
+// HookState entry [periodStart u64 || spent u64] and reports the agent's REAL
+// remaining budget per the STATE.md formulas. FAIL-TRANSPARENT: any value it cannot
+// read/decode -> remaining:null + a note, NEVER a fabricated budget.
+{
+  const {
+    getPolicy, decode8ByteDropsBig, decodePerLedgers, decodeStatefulStateValue, computeBudget,
+    HOOK_PARAM_PLM, HOOK_PARAM_PER, STATEFUL_STATE_KEY_HEX,
+  } = __test;
+
+  // Param-name encoding + state-key form are correct.
+  assert.equal(HOOK_PARAM_PLM, "504C4D", "PLM param name is hex of ASCII 'PLM'");
+  assert.equal(HOOK_PARAM_PER, "504552", "PER param name is hex of ASCII 'PER'");
+  assert.equal(STATEFUL_STATE_KEY_HEX, "0000000000000000000000000000000000000000000000000000000000000001", "state key is 0x01 left-padded to 32 bytes");
+
+  // Low-level decoders.
+  assert.equal(decode8ByteDropsBig("0000000005F5E100"), 100000000n, "PLM 8-byte BE drops -> bigint");
+  assert.equal(decodePerLedgers("000003E8"), 1000n, "PER 4-byte BE -> 1000 ledgers");
+  assert.equal(decodePerLedgers("00000000000003E8"), 1000n, "PER 8-byte BE -> 1000 ledgers");
+  assert.equal(decodePerLedgers("00"), null, "PER wrong length -> null (Hook rolls back on bad PER)");
+  assert.equal(decodePerLedgers("00000000"), null, "PER == 0 -> null (must be > 0)");
+  const sv = decodeStatefulStateValue("00000000000027100000000001C9C380");
+  assert.equal(sv.periodStart, 10000n, "decode periodStart from 16-byte value");
+  assert.equal(sv.spent, 30000000n, "decode spent from 16-byte value");
+  assert.equal(decodeStatefulStateValue("0011"), null, "non-16-byte value -> null (corrupt)");
+
+  // computeBudget formula spot-checks (BigInt math, exact).
+  const cb = computeBudget({ now: 10500n, periodStart: 10000n, spent: 30000000n, lim: 5000000n, plm: 100000000n, per: 1000n });
+  assert.equal(cb.remaining, "70000000", "live partial: remaining = PLM - spent");
+  assert.equal(cb.resetInLedgers, "500", "reset = periodStart + PER - now");
+  assert.equal(cb.maxNextPayment, "5000000", "maxNext = min(LIM, remaining)");
+
+  // Shared hex fixtures for the stateful Hook.
+  const LIM_HEX = "00000000004C4B40";      // 5 XAH per-tx
+  const PLM_HEX = "0000000005F5E100";      // 100 XAH per period
+  const PER_HEX = "000003E8";              // 1000 ledgers (4-byte form)
+  const NS_HEX = "AA".repeat(32);          // 32-byte HookNamespace
+  const STATE_KEY = STATEFUL_STATE_KEY_HEX.toUpperCase();
+
+  // Build a fake node client that serves the stateful Hook + a configurable state read.
+  // `stateMode`: "present" (value), "absent", "error", or "corrupt".
+  const makeStatefulClient = ({ nowLedger, stateValue, stateMode = "present" }) => ({
+    request: async (q) => {
+      if (q.command === "ledger") return { result: { ledger_index: nowLedger } };
+      if (q.command === "account_objects" && q.type === "hook") {
+        return { result: { account_objects: [
+          { HookNamespace: NS_HEX, HookParameters: [
+            { HookParameter: { HookParameterName: "4C494D", HookParameterValue: LIM_HEX } },
+            { HookParameter: { HookParameterName: HOOK_PARAM_PLM, HookParameterValue: PLM_HEX } },
+            { HookParameter: { HookParameterName: HOOK_PARAM_PER, HookParameterValue: PER_HEX } },
+          ] },
+        ] } };
+      }
+      if (q.command === "ledger_entry" && q.hook_state) {
+        // Validate the facilitator queried the right key/namespace.
+        assert.equal(q.hook_state.account, PAYER, "hook_state read targets the agent account");
+        assert.equal(q.hook_state.key, STATE_KEY, "hook_state key is the 32-byte 0x01");
+        assert.equal(q.hook_state.namespace_id, NS_HEX.toUpperCase(), "hook_state namespace_id is the Hook's HookNamespace");
+        if (stateMode === "error") throw new Error("node down");
+        if (stateMode === "absent") throw Object.assign(new Error("entryNotFound"), { message: "entryNotFound" });
+        return { result: { node: { HookStateData: stateMode === "corrupt" ? "0011" : stateValue } } };
+      }
+      return { result: {} };
+    },
+  });
+
+  // (a) Same-period, partially spent: remaining = PLM - spent.
+  let pol = await getPolicy(makeStatefulClient({ nowLedger: 10500, stateValue: "00000000000027100000000001C9C380" }), PAYER);
+  assert.equal(pol.policy.stateful, true, "(a) stateful:true when PLM+PER present");
+  assert.equal(pol.policy.source, "on-ledger", "(a) source on-ledger");
+  assert.equal(pol.policy.perTxLimitDrops, "5000000", "(a) LIM decoded");
+  assert.equal(pol.policy.periodLimitDrops, "100000000", "(a) PLM decoded");
+  assert.equal(pol.policy.periodLedgers, "1000", "(a) PER decoded");
+  assert.equal(pol.policy.spentThisPeriod, "30000000", "(a) spent read from state");
+  assert.equal(pol.policy.remaining, "70000000", "(a) remaining = PLM - spent");
+  assert.equal(pol.policy.periodStartLedger, "10000", "(a) periodStartLedger from state");
+  assert.equal(pol.policy.resetInLedgers, "500", "(a) resetInLedgers = start + PER - now");
+  assert.equal(pol.policy.maxNextPayment, "5000000", "(a) maxNext = min(LIM, remaining)");
+
+  // (b) spent == PLM -> remaining 0, maxNext 0.
+  pol = await getPolicy(makeStatefulClient({ nowLedger: 10500, stateValue: "00000000000027100000000005F5E100" }), PAYER);
+  assert.equal(pol.policy.remaining, "0", "(b) spent==PLM -> remaining 0");
+  assert.equal(pol.policy.maxNextPayment, "0", "(b) maxNext 0 when budget exhausted");
+
+  // (c) period elapsed (now - periodStart >= PER): remaining = full PLM, reset 0.
+  pol = await getPolicy(makeStatefulClient({ nowLedger: 20000, stateValue: "00000000000027100000000001C9C380" }), PAYER);
+  assert.equal(pol.policy.remaining, "100000000", "(c) elapsed period -> full PLM remaining");
+  assert.equal(pol.policy.resetInLedgers, "0", "(c) elapsed -> resetInLedgers 0");
+  assert.equal(pol.policy.maxNextPayment, "5000000", "(c) maxNext = min(LIM, PLM)");
+  assert.match(pol.policy.note, /elapsed/, "(c) note explains the fresh-period reset");
+
+  // (d) absent state key -> fresh-period values + note.
+  pol = await getPolicy(makeStatefulClient({ nowLedger: 10500, stateMode: "absent" }), PAYER);
+  assert.equal(pol.policy.stateful, true, "(d) still stateful:true");
+  assert.equal(pol.policy.spentThisPeriod, "0", "(d) fresh period -> spent 0");
+  assert.equal(pol.policy.remaining, "100000000", "(d) fresh period -> full PLM");
+  assert.equal(pol.policy.resetInLedgers, "0", "(d) no period open -> reset 0");
+  assert.equal(pol.policy.maxNextPayment, "5000000", "(d) maxNext = min(LIM, PLM)");
+  assert.match(pol.policy.note, /no period opened yet/, "(d) honest fresh-period note");
+
+  // (e) node/state read error -> remaining:null + note (NO fabrication), caps still shown.
+  pol = await getPolicy(makeStatefulClient({ nowLedger: 10500, stateMode: "error" }), PAYER);
+  assert.equal(pol.policy.stateful, true, "(e) stateful:true even when state unreadable");
+  assert.equal(pol.policy.periodLimitDrops, "100000000", "(e) decoded caps still reported");
+  assert.equal(pol.policy.remaining, null, "(e) unreadable state -> remaining:null (never fabricate)");
+  assert.equal("spentThisPeriod" in pol.policy, false, "(e) no fabricated spent");
+  assert.match(pol.policy.note, /could not read hook state/, "(e) honest note on state read failure");
+
+  // (e2) corrupt (non-16-byte) state value -> remaining:null + note.
+  pol = await getPolicy(makeStatefulClient({ nowLedger: 10500, stateMode: "corrupt" }), PAYER);
+  assert.equal(pol.policy.remaining, null, "(e2) corrupt state value -> remaining:null");
+  assert.match(pol.policy.note, /malformed/, "(e2) honest note on a corrupt state value");
+
+  // (e3) account_namespace FALLBACK path (node lacks ledger_entry hook_state) -> still reads.
+  const clientNsFallback = {
+    request: async (q) => {
+      if (q.command === "ledger") return { result: { ledger_index: 10500 } };
+      if (q.command === "account_objects" && q.type === "hook") {
+        return { result: { account_objects: [
+          { HookNamespace: NS_HEX, HookParameters: [
+            { HookParameter: { HookParameterName: "4C494D", HookParameterValue: LIM_HEX } },
+            { HookParameter: { HookParameterName: HOOK_PARAM_PLM, HookParameterValue: PLM_HEX } },
+            { HookParameter: { HookParameterName: HOOK_PARAM_PER, HookParameterValue: PER_HEX } },
+          ] },
+        ] } };
+      }
+      if (q.command === "ledger_entry") throw new Error("unknownCmd: ledger_entry hook_state not supported");
+      if (q.command === "account_namespace") {
+        assert.equal(q.namespace_id, NS_HEX.toUpperCase(), "fallback uses the Hook namespace");
+        return { result: { namespace_entries: [ { HookStateKey: STATE_KEY, HookStateData: "00000000000027100000000001C9C380" } ] } };
+      }
+      return { result: {} };
+    },
+  };
+  pol = await getPolicy(clientNsFallback, PAYER);
+  assert.equal(pol.policy.remaining, "70000000", "(e3) account_namespace fallback decodes remaining");
+  assert.equal(pol.policy.spentThisPeriod, "30000000", "(e3) fallback reads spent");
+
+  // (f) the PER-TX-ONLY hook (LIM/DST, NO PLM/PER) still reports stateful:false.
+  const clientPerTxOnly = {
+    request: async (q) => {
+      if (q.command === "ledger") return { result: { ledger_index: 10500 } };
+      if (q.command === "account_objects" && q.type === "hook") {
+        return { result: { account_objects: [ { HookNamespace: NS_HEX, HookParameters: [
+          { HookParameter: { HookParameterName: "4C494D", HookParameterValue: LIM_HEX } },
+        ] } ] } };
+      }
+      if (q.command === "ledger_entry" || q.command === "account_namespace")
+        throw new Error("state should NOT be read for a per-tx-only hook");
+      return { result: {} };
+    },
+  };
+  pol = await getPolicy(clientPerTxOnly, PAYER);
+  assert.equal(pol.policy.stateful, false, "(f) per-tx-only hook -> stateful:false (unchanged)");
+  assert.equal(pol.policy.perTxLimitDrops, "5000000", "(f) per-tx cap still decoded");
+  assert.equal("remaining" in pol.policy, false, "(f) no remaining for a stateless cap");
+  assert.equal("periodLimitDrops" in pol.policy, false, "(f) no period fields for a stateless cap");
+
+  // (g) stateful detected but PER undecodable -> caps partial, remaining:null + note.
+  const clientBadPer = makeStatefulClient({ nowLedger: 10500, stateValue: "00000000000027100000000001C9C380" });
+  const origBadPer = clientBadPer.request;
+  clientBadPer.request = async (q) => {
+    if (q.command === "account_objects" && q.type === "hook") {
+      return { result: { account_objects: [ { HookNamespace: NS_HEX, HookParameters: [
+        { HookParameter: { HookParameterName: "4C494D", HookParameterValue: LIM_HEX } },
+        { HookParameter: { HookParameterName: HOOK_PARAM_PLM, HookParameterValue: PLM_HEX } },
+        { HookParameter: { HookParameterName: HOOK_PARAM_PER, HookParameterValue: "00" } }, // bad PER length
+      ] } ] } };
+    }
+    return origBadPer(q);
+  };
+  pol = await getPolicy(clientBadPer, PAYER);
+  assert.equal(pol.policy.stateful, true, "(g) stateful detected via PLM presence");
+  assert.equal(pol.policy.remaining, null, "(g) undecodable PER -> remaining:null (no fabrication)");
+  assert.match(pol.policy.note, /PER/, "(g) honest note names the bad PER param");
+}
+
 // /policy integration over a spawned server: 503 when XAHAU_WSS unset, 400 on a bad
 // address. (We don't exercise the live-node path here — covered by the unit tests
 // above with an injected client.)
