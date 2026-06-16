@@ -1,0 +1,96 @@
+build = "agent_guardrail_stateful.c"
+
+# sfAccount AAAA... == the sim's hook_account (0xAA*20) -> marks an OUTGOING payment.
+# LIM = 0x0000000000989680 = 10,000,000 drops (10 XAH) per-tx cap.
+# PLM = 0x00000000017d7840 = 25,000,000 drops (25 XAH) per-period cap.
+# PER = 0x0000000000000064 = 100 ledgers.
+#
+# HARNESS LIMITATION (documented honestly): the local sim starts each case with
+# EMPTY hook state and a FIXED ledger_seq (1,000,000). It cannot carry `spent`
+# across cases nor advance the ledger, so every case below runs the FRESH-PERIOD
+# decision path (periodStart = now, spent = 0). These cases therefore prove the
+# decision logic AT period open; true multi-tx accumulation and the time-based
+# reset are proven exhaustively by xahc-prover and must be confirmed on testnet.
+# See agent_guardrail_stateful.STATE.md.
+
+# (a) First payment under BOTH caps -> accepts and writes one state key.
+[[case]]
+name = "first payment under both caps accepts and sets state"
+tt = 0
+drops = 5000000
+fields = { sfAccount = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" }
+hook_params = { LIM = "0000000000989680", PLM = "00000000017d7840", PER = "0000000000000064" }
+expect = "accept"
+state_keys = 1
+
+# (b) Under per-tx LIM but the amount alone exceeds the PERIOD budget PLM.
+#     (spent=0 + 30 XAH > 25 XAH PLM) -> rollback on period budget.
+#     NOTE: 30 XAH is ALSO over the 10 XAH per-tx LIM, so to isolate the PERIOD
+#     check we instead raise LIM above PLM for this case (LIM=30, PLM=25), proving
+#     a payment that passes per-tx but fails the cumulative cap is rejected.
+[[case]]
+name = "under per-tx but over period budget rolls back"
+tt = 0
+drops = 28000000
+fields = { sfAccount = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" }
+hook_params = { LIM = "0000000001c9c380", PLM = "00000000017d7840", PER = "0000000000000064" }
+expect = "rollback"
+
+# (c) Period reset path: a fresh period (which is exactly the state a reset
+#     produces after PER ledgers elapse) accepts a payment within both caps.
+#     The harness can't advance ledger_seq, so this asserts the post-reset
+#     behaviour via the fresh-state path. True elapsed-period reset is proven
+#     by xahc-prover / testnet.
+[[case]]
+name = "fresh period (post-reset equivalent) accepts within caps"
+tt = 0
+drops = 9000000
+fields = { sfAccount = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" }
+hook_params = { LIM = "0000000000989680", PLM = "00000000017d7840", PER = "0000000000000064" }
+expect = "accept"
+state_keys = 1
+
+# (d) Over the per-tx LIM -> rollback (per-tx cap, checked before period cap).
+[[case]]
+name = "over per-tx limit rolls back"
+tt = 0
+drops = 20000000
+fields = { sfAccount = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" }
+hook_params = { LIM = "0000000000989680", PLM = "00000000017d7840", PER = "0000000000000064" }
+expect = "rollback"
+
+# (e) Disallowed destination -> rollback. dest 0xCC*20 != allowed DST 0xBB*20.
+[[case]]
+name = "disallowed destination rolls back"
+tt = 0
+drops = 5000000
+fields = { sfAccount = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", sfDestination = "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC" }
+hook_params = { LIM = "0000000000989680", PLM = "00000000017d7840", PER = "0000000000000064", DST = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB" }
+expect = "rollback"
+
+# (f) Bonus: outgoing to the ALLOWED destination, within caps -> accepts.
+[[case]]
+name = "allowed destination within caps accepts"
+tt = 0
+drops = 5000000
+fields = { sfAccount = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", sfDestination = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB" }
+hook_params = { LIM = "0000000000989680", PLM = "00000000017d7840", PER = "0000000000000064", DST = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB" }
+expect = "accept"
+state_keys = 1
+
+# (g) Bonus: incoming payment (origin != hook account) is not policed.
+[[case]]
+name = "incoming payment passes unpoliced"
+tt = 0
+drops = 99000000
+fields = { sfAccount = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB" }
+hook_params = { LIM = "0000000000989680", PLM = "00000000017d7840", PER = "0000000000000064" }
+expect = "accept"
+state_keys = 0
+
+# (h) Bonus: non-payment passes unpoliced.
+[[case]]
+name = "non-payment passes unpoliced"
+tt = 99
+expect = "accept"
+state_keys = 0
