@@ -46,12 +46,39 @@ check is mandatory — a missing bound is a **failure**, never a skip):
   `"signature does not match Account"`. (xrpl `verifySignature` only proves the
   `TxnSignature` matches the *embedded* `SigningPubKey` — not that the key belongs
   to the payer; without the binding a tx with `Account=victim` + an attacker's
-  key/signature would pass.) The response reports `signatureVerified: true/false`.
-  Residual (documented, not solved): a **RegularKey**-signed tx is legitimate but
-  its key→Account link lives in ledger state and **cannot be confirmed offline**,
-  and **multisig (`Signers`)** likewise depends on an on-ledger `SignerList`; both
-  are reported `signatureVerified:false` (flagged, never silently passed) and rely
-  on the on-chain settle as the authority.
+  key/signature would pass.) The `/verify` response reports
+  `signatureVerified: true/false`.
+  **What `/verify` confirms OFFLINE:** only a **master-key single-sig** is bound
+  offline (`deriveAddress(SigningPubKey) === Account` after the crypto check →
+  `signatureVerified:true`). A **RegularKey**-signed tx and a **multisig
+  (`Signers`)** tx cannot be confirmed offline (the key→Account link / `SignerList`
+  live in ledger state, and xrpl `verifySignature` cannot even validate a multisig
+  blob), so `/verify` returns `signatureVerified:false` for them (flagged, never a
+  guarantee).
+  **What `/settle` confirms ON-LEDGER (Upgrade #3):** at settle the facilitator
+  holds a node connection, so for a tx that was *not* bound offline it does a
+  POSITIVE on-ledger authorization check and reports the *source*:
+  - **RegularKey** (single-sig): `account_info` is read; authorized iff the
+    account's `RegularKey` equals `deriveAddress(SigningPubKey)`. (Note: a
+    single-sig whose key doesn't derive to `Account` is already rejected offline by
+    the conservative master-key binding; the RegularKey on-ledger path is the
+    documented hook for that case.)
+  - **multisig** (`Signers`): the on-ledger `SignerList` is read; each signer's
+    `TxnSignature` is cryptographically verified over `encodeForMultisigning(tx,
+    signer.Account)`, `deriveAddress(signer.SigningPubKey)` must equal
+    `signer.Account`, the signer must be on the `SignerList`, and the sum of the
+    **on-ledger** `SignerWeight` of the valid, listed signers (deduped) must reach
+    the on-ledger `SignerQuorum`.
+  These checks may only **REJECT** (an obviously-unauthorized tx is refused
+  *pre-submit* — no slot reserved, no submit wasted, `signatureVerified:false`) or
+  **UPGRADE** confidence (a genuinely-authorized tx settles with
+  `signatureVerified:true` and `signatureSource: "regularkey" | "multisig"` —
+  master-key txs report `source:"master"`). They never weaken a check. **The check
+  fails CLOSED:** if the node read fails, the facilitator does NOT fabricate
+  authorization — it falls back to its prior behavior (proceed to submit; the
+  **ledger is the ultimate authority** and rejects a bad tx at `submitAndWait` via
+  `tefBAD_AUTH` / `tefBAD_QUORUM` etc.). `signatureVerified:true` is never reported
+  without a positive on-ledger confirmation.
 
 **The agent's spending policy is NOT enforced by the facilitator** — the payer's
 on-chain [xahc guardrail Hook](../docs/AGENTIC.md) is, **provided it is actually
@@ -87,6 +114,12 @@ XAHAU_WSS=wss://… npm start   # enable /settle against a Xahau node
 #                          and to see /health's verbose internals (else /health is
 #                          the minimal liveness shape only)
 #   X402_RATE_MAX=20       per-IP token-bucket size (default 20 / 60s)
+#   X402_TRUST_PROXY=0     # trusted proxy/LB hops in front of this server. 0
+#                          # (default) = NEVER trust X-Forwarded-For (use the socket
+#                          # peer addr); n>0 = take the client IP as the (n+1)-th
+#                          # entry from the RIGHT of XFF (strip n trusted hops). Set
+#                          # this to the EXACT number of proxies you control — a too-
+#                          # high value lets a client spoof its rate-limit identity.
 #   XAHAU_NETWORK=xahau-testnet   expect NetworkID 21338 instead of 21337
 #   X402_REDIS_URL=redis://…      use a SHARED, durable replay store + limiter
 #                                 (needs `npm i ioredis`; fails fast if missing)
@@ -233,13 +266,30 @@ behind a small **async interface** with two backends:
   restart or a second instance could allow one reuse. Single-process only.
 - **Optional — Redis (shared + durable).** Set `X402_REDIS_URL` to switch to a
   shared store (atomic `SET key val NX PX <window>` reservation; Redis-native PX TTL
-  for the on-ledger window expiry) and a shared **fixed-window** rate limiter
-  (`INCR` + `PEXPIRE`; worst case ~2×max across a window boundary — the standard
-  cheap-distributed-limiter trade-off). This closes the multi-instance / durability
-  gap. `ioredis` is an **optional** dependency, lazy-loaded only when
-  `X402_REDIS_URL` is set; if it is set but `ioredis` is missing the server
-  **fails fast at boot** rather than silently falling back to a non-shared store
-  (which would reopen replay across instances).
+  for the on-ledger window expiry) and a shared **token-bucket** rate limiter
+  (Upgrade #4). The limiter is an atomic Redis **Lua script** (`EVAL`): per IP it
+  stores `{tokens, ts}`, refills `max` tokens per `windowMs` by elapsed time
+  (clamped at `max`; a backwards clock adds nothing), consumes 1 per request, and
+  returns allow/deny + a reset hint — a true continuous-refill bucket matching the
+  in-memory limiter's model, with **no fixed-window 2×max boundary burst**. Tokens
+  are integer fixed-point to avoid Lua float drift; the bucket key TTLs out when
+  idle. If `EVAL` itself fails (e.g. a Redis build without scripting), the limiter
+  **fails CLOSED** (denies) rather than allowing unbounded traffic. This closes the
+  multi-instance / durability gap. `ioredis` is an **optional** dependency,
+  lazy-loaded only when `X402_REDIS_URL` is set; if it is set but `ioredis` is
+  missing the server **fails fast at boot** rather than silently falling back to a
+  non-shared store (which would reopen replay across instances).
+
+**Proxy-aware rate-limit key (Upgrade #4).** Both `/verify` and `/settle` key the
+limiter off a `clientIp(req)` helper governed by `X402_TRUST_PROXY` (number of
+trusted proxy/LB hops). At the default `0`, `X-Forwarded-For` is **never** trusted
+(it is client-spoofable) and the direct socket peer address is used. With `n>0`, the
+client IP is the `(n+1)`-th entry from the **right** of `X-Forwarded-For` (strip `n`
+trusted hops), falling back to the socket address if the header is missing/short/
+malformed. This avoids both failure modes: keying off the socket alone throttles
+every client behind a proxy as one IP, while blindly trusting `XFF` lets a client
+forge its limiter identity. Set `X402_TRUST_PROXY` to the **exact** hop count you
+control.
 
 `reserve()` is an **atomic test-and-set** in both backends, so two concurrent /
 multi-instance settles of the same payment can't both win. `/settle` is also
@@ -252,9 +302,13 @@ amount) and never re-submits, while an in-flight / ambiguous payment returns
 **Limitations to close before production (architectural):** with the **default
 in-memory backend**, the replay/nonce store does not survive a restart and is not
 shared across instances, and the rate limiter is single-process — use the optional
-Redis backend (`X402_REDIS_URL`) for a durable, shared deployment; **RegularKey**
-and **multisig (`Signers`)** signatures cannot be validated offline (reported
-`signatureVerified:false`, deferred to on-chain settle). Not audited.
+Redis backend (`X402_REDIS_URL`) for a durable, shared deployment. **RegularKey**
+and **multisig (`Signers`)** signatures cannot be validated **offline** (so `/verify`
+reports `signatureVerified:false`); at `/settle` they are checked **on-ledger**
+(RegularKey match / SignerList quorum) and either rejected pre-submit or settled with
+`signatureVerified:true` + a `signatureSource`, with the **ledger remaining the
+ultimate authority** (the on-ledger check fails closed to ledger authority on a node
+read error). Not audited.
 
 **Issued-amount caveats (honest):** the exact token comparator is sound over the full
 XRPL token range, but a few issued-amount edge cases are intentionally **out of

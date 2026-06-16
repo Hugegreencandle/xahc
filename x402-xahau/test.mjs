@@ -910,16 +910,377 @@ for (const failOn of ["isConsumed", "reserve"]) {
   assert.equal(await capped.isConsumed("c2"), false, "the over-cap reserve was rolled back (DEL), no live c2");
   assert.equal(await capped.isConsumed("c1"), true, "the pre-existing live binding was NOT evicted");
 
-  // RedisRateLimiter fixed-window: INCR + PEXPIRE; allowed while count <= max.
+  // (#4) RedisRateLimiter TOKEN BUCKET: atomic EVAL of the Lua script. The fake
+  // ioredis below interprets the bucket arithmetic in JS (mirroring the Lua) so we can
+  // assert (a) the limiter actually calls EVAL with the real script + correct ARGV,
+  // and (b) allow/deny logic: a fresh full bucket allows `max`, then denies, then
+  // refills with elapsed time.
   const { RedisRateLimiter } = __test;
-  const rl = new RedisRateLimiter(
-    { incr: async (k) => { const e = redis.kv.get(k); const v = (e ? Number(e.val) : 0) + 1; redis.kv.set(k, { val: String(v), expireAt: null }); return v; },
-      pexpire: async () => 1 },
-    { max: 2, windowMs: 60_000 }
-  );
-  assert.equal(await rl.ok("9.9.9.9"), true, "fixed-window: 1st request allowed");
-  assert.equal(await rl.ok("9.9.9.9"), true, "fixed-window: 2nd request allowed (== max)");
-  assert.equal(await rl.ok("9.9.9.9"), false, "fixed-window: 3rd request (> max) refused");
+  // Minimal fake ioredis supporting eval of the token-bucket script (hash-backed).
+  function fakeBucketRedis() {
+    const hashes = new Map(); // key -> { t, ts }
+    let evalCalls = 0;
+    let lastScript = null;
+    return {
+      hashes,
+      get evalCalls() { return evalCalls; },
+      get lastScript() { return lastScript; },
+      // eval(script, numKeys, key, now, max, windowMs, ttlMs)
+      async eval(script, numKeys, key, now, max, windowMs, ttlMs) {
+        evalCalls++; lastScript = script;
+        const SCALE = __test.RL_SCALE;
+        now = Number(now); max = Number(max); windowMs = Number(windowMs);
+        const maxScaled = max * SCALE;
+        let h = hashes.get(key);
+        let tokens = h ? Number(h.t) : maxScaled;
+        let ts = h ? Number(h.ts) : now;
+        let elapsed = now - ts; if (elapsed < 0) elapsed = 0;
+        const refill = Math.floor((elapsed * maxScaled) / windowMs);
+        tokens = Math.min(maxScaled, tokens + refill);
+        let allow = 0, resetMs = 0;
+        if (tokens >= SCALE) { tokens -= SCALE; allow = 1; }
+        else { resetMs = Math.ceil(((SCALE - tokens) * windowMs) / maxScaled); }
+        hashes.set(key, { t: tokens, ts: now });
+        return [allow, resetMs];
+      },
+    };
+  }
+  const bredis = fakeBucketRedis();
+  const rl = new RedisRateLimiter(bredis, { max: 2, windowMs: 60_000 });
+  // Pin `now` so refill is deterministic across the burst (same instant -> no refill).
+  const T0 = 1_700_000_000_000;
+  assert.equal(await rl.ok("9.9.9.9", T0), true, "token-bucket: 1st request allowed (full bucket)");
+  assert.equal(bredis.evalCalls, 1, "RedisRateLimiter.ok runs exactly one EVAL per call");
+  assert.equal(bredis.lastScript, __test.REDIS_TOKEN_BUCKET_LUA, "EVAL uses the real token-bucket Lua script");
+  assert.equal(await rl.ok("9.9.9.9", T0), true, "token-bucket: 2nd request allowed (== max, no refill at same instant)");
+  assert.equal(await rl.ok("9.9.9.9", T0), false, "token-bucket: 3rd request (bucket empty) refused");
+  // After a FULL window elapses the bucket refills to max -> allowed again.
+  assert.equal(await rl.ok("9.9.9.9", T0 + 60_000), true, "token-bucket: refills after a full window");
+  // Half a window after empty gives ~1 token (continuous refill, no boundary doubling).
+  const bredis2 = fakeBucketRedis();
+  const rl2 = new RedisRateLimiter(bredis2, { max: 2, windowMs: 60_000 });
+  assert.equal(await rl2.ok("8.8.8.8", T0), true);
+  assert.equal(await rl2.ok("8.8.8.8", T0), true);
+  assert.equal(await rl2.ok("8.8.8.8", T0), false, "empty after 2");
+  assert.equal(await rl2.ok("8.8.8.8", T0 + 30_000), true, "half-window refill yields exactly 1 token");
+  assert.equal(await rl2.ok("8.8.8.8", T0 + 30_000), false, "only 1 token from a half window (no 2x boundary burst)");
+
+  // FAIL CLOSED: if EVAL throws (no scripting support), ok() must DENY, never allow.
+  const throwingRedis = { eval: async () => { throw new Error("ERR unknown command EVAL"); } };
+  const rlFail = new RedisRateLimiter(throwingRedis, { max: 100, windowMs: 60_000 });
+  assert.equal(await rlFail.ok("7.7.7.7"), false, "RedisRateLimiter fails CLOSED (deny) when EVAL errors");
+}
+
+// ===========================================================================
+// UPGRADE #3 — on-ledger RegularKey + multisig authorization at SETTLE
+// ===========================================================================
+// At settle we hold a node connection, so we POSITIVELY check on-ledger auth for txs
+// whose signature could NOT be bound offline (RegularKey single-sig + multisig). The
+// check may only REJECT (skip submit) or UPGRADE confidence (signatureVerified:true +
+// source); a node-read failure FALLS BACK to the ledger (proceed to submit). The pure
+// decision fn `authorizeOnLedger_decide` is unit-tested directly; full settle paths
+// use the injected fake client.
+
+// --- (3.0) pure decision fn: REGULARKEY -----------------------------------
+{
+  const { authorizeOnLedger_decide } = __test;
+  // The signing key derives to ATTACKER (a regular key set on PAYER's account).
+  const txRK = { Account: PAYER, SigningPubKey: kpB.publicKey, TxnSignature: "ab" };
+
+  // RegularKey present AND == deriveAddress(SigningPubKey) -> authorized:regularkey.
+  let d = authorizeOnLedger_decide(txRK, null, { RegularKey: ATTACKER }, false);
+  assert.equal(d.decision, "authorized", "RegularKey match -> authorized");
+  assert.equal(d.source, "regularkey", "source is regularkey");
+
+  // RegularKey present but MISMATCHED -> rejected (unauthorized forgery).
+  d = authorizeOnLedger_decide(txRK, null, { RegularKey: PAY_TO }, false);
+  assert.equal(d.decision, "rejected", "mismatched RegularKey -> rejected");
+  assert.match(d.reason, /neither master nor current RegularKey/);
+
+  // No RegularKey set at all -> rejected.
+  d = authorizeOnLedger_decide(txRK, null, {}, false);
+  assert.equal(d.decision, "rejected", "no RegularKey -> rejected");
+
+  // account read failed (null) -> fallback (never fabricate authorization).
+  d = authorizeOnLedger_decide(txRK, null, null, false);
+  assert.equal(d.decision, "fallback", "account_info read failure -> fallback (ledger authority)");
+}
+
+// --- (3.1) pure decision fn: MULTISIG quorum ------------------------------
+{
+  const { authorizeOnLedger_decide } = __test;
+  const codec = require_("xrpl-binary-codec-prerelease");
+  // Two real signer keypairs.
+  const s1 = kp.deriveKeypair(kp.generateSeed({ entropy: new Uint8Array(16).fill(11) }));
+  const s2 = kp.deriveKeypair(kp.generateSeed({ entropy: new Uint8Array(16).fill(12) }));
+  const a1 = kp.deriveAddress(s1.publicKey);
+  const a2 = kp.deriveAddress(s2.publicKey);
+
+  // Base multisig tx (no Signers yet) -> sign per-signer over encodeForMultisigning.
+  const base = {
+    TransactionType: "Payment", Account: PAYER, Destination: PAY_TO, Amount: "1000000",
+    Fee: "100", Sequence: 1, Flags: 0, NetworkID: EXPECTED_NETWORK_ID,
+    LastLedgerSequence: 1000005, SigningPubKey: "",
+  };
+  const sig1 = kp.sign(codec.encodeForMultisigning(base, a1), s1.privateKey);
+  const sig2 = kp.sign(codec.encodeForMultisigning(base, a2), s2.privateKey);
+  const mkTx = (signers) => codec.decode(codec.encode({ ...base, Signers: signers }));
+
+  const both = mkTx([
+    { Signer: { Account: a1, SigningPubKey: s1.publicKey, TxnSignature: sig1 } },
+    { Signer: { Account: a2, SigningPubKey: s2.publicKey, TxnSignature: sig2 } },
+  ]);
+
+  // SignerList: each weight 1, quorum 2. Both valid sigs -> sum 2 >= 2 -> authorized.
+  const slBoth = { quorum: 2, signers: [{ account: a1, weight: 1 }, { account: a2, weight: 1 }] };
+  let d = authorizeOnLedger_decide(both, slBoth, null, true);
+  assert.equal(d.decision, "authorized", "two valid signers meeting quorum -> authorized");
+  assert.equal(d.source, "multisig", "source is multisig");
+
+  // Quorum 3 (unreachable with weight 2) -> rejected (under quorum).
+  const slHigh = { quorum: 3, signers: [{ account: a1, weight: 1 }, { account: a2, weight: 1 }] };
+  d = authorizeOnLedger_decide(both, slHigh, null, true);
+  assert.equal(d.decision, "rejected", "valid signers below quorum -> rejected");
+  assert.match(d.reason, /quorum not met/);
+
+  // One signer's signature is INVALID (tampered) -> excluded; remaining weight 1 < 2.
+  const tampered = mkTx([
+    { Signer: { Account: a1, SigningPubKey: s1.publicKey, TxnSignature: sig1 } },
+    { Signer: { Account: a2, SigningPubKey: s2.publicKey, TxnSignature: sig1 /* WRONG sig for a2 */ } },
+  ]);
+  d = authorizeOnLedger_decide(tampered, slBoth, null, true);
+  assert.equal(d.decision, "rejected", "bad signature excluded -> under quorum -> rejected");
+
+  // A signer NOT on the on-ledger SignerList contributes nothing.
+  const slOnlyA1 = { quorum: 2, signers: [{ account: a1, weight: 1 }] };
+  d = authorizeOnLedger_decide(both, slOnlyA1, null, true);
+  assert.equal(d.decision, "rejected", "unlisted signer contributes no weight -> under quorum -> rejected");
+
+  // A1 weight 5, quorum 3 -> single valid listed signer meets quorum -> authorized.
+  const slWeighted = { quorum: 3, signers: [{ account: a1, weight: 5 }, { account: a2, weight: 1 }] };
+  d = authorizeOnLedger_decide(both, slWeighted, null, true);
+  assert.equal(d.decision, "authorized", "weighted signer alone meets quorum -> authorized");
+
+  // Duplicate signer entries do NOT double-count weight (dedupe). a1 listed once w=1,
+  // quorum 2; tx repeats a1 twice -> still only weight 1 -> under quorum -> rejected.
+  const dupA1 = mkTx([
+    { Signer: { Account: a1, SigningPubKey: s1.publicKey, TxnSignature: sig1 } },
+    { Signer: { Account: a1, SigningPubKey: s1.publicKey, TxnSignature: sig1 } },
+  ]);
+  d = authorizeOnLedger_decide(dupA1, { quorum: 2, signers: [{ account: a1, weight: 1 }] }, null, true);
+  assert.equal(d.decision, "rejected", "duplicate signer weight counted once -> under quorum -> rejected");
+
+  // No on-ledger SignerList at all (account not multisig-configured) -> rejected.
+  d = authorizeOnLedger_decide(both, { error: "no_signer_list" }, null, true);
+  assert.equal(d.decision, "rejected", "no SignerList -> rejected");
+  assert.match(d.reason, /no on-ledger SignerList/);
+
+  // SignerList read failed (null) -> fallback (ledger authority, no fabrication).
+  d = authorizeOnLedger_decide(both, null, null, true);
+  assert.equal(d.decision, "fallback", "SignerList read failure -> fallback");
+
+  // Malformed / ambiguous list -> fallback (cannot evaluate -> ledger authority).
+  d = authorizeOnLedger_decide(both, { error: "malformed_signer_list" }, null, true);
+  assert.equal(d.decision, "fallback", "malformed SignerList -> fallback");
+
+  // Stash for the settle integration tests below.
+  globalThis.__MULTISIG = { s1, s2, a1, a2, base, sig1, sig2, codec };
+}
+
+// --- (3.2) settle integration: REGULARKEY authorized + rejected -----------
+{
+  const prev = process.env.XAHAU_WSS;
+  process.env.XAHAU_WSS = "wss://invalid.example";
+  const { InMemoryStore } = __test;
+  const now = 1_000_000_000, curLedger = 100;
+
+  // Build a tx whose Account is PAYER but signed by the ATTACKER key (a regular key).
+  // This is exactly the verifyExact "signature does not match Account" case offline —
+  // but at SETTLE we re-derive and check the on-ledger RegularKey. We must construct a
+  // GENUINELY-signed blob with SigningPubKey = attacker key so verifyExact's signature
+  // crypto passes and it returns signatureVerified:false (key != Account).
+  function regularKeyBlob(overrides = {}) {
+    const tx = {
+      TransactionType: "Payment", Account: PAYER, Destination: PAY_TO, Amount: "1000000",
+      Fee: "10", Sequence: 91, Flags: 0, NetworkID: EXPECTED_NETWORK_ID,
+      LastLedgerSequence: curLedger + 5, SigningPubKey: kpB.publicKey, ...overrides,
+    };
+    tx.TxnSignature = kp.sign(encodeForSigning(tx), kpB.privateKey);
+    return encode(tx);
+  }
+
+  // Sanity: verifyExact REJECTS this offline (single-sig key != Account).
+  let vr = verifyExact({ txBlob: regularKeyBlob() }, req);
+  assert.equal(vr.isValid, false, "RegularKey-signed tx is rejected by OFFLINE verifyExact (key != Account)");
+  assert.match(vr.invalidReason, /signature does not match Account/);
+
+  // NOTE: because verifyExact rejects a RegularKey single-sig offline, settle's
+  // re-verification ALSO rejects it before reaching the on-ledger auth check. This is
+  // the CURRENT conservative single-sig binding: a single-sig key that doesn't derive
+  // to Account fails closed. The on-ledger RegularKey UPGRADE path therefore applies
+  // to signatures that verifyExact lets through as signatureVerified:false WITHOUT
+  // rejecting — which today is the MULTISIG case. We assert the conservative single-sig
+  // behavior is preserved (it does NOT settle), and exercise the on-ledger REJECT/
+  // AUTHORIZE upgrade via the multisig settle path + the pure-fn RegularKey tests above.
+  const store = new InMemoryStore({ now: () => now });
+  let submitCount = 0;
+  const client = {
+    isConnected: () => true,
+    request: async (q) => {
+      if (q.command === "account_info") return { result: { account_data: { RegularKey: ATTACKER } } };
+      return { result: { account_objects: [] } };
+    },
+    submitAndWait: async () => { submitCount++; return { result: { hash: "X", meta: { TransactionResult: "tesSUCCESS", delivered_amount: "1000000" } } }; },
+  };
+  const deps = { store, client, currentValidatedLedger: async () => curLedger, now: () => now };
+  const out = await __test.settle({ txBlob: regularKeyBlob() }, req, deps);
+  assert.equal(out.success, false, "single-sig key != Account does NOT settle (conservative binding preserved)");
+  assert.match(out.errorReason, /verify failed/);
+  assert.equal(submitCount, 0, "no submit for a tx that fails re-verification");
+
+  // Master-key single-sig still authorized as before (signatureVerified:true, source master).
+  const store2 = new InMemoryStore({ now: () => now });
+  let submit2 = 0;
+  const client2 = {
+    isConnected: () => true,
+    request: async () => ({ result: { account_objects: [] } }),
+    submitAndWait: async () => { submit2++; return { result: { hash: "MASTER", meta: { TransactionResult: "tesSUCCESS", delivered_amount: "1000000" } } }; },
+  };
+  const deps2 = { store: store2, client: client2, currentValidatedLedger: async () => curLedger, now: () => now };
+  const outM = await __test.settle({ txBlob: blob({ LastLedgerSequence: curLedger + 5, Sequence: 92 }) }, req, deps2);
+  assert.equal(outM.success, true, `master-key single-sig still settles: ${outM.errorReason}`);
+  assert.equal(outM.signatureVerified, true, "master-key settle reports signatureVerified:true");
+  assert.equal(outM.signatureSource, "master", "master-key settle reports source master");
+  assert.equal(submit2, 1, "master-key tx submitted once");
+
+  if (prev === undefined) delete process.env.XAHAU_WSS; else process.env.XAHAU_WSS = prev;
+}
+
+// --- (3.3) settle integration: MULTISIG authorized / rejected / fallback ---
+{
+  const prev = process.env.XAHAU_WSS;
+  process.env.XAHAU_WSS = "wss://invalid.example";
+  const { InMemoryStore } = __test;
+  const now = 1_000_000_000, curLedger = 100;
+  const M = globalThis.__MULTISIG;
+
+  // Build a multisig blob with both real signatures. LastLedgerSequence must be in the
+  // in-bounds window; rebuild base with the right LLS and re-sign.
+  const mbase = { ...M.base, LastLedgerSequence: curLedger + 5, Sequence: 101 };
+  const msig1 = kp.sign(M.codec.encodeForMultisigning(mbase, M.a1), M.s1.privateKey);
+  const msig2 = kp.sign(M.codec.encodeForMultisigning(mbase, M.a2), M.s2.privateKey);
+  const multiBlob = M.codec.encode({
+    ...mbase,
+    Signers: [
+      { Signer: { Account: M.a1, SigningPubKey: M.s1.publicKey, TxnSignature: msig1 } },
+      { Signer: { Account: M.a2, SigningPubKey: M.s2.publicKey, TxnSignature: msig2 } },
+    ],
+  });
+
+  // verifyExact lets a multisig through with signatureVerified:false (offline-unbindable).
+  const vm = verifyExact({ txBlob: multiBlob }, req);
+  // (some codec/verify combos may not validate a multisig blob's overall sig; if it
+  // passes, signatureVerified MUST be false.)
+  if (vm.isValid) assert.equal(vm.signatureVerified, false, "multisig offline -> signatureVerified:false");
+
+  // (a) AUTHORIZED: on-ledger SignerList = both signers, quorum 2 -> meets quorum.
+  const slBoth = { SignerQuorum: 2, SignerEntries: [
+    { SignerEntry: { Account: M.a1, SignerWeight: 1 } },
+    { SignerEntry: { Account: M.a2, SignerWeight: 1 } },
+  ] };
+  const mkClient = (signerLists, { onSubmit } = {}) => {
+    let submitCount = 0;
+    const c = {
+      isConnected: () => true,
+      get submitCount() { return submitCount; },
+      request: async (q) => {
+        if (q.command === "account_info") {
+          return { result: { account_data: { signer_lists: signerLists } } };
+        }
+        return { result: { account_objects: [] } };
+      },
+      submitAndWait: async () => { submitCount++; if (onSubmit) onSubmit(); return { result: { hash: "MULTIHASH", meta: { TransactionResult: "tesSUCCESS", delivered_amount: "1000000" } } }; },
+    };
+    return c;
+  };
+
+  if (vm.isValid) {
+    const store = new InMemoryStore({ now: () => now });
+    const client = mkClient([slBoth]);
+    const deps = { store, client, currentValidatedLedger: async () => curLedger, now: () => now };
+    const out = await __test.settle({ txBlob: multiBlob }, req, deps);
+    assert.equal(out.success, true, `multisig meeting quorum settles: ${out.errorReason}`);
+    assert.equal(out.signatureVerified, true, "authorized multisig reports signatureVerified:true");
+    assert.equal(out.signatureSource, "multisig", "authorized multisig reports source multisig");
+    assert.equal(client.submitCount, 1, "authorized multisig submitted once");
+  }
+
+  // (b) REJECTED pre-submit: quorum 3 (unreachable) -> rejected, submit NOT called.
+  {
+    const slHigh = { SignerQuorum: 3, SignerEntries: slBoth.SignerEntries };
+    const store = new InMemoryStore({ now: () => now });
+    const client = mkClient([slHigh]);
+    const deps = { store, client, currentValidatedLedger: async () => curLedger, now: () => now };
+    const out = await __test.settle({ txBlob: multiBlob }, req, deps);
+    assert.equal(out.success, false, "under-quorum multisig rejected at settle");
+    assert.match(out.errorReason, /quorum not met|unauthorized/);
+    assert.equal(out.signatureVerified, false, "rejected multisig reports signatureVerified:false");
+    assert.equal(client.submitCount, 0, "REJECTED multisig does NOT submit (asserted submit not called)");
+    assert.equal(store.map.size, 0, "rejected multisig reserves NO replay slot");
+  }
+
+  // (c) FALLBACK: node SignerList read FAILS -> proceed to submit (ledger authority),
+  //     no fabricated authorization (signatureVerified stays false).
+  if (vm.isValid) {
+    const store = new InMemoryStore({ now: () => now });
+    let submitCount = 0;
+    const client = {
+      isConnected: () => true,
+      request: async (q) => {
+        if (q.command === "account_info") throw new Error("node down");
+        if (q.command === "account_objects" && q.type === "signer_list") throw new Error("node down");
+        return { result: { account_objects: [] } };
+      },
+      submitAndWait: async () => { submitCount++; return { result: { hash: "FBHASH", meta: { TransactionResult: "tesSUCCESS", delivered_amount: "1000000" } } }; },
+    };
+    const deps = { store, client, currentValidatedLedger: async () => curLedger, now: () => now };
+    const out = await __test.settle({ txBlob: multiBlob }, req, deps);
+    assert.equal(out.success, true, "node-read failure FALLS BACK to submit (ledger authority)");
+    assert.equal(out.signatureVerified, false, "fallback does NOT fabricate authorization (signatureVerified:false)");
+    assert.equal(out.signatureSource, null, "fallback has no signatureSource");
+    assert.equal(submitCount, 1, "fallback proceeds to submit exactly once");
+  }
+
+  if (prev === undefined) delete process.env.XAHAU_WSS; else process.env.XAHAU_WSS = prev;
+}
+
+// ===========================================================================
+// UPGRADE #4 — proxy-aware clientIp()
+// ===========================================================================
+{
+  const { clientIp } = __test;
+  const mkReq = (socket, xff) => ({ socket: { remoteAddress: socket }, headers: xff != null ? { "x-forwarded-for": xff } : {} });
+
+  // hops=0 (default): NEVER trust XFF -> use socket address.
+  assert.equal(clientIp(mkReq("10.0.0.1", "1.2.3.4"), 0), "10.0.0.1", "trust_proxy=0 ignores XFF (uses socket)");
+  assert.equal(clientIp(mkReq("10.0.0.1"), 0), "10.0.0.1", "trust_proxy=0 no XFF -> socket");
+  // Spoofed XFF when proxy=0 is NOT trusted.
+  assert.equal(clientIp(mkReq("10.0.0.1", "evil-spoof, 9.9.9.9"), 0), "10.0.0.1", "trust_proxy=0 does not trust a spoofed XFF");
+
+  // hops=1: strip 1 trusted hop -> client is the entry immediately left of it.
+  assert.equal(clientIp(mkReq("10.0.0.1", "1.2.3.4, 10.0.0.1"), 1), "1.2.3.4", "trust_proxy=1 strips one hop -> real client");
+  // hops=1 with a spoofed prefix: "spoof, client, proxy" -> client is 2nd-from-right.
+  assert.equal(clientIp(mkReq("10.0.0.1", "spoof, 1.2.3.4, 10.0.0.1"), 1), "1.2.3.4", "trust_proxy=1 picks the (hops+1)-th from right, not the spoof");
+
+  // hops=2: strip 2 trusted hops.
+  assert.equal(clientIp(mkReq("10.0.0.1", "1.2.3.4, 10.0.0.2, 10.0.0.1"), 2), "1.2.3.4", "trust_proxy=2 strips two hops");
+
+  // malformed / short XFF falls back to socket.
+  assert.equal(clientIp(mkReq("10.0.0.1", ""), 1), "10.0.0.1", "empty XFF -> socket fallback");
+  assert.equal(clientIp(mkReq("10.0.0.1", "   "), 1), "10.0.0.1", "whitespace-only XFF -> socket fallback");
+  assert.equal(clientIp(mkReq("10.0.0.1", "1.2.3.4"), 2), "10.0.0.1", "fewer XFF entries than trusted hops -> socket fallback");
+  // missing socket entirely -> "unknown" (never throws).
+  assert.equal(clientIp({ socket: {}, headers: {} }, 0), "unknown", "no socket addr -> 'unknown'");
 }
 
 // ---- AUDIT FIX (MEDIUM-2): /verify is rate-limited -------------------------

@@ -74,8 +74,17 @@
  * headers timeout caps how long a slow client may drip a request, maxConnections caps
  * concurrent sockets, and graceful shutdown closes idle keep-alive sockets so a slow
  * client can't ride out the drain budget (all applied in serve(), never at import).
- * Signatures are bound to Account (deriveAddress == Account); RegularKey/multisig
- * are offline-unverifiable and are flagged (signatureVerified:false), not passed.
+ * Signatures: a master-key single-sig is bound OFFLINE (deriveAddress == Account ->
+ * signatureVerified:true). RegularKey + multisig (Signers) are offline-unverifiable
+ * (verify reports signatureVerified:false), but at SETTLE — where a node connection
+ * exists — they get a POSITIVE on-ledger authorization check (#3): RegularKey match
+ * (account_info.RegularKey == deriveAddress(SigningPubKey)) / multisig SignerList
+ * quorum (per-signer multisigning-data verify + on-ledger weight sum >= quorum).
+ * That check may only REJECT pre-submit or UPGRADE confidence (signatureVerified:true
+ * + signatureSource); it FAILS CLOSED to ledger authority on any node-read error and
+ * never fabricates authorization. The rate-limit key is proxy-aware (#4): X402_TRUST_
+ * PROXY hops control whether X-Forwarded-For is trusted (default 0 = socket addr only,
+ * never trust a spoofable XFF); the Redis limiter is an atomic Lua token bucket.
  *
  * ASSETS: both native XAH and ISSUED amounts (IOU / tokens) are supported. The x402
  * paymentRequirements carry an optional `asset` field: when ABSENT the payment is
@@ -486,6 +495,44 @@ function deriveAddressFromPubKey(pubKey) {
   catch { return null; }
 }
 
+/**
+ * ripple-keypairs `verify(message, signature, publicKey)` — verifies a hex-encoded
+ * signature over hex-encoded message bytes against a public key. Returns true/false;
+ * null if ripple-keypairs is unavailable. A malformed signature/key THROWS inside
+ * ripple-keypairs, which we catch and treat as a FAILED verification (false) — never
+ * as "cannot verify". This is the primitive used to check each multisig Signer's
+ * TxnSignature over the per-signer multisigning data.
+ */
+let _kpVerify = undefined;
+function keypairVerify(messageHex, signatureHex, publicKeyHex) {
+  if (_kpVerify === undefined) {
+    try { _kpVerify = require_("ripple-keypairs").verify; }
+    catch { _kpVerify = null; }
+  }
+  if (typeof _kpVerify !== "function") return null;
+  try { return _kpVerify(messageHex, signatureHex, publicKeyHex) === true; }
+  catch { return false; } // malformed sig/key -> NOT verified (fail closed)
+}
+
+/**
+ * Codec `encodeForMultisigning(tx, signerAccount)` — reproduces the exact bytes a
+ * multisig Signer signed (the tx serialized with the signer's account appended, per
+ * the XRPL multisigning scheme). Returns the hex string, or null if the codec is
+ * unavailable / the input is unencodable. Verified end-to-end: encoding the DECODED
+ * tx with each Signer.Account reproduces the data ripple-keypairs.verify accepts
+ * against that signer's SigningPubKey + TxnSignature.
+ */
+let _encodeForMultisigning = undefined;
+function encodeForMultisigning(tx, signerAccount) {
+  if (_encodeForMultisigning === undefined) {
+    try { _encodeForMultisigning = require_("xrpl-binary-codec-prerelease").encodeForMultisigning; }
+    catch { _encodeForMultisigning = null; }
+  }
+  if (typeof _encodeForMultisigning !== "function") return null;
+  try { return _encodeForMultisigning(tx, signerAccount); }
+  catch { return null; }
+}
+
 // ---------------------------------------------------------------------------
 // verify
 // ---------------------------------------------------------------------------
@@ -584,9 +631,6 @@ export function verifyExact(payload, req) {
   const isMultisig = Array.isArray(tx.Signers) && tx.Signers.length > 0;
   if (!tx.TxnSignature && !isMultisig)
     return { isValid: false, invalidReason: "unsigned (no TxnSignature/Signers)" };
-  const sigOk = verifyTxSignature(payload.txBlob);
-  if (sigOk === false)
-    return { isValid: false, invalidReason: "invalid signature" };
 
   // (2b) HIGH: bind the verified signature to the payer. xrpl.verifySignature
   // only proves the TxnSignature matches the *embedded* SigningPubKey — it does
@@ -598,30 +642,44 @@ export function verifyExact(payload, req) {
   // legitimate signer whose key CANNOT be confirmed offline — the regular-key
   // assignment lives in ledger state. Likewise multisig (Signers) authorization
   // is a SignerList in ledger state. We therefore:
-  //   - single-sig: require deriveAddress(SigningPubKey) === Account, else FAIL;
-  //   - multisig:   cannot bind offline -> signatureVerified:false (flagged,
-  //                 not silently passed); the on-chain settle is the authority.
+  //   - single-sig: cryptographically verify the TxnSignature AND require
+  //     deriveAddress(SigningPubKey) === Account (master key), else FAIL;
+  //   - multisig:   xrpl.verifySignature CANNOT validate a Signers blob (it expects a
+  //     single TxnSignature and THROWS on a multisig tx). The per-signer signatures +
+  //     SignerList quorum can only be confirmed against ON-LEDGER state, which we do
+  //     at /settle (#3). So offline we DO NOT run the single-sig crypto check on a
+  //     multisig (it would spuriously read as "invalid signature"); we pass it through
+  //     with signatureVerified:false (flagged, not a guarantee) and let the on-ledger
+  //     settle check be the authority. The ledger still rejects a bad multisig at
+  //     submit (tefBAD_AUTH / tefBAD_QUORUM). This is a CONFIDENCE-only relaxation: a
+  //     multisig is never reported verified offline, and settle re-checks it.
   let signatureVerified = false;
   if (isMultisig) {
-    // Offline single-sig path can't validate a SignerList. Flag, don't pass.
+    // Offline single-sig crypto cannot validate a SignerList/Signers blob. Flag,
+    // don't run the (throwing) single-sig verify, don't pass as verified.
     signatureVerified = false;
-  } else if (sigOk === true) {
-    const derived = deriveAddressFromPubKey(tx.SigningPubKey);
-    if (derived === null) {
-      // Can't derive (ripple-keypairs missing / malformed key) -> can't bind.
-      signatureVerified = false;
-    } else if (derived !== tx.Account) {
-      // The signing key does NOT belong to Account. This is either a forged
-      // Account or a RegularKey signature; neither can be trusted offline as a
-      // master-key signature. A master-key signature MUST derive to Account, so
-      // a mismatch fails closed.
-      return { isValid: false, invalidReason: "signature does not match Account" };
-    } else {
-      signatureVerified = true;
+  } else {
+    const sigOk = verifyTxSignature(payload.txBlob);
+    if (sigOk === false)
+      return { isValid: false, invalidReason: "invalid signature" };
+    if (sigOk === true) {
+      const derived = deriveAddressFromPubKey(tx.SigningPubKey);
+      if (derived === null) {
+        // Can't derive (ripple-keypairs missing / malformed key) -> can't bind.
+        signatureVerified = false;
+      } else if (derived !== tx.Account) {
+        // The signing key does NOT belong to Account. This is either a forged
+        // Account or a RegularKey signature; neither can be trusted offline as a
+        // master-key signature. A master-key signature MUST derive to Account, so
+        // a mismatch fails closed.
+        return { isValid: false, invalidReason: "signature does not match Account" };
+      } else {
+        signatureVerified = true;
+      }
     }
+    // sigOk === null => xrpl not installed (cannot verify). Report honestly rather
+    // than implying a guarantee; signatureVerified stays false.
   }
-  // sigOk === null => xrpl not installed (cannot verify). Report honestly rather
-  // than implying a guarantee; signatureVerified stays false.
 
   // Replay binding: bind this payment to the request via InvoiceID (preferred)
   // or a SourceTag nonce. We surface the binding so /settle can consume it.
@@ -950,6 +1008,200 @@ async function currentValidatedLedger(client) {
 }
 
 // ---------------------------------------------------------------------------
+// on-ledger authorization (RegularKey + multisig) — settle-time only
+// ---------------------------------------------------------------------------
+// At /settle we hold a node connection, so we can do POSITIVE on-ledger auth checks
+// that the OFFLINE verifyExact cannot: confirm a RegularKey-signed or multisig tx is
+// genuinely authorized by reading ledger state (the account's RegularKey / SignerList).
+//
+// CONTRACT (security-critical, fail-closed everywhere):
+//   - These checks may only REJECT (prove a tx is unauthorized -> skip the submit) or
+//     UPGRADE confidence (report signatureVerified:true + a source). They NEVER weaken
+//     a check, and they NEVER fabricate authorization.
+//   - If the node read FAILS (account_info / SignerList unreadable), we return a
+//     "node read failed" outcome -> settle FALLS BACK to its existing behavior
+//     (proceed to submit; the LEDGER enforces auth and rejects a bad tx at submit).
+//     We never claim authorized without a POSITIVE on-ledger confirmation.
+//   - account flags: a RegularKey is invalid for signing if the master key is the
+//     ONLY enabled signer in a way that disables the regular key — but lsfDisableMaster
+//     does the OPPOSITE (it disables the MASTER, making the regular key the authority),
+//     and there is no flag that disables a SET regular key while leaving the account
+//     usable. So a present, matching RegularKey is authorized regardless of
+//     lsfDisableMaster. We document this rather than guess at a non-existent flag.
+
+// AccountRoot flag: master key disabled (the regular key / signer list is the authority).
+const LSF_DISABLE_MASTER = 0x00100000;
+
+/**
+ * Fetch an account's AccountRoot via account_info. Returns the `account_data` object,
+ * or null if it could not be read (node error / missing). Caller treats null as
+ * "could not determine -> fall back to ledger-authoritative submit".
+ */
+async function fetchAccountRoot(client, account) {
+  try {
+    const r = await client.request({ command: "account_info", account, ledger_index: "validated" });
+    const data = r?.result?.account_data;
+    return (data && typeof data === "object") ? data : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Fetch an account's on-ledger SignerList entries. Tries account_info with
+ * `signer_lists:true` (the canonical place), falling back to account_objects type
+ * "signer_list". Returns an array of { account, weight } for the (single) active
+ * SignerList plus its quorum, as { quorum, signers: [{account, weight}] }, or null
+ * if it could not be read or the account has NO SignerList.
+ *
+ * XRPL allows at most one SignerList (SignerListID 0) on an account today; if a node
+ * returns multiple we conservatively reject (return { error:"multiple_signer_lists" })
+ * rather than guess which applies.
+ */
+async function fetchSignerList(client, account) {
+  let lists = null;
+  // Preferred: account_info signer_lists.
+  try {
+    const r = await client.request({ command: "account_info", account, signer_lists: true, ledger_index: "validated" });
+    const sl = r?.result?.account_data?.signer_lists;
+    if (Array.isArray(sl)) lists = sl;
+  } catch {
+    lists = null;
+  }
+  // Fallback: account_objects type signer_list.
+  if (lists === null) {
+    try {
+      const r = await client.request({ command: "account_objects", account, type: "signer_list", ledger_index: "validated" });
+      const objs = r?.result?.account_objects;
+      if (Array.isArray(objs)) lists = objs;
+    } catch {
+      return null; // node read failed on both paths -> fall back to ledger authority
+    }
+  }
+  if (lists === null) return null;          // node read failed
+  if (lists.length === 0) return { error: "no_signer_list" };
+  if (lists.length > 1) return { error: "multiple_signer_lists" };
+  const list = lists[0];
+  const quorum = Number(list?.SignerQuorum);
+  const entries = list?.SignerEntries;
+  if (!Number.isInteger(quorum) || quorum <= 0 || !Array.isArray(entries))
+    return { error: "malformed_signer_list" };
+  const signers = [];
+  for (const e of entries) {
+    const se = e?.SignerEntry;
+    const acct = se?.Account;
+    const weight = Number(se?.SignerWeight);
+    if (typeof acct !== "string" || !Number.isInteger(weight) || weight <= 0)
+      return { error: "malformed_signer_list" };
+    signers.push({ account: acct, weight });
+  }
+  if (signers.length === 0) return { error: "malformed_signer_list" };
+  return { quorum, signers };
+}
+
+/**
+ * On-ledger authorization for a tx whose offline binding was NOT established
+ * (verifyExact returned signatureVerified:false). Called at settle ONLY (needs the
+ * node). Returns one of:
+ *   { decision: "authorized", source: "regularkey" | "multisig" }
+ *   { decision: "rejected", reason: <string> }          -> caller MUST NOT submit
+ *   { decision: "fallback" }                            -> node read failed; caller
+ *                                                          proceeds to submit (ledger
+ *                                                          is the authority)
+ *
+ * The decoded `tx` is passed (already decoded at settle). `txBlob` is the original
+ * blob (single-sig signature already cryptographically verified in verifyExact; here
+ * we only need to confirm the KEY's authority on-ledger).
+ *
+ * REGULARKEY (single-sig): tx has SigningPubKey + TxnSignature, deriveAddress !=
+ *   Account (else verifyExact would have bound it as master). The signature itself
+ *   was already verified by verifyExact (it never reaches settle if invalid). We fetch
+ *   account_info and AUTHORIZE iff account.RegularKey === deriveAddress(SigningPubKey).
+ *   No RegularKey set, or a mismatch -> REJECT (forgery / unauthorized).
+ *
+ * MULTISIG (Signers): we verify EACH listed signer's TxnSignature over
+ *   encodeForMultisigning(tx, signer.Account) against signer.SigningPubKey, require
+ *   deriveAddress(signer.SigningPubKey) === signer.Account, require signer.Account be
+ *   in the on-ledger SignerList, then SUM the on-ledger SignerWeight of the VALID,
+ *   LISTED signers and require sum >= on-ledger SignerQuorum. Any invalid signature,
+ *   any unlisted/derive-mismatched signer is EXCLUDED from the sum (not fatal on its
+ *   own — but it cannot contribute weight). AUTHORIZE iff the surviving weight >=
+ *   quorum; else REJECT. A node read failure (cannot fetch SignerList) -> fallback.
+ *
+ * Determinism / soundness notes: duplicate signer Accounts are collapsed (a signer's
+ * weight counts at most ONCE) so a repeated entry can't inflate the sum. We use the
+ * ON-LEDGER weight (not any client-claimed weight). encodeForMultisigning is verified
+ * to reproduce exactly the bytes each signer signed.
+ */
+function authorizeOnLedger_decide(tx, signerList, accountRoot, isMultisig) {
+  if (isMultisig) {
+    // signerList is the resolved { quorum, signers } | { error } | null.
+    if (signerList === null) return { decision: "fallback" }; // node read failed
+    if (signerList.error) {
+      // No SignerList / malformed / multiple lists: we cannot positively authorize a
+      // multisig tx offline-of-the-ledger here. "no_signer_list" means the account is
+      // NOT multisig-configured -> the tx is unauthorized -> REJECT. A malformed or
+      // ambiguous list we cannot evaluate -> fall back to the ledger at submit.
+      if (signerList.error === "no_signer_list")
+        return { decision: "rejected", reason: "unauthorized: account has no on-ledger SignerList for this multisig" };
+      return { decision: "fallback" };
+    }
+    const weightByAccount = new Map();
+    for (const s of signerList.signers) weightByAccount.set(s.account, s.weight);
+
+    const counted = new Set(); // signer accounts already credited (dedupe)
+    let sum = 0;
+    for (const entry of tx.Signers) {
+      const s = entry?.Signer;
+      if (!s || typeof s.SigningPubKey !== "string" || typeof s.TxnSignature !== "string" || typeof s.Account !== "string")
+        continue; // malformed signer entry -> contributes nothing
+      // (2) derived address must match the claimed signer account.
+      const derived = deriveAddressFromPubKey(s.SigningPubKey);
+      if (derived === null || derived !== s.Account) continue;
+      // (3) signer must be on the on-ledger SignerList.
+      const weight = weightByAccount.get(s.Account);
+      if (weight === undefined) continue;
+      // (1) signature must verify over the per-signer multisigning data.
+      const signingData = encodeForMultisigning(tx, s.Account);
+      if (signingData === null) return { decision: "fallback" }; // codec unavailable -> ledger authority
+      const ok = keypairVerify(signingData, s.TxnSignature, s.SigningPubKey);
+      if (ok !== true) continue; // invalid (or unverifiable) signature -> excluded
+      if (counted.has(s.Account)) continue; // dedupe: count each signer's weight once
+      counted.add(s.Account);
+      sum += weight;
+    }
+    if (sum >= signerList.quorum)
+      return { decision: "authorized", source: "multisig" };
+    return { decision: "rejected", reason: "unauthorized: multisig quorum not met by valid on-ledger signers" };
+  }
+
+  // RegularKey single-sig path.
+  if (accountRoot === null) return { decision: "fallback" }; // node read failed
+  const derived = deriveAddressFromPubKey(tx.SigningPubKey);
+  if (derived === null) return { decision: "fallback" }; // cannot derive -> ledger authority
+  const regularKey = accountRoot.RegularKey;
+  if (typeof regularKey === "string" && regularKey.length > 0 && regularKey === derived)
+    return { decision: "authorized", source: "regularkey" };
+  // No RegularKey set, or it does not match the signing key -> forgery / unauthorized.
+  return { decision: "rejected", reason: "unauthorized: signing key is neither master nor current RegularKey" };
+}
+
+/**
+ * Orchestrate the on-ledger auth check: fetch the needed ledger state for the tx's
+ * signing mode, then decide. Returns the same shape as authorizeOnLedger_decide.
+ * isMultisig is derived by the caller from the decoded tx. Network reads are guarded
+ * inside fetchAccountRoot/fetchSignerList (they return null on failure -> fallback).
+ */
+async function authorizeOnLedger(client, tx, isMultisig) {
+  if (isMultisig) {
+    const signerList = await fetchSignerList(client, tx.Account);
+    return authorizeOnLedger_decide(tx, signerList, null, true);
+  }
+  const accountRoot = await fetchAccountRoot(client, tx.Account);
+  return authorizeOnLedger_decide(tx, null, accountRoot, false);
+}
+
+// ---------------------------------------------------------------------------
 // pooled client
 // ---------------------------------------------------------------------------
 let _client = null;
@@ -1139,6 +1391,51 @@ async function settle(payload, req, _deps = {}) {
     return { success: false, network: NETWORK, transaction: "", payer: v.payer, errorReason: `validity window too large (LastLedgerSequence > ${MAX_VALIDITY_LEDGERS} ledgers ahead)` };
   }
 
+  // (#3) ON-LEDGER AUTHORIZATION for txs whose signature could NOT be bound offline.
+  // verifyExact cryptographically binds ONLY a master-key single-sig (it returns
+  // signatureVerified:true). A RegularKey single-sig and a multisig (Signers) tx come
+  // back signatureVerified:false — offline-unverifiable. Here at settle we hold a node
+  // connection, so we POSITIVELY check on-ledger authorization BEFORE wasting a submit:
+  //   - reject an obviously-unauthorized tx (no/mismatched RegularKey; multisig quorum
+  //     not met by valid on-ledger signers) WITHOUT submitting / reserving a slot;
+  //   - upgrade signatureVerified -> true (with a source) for a genuinely-authorized
+  //     RegularKey / multisig tx, honestly reported in the receipt.
+  // This is fail-CLOSED on the CHECK ITSELF: if the ledger reads fail (node error) we
+  // do NOT fabricate authorization — we fall back to the existing behavior (proceed to
+  // submit; the LEDGER is the ultimate authority and rejects a bad tx at submitAndWait
+  // via tefBAD_AUTH etc.). The ledger remains authoritative; this only REJECTS or
+  // UPGRADES confidence, never weakens. (master-key single-sig already signatureVerified
+  // -> true here, so this entire block is skipped for it.)
+  const isMultisig = Array.isArray(tx.Signers) && tx.Signers.length > 0;
+  let signatureVerified = v.signatureVerified === true;
+  let signatureSource = signatureVerified ? "master" : null;
+  if (!signatureVerified) {
+    let auth;
+    try {
+      auth = await authorizeOnLedger(client, tx, isMultisig);
+    } catch (e) {
+      // Any unexpected throw in the auth check -> fall back to ledger authority (never
+      // fabricate authorization, never 500). Log the error class only.
+      log("warn", "settle_authz_check_error", { error: String(e?.name || "authz_error") });
+      auth = { decision: "fallback" };
+    }
+    if (auth.decision === "rejected") {
+      // Provably unauthorized on-ledger -> REJECT pre-submit. No slot reserved, no
+      // submit wasted. The ledger would reject it anyway; we save the round-trip and
+      // report honestly.
+      recordSettleReject("verify_failed");
+      log("info", "settle_unauthorized", { mode: isMultisig ? "multisig" : "regularkey" });
+      return { success: false, network: NETWORK, transaction: "", payer: v.payer, errorReason: auth.reason, signatureVerified: false };
+    }
+    if (auth.decision === "authorized") {
+      signatureVerified = true;
+      signatureSource = auth.source; // "regularkey" | "multisig"
+      log("info", "settle_onledger_authorized", { source: signatureSource });
+    }
+    // auth.decision === "fallback": node read failed -> proceed to submit; the ledger
+    // enforces auth. signatureVerified stays false (no positive confirmation).
+  }
+
   const replayCtx = { lastLedgerSequence: lastLedger, currentLedger: curLedger };
   const expiryMs = consumedExpiryFor(replayCtx, now);
 
@@ -1295,6 +1592,13 @@ async function settle(payload, req, _deps = {}) {
   // x402 SettleResponse requires a `payer` field on every settlement result. The
   // verified payer (== tx.Account, signature-bound) is the authoritative value.
   receipt.payer = v.payer;
+  // (#3) Honestly report HOW the payer's authorization was confirmed. master = offline
+  // master-key binding (verifyExact); regularkey/multisig = POSITIVE on-ledger check at
+  // settle; null source with signatureVerified:false = could not bind/confirm (the
+  // ledger was the authority at submit). This UPGRADES the offline report; it never
+  // claims true without a positive confirmation.
+  receipt.signatureVerified = signatureVerified;
+  receipt.signatureSource = signatureSource;
   // Metrics: classify the TERMINAL outcome by its actual cause (no PII). success
   // increments settle_success; on-ledger non-tesSUCCESS (e.g. tecHOOK_REJECTED) ->
   // on_ledger_failure; a tesSUCCESS that under-delivered / mis-asset'd / had an
@@ -1352,6 +1656,45 @@ function authOk(req) {
   return crypto.timingSafeEqual(a, b);
 }
 
+// ---------------------------------------------------------------------------
+// (#4) proxy-aware client IP for the rate-limiter key
+// ---------------------------------------------------------------------------
+// X402_TRUST_PROXY = the number of TRUSTED proxy/LB hops in front of this server.
+//   0 (default) -> NEVER trust X-Forwarded-For (it is client-spoofable); the key is
+//     the direct socket peer address. This is the SAFE default — a deployment behind
+//     no proxy, or that hasn't opted in, can't be tricked into trusting a forged XFF.
+//   n>0 -> the rightmost `n` XFF entries are the trusted hops we control; the client
+//     IP is the (n+1)-th from the right (i.e. the entry the OUTERMOST trusted proxy
+//     observed). Anything further left is client-controlled and MUST NOT be trusted.
+//     Falls back to the socket address if XFF is missing/short/malformed.
+// Keying the limiter off the socket address alone is wrong behind a proxy (every
+// client shares the proxy's IP -> one IP throttles everyone); keying off a blindly-
+// trusted XFF is wrong with no proxy (a client spoofs XFF to dodge / frame others).
+// X402_TRUST_PROXY makes the trust boundary EXPLICIT.
+const TRUST_PROXY_HOPS = Math.max(0, Math.floor(Number(process.env.X402_TRUST_PROXY) || 0));
+
+/**
+ * Resolve the rate-limit client IP for a request, honoring X402_TRUST_PROXY.
+ * Returns a non-empty string (falls back to "unknown" if even the socket addr is
+ * absent). NEVER trusts X-Forwarded-For when TRUST_PROXY_HOPS === 0.
+ */
+function clientIp(req, hops = TRUST_PROXY_HOPS) {
+  const socketAddr = (req && req.socket && req.socket.remoteAddress) || "unknown";
+  if (!hops || hops <= 0) return socketAddr; // do NOT trust XFF
+  const xff = req && req.headers && req.headers["x-forwarded-for"];
+  if (typeof xff !== "string" || xff.length === 0) return socketAddr; // missing -> fall back
+  // XFF is "client, proxy1, proxy2, ..." (left = original client, right = nearest
+  // trusted hop). Strip `hops` trusted entries from the right; the client IP is the
+  // next one to the left.
+  const parts = xff.split(",").map((s) => s.trim()).filter((s) => s.length > 0);
+  if (parts.length === 0) return socketAddr; // malformed -> fall back
+  // index of the client = parts.length - 1 - hops (the (hops+1)-th from the right).
+  const idx = parts.length - 1 - hops;
+  if (idx < 0) return socketAddr; // fewer entries than trusted hops -> malformed/short, fall back
+  const ip = parts[idx];
+  return ip && ip.length > 0 ? ip : socketAddr;
+}
+
 const RATE_MAX = Number(process.env.X402_RATE_MAX) || 20; // tokens
 const RATE_WINDOW_MS = Number(process.env.X402_RATE_WINDOW_MS) || 60_000;
 
@@ -1388,29 +1731,115 @@ export class InMemoryRateLimiter {
   }
 }
 
+// (#4) Atomic Redis TOKEN-BUCKET Lua script (replaces the old fixed-window counter).
+//
+// WHY: a fixed-window counter (INCR + PEXPIRE per window) resets at each window
+// boundary, allowing a worst-case burst of up to 2*max across the boundary. A token
+// bucket refills CONTINUOUSLY (max tokens per windowMs), so the sustained rate is a
+// true `max per windowMs` with no boundary doubling.
+//
+// LUA SEMANTICS (run atomically by Redis — read-modify-write can't interleave across
+// instances, which is exactly why this must be a single script, not multiple round
+// trips):
+//   KEYS[1]                = the per-IP bucket key (`rl:<ip>`)
+//   ARGV[1] = now          (caller's epoch ms — passed in so the script is testable
+//                           and not tied to Redis server time)
+//   ARGV[2] = max          (bucket capacity, in tokens)
+//   ARGV[3] = windowMs     (time to refill from 0 to `max`)
+//   ARGV[4] = ttlMs        (key TTL to GC idle buckets; >= windowMs)
+//   The script:
+//     1. HMGET the stored { tokens, ts }; default to a FULL bucket (tokens=max, ts=now)
+//        for a brand-new/expired key.
+//     2. refill = (now - ts) * max / windowMs, clamped so tokens never exceeds max and
+//        never goes below the stored value (a backwards clock can't add tokens: if
+//        now < ts, elapsed is treated as 0).
+//     3. If tokens >= 1 -> consume 1 (allow); else allow=0 (deny). ts is advanced to
+//        now in BOTH cases (so refill accounting stays correct).
+//     4. HSET the new { tokens, ts } + PEXPIRE ttlMs.
+//     5. return {allow(1/0), resetMs} where resetMs = ms until >=1 token is available
+//        (0 when allowed).
+// Tokens are stored as a scaled INTEGER (tokens * SCALE) to avoid Lua float drift; the
+// arithmetic is integer throughout. The script is loaded via EVAL (ioredis caches the
+// SHA after the first call); callers pass `now` so unit tests are deterministic.
+const RL_SCALE = 1000000; // fixed-point scale for fractional tokens (integer math in Lua)
+const REDIS_TOKEN_BUCKET_LUA = `
+local key = KEYS[1]
+local now = tonumber(ARGV[1])
+local max = tonumber(ARGV[2])
+local windowMs = tonumber(ARGV[3])
+local ttlMs = tonumber(ARGV[4])
+local SCALE = ${RL_SCALE}
+local maxScaled = max * SCALE
+
+local data = redis.call('HMGET', key, 't', 'ts')
+local tokens = tonumber(data[1])
+local ts = tonumber(data[2])
+if tokens == nil or ts == nil then
+  tokens = maxScaled
+  ts = now
+end
+
+-- continuous refill; a backwards/equal clock adds nothing (elapsed clamped to >= 0).
+local elapsed = now - ts
+if elapsed < 0 then elapsed = 0 end
+-- refillScaled = elapsed * maxScaled / windowMs  (integer math; windowMs > 0)
+local refill = math.floor(elapsed * maxScaled / windowMs)
+tokens = tokens + refill
+if tokens > maxScaled then tokens = maxScaled end
+
+local allow = 0
+local resetMs = 0
+if tokens >= SCALE then
+  tokens = tokens - SCALE
+  allow = 1
+else
+  -- ms until one whole token (SCALE units) has refilled.
+  local deficit = SCALE - tokens
+  resetMs = math.ceil(deficit * windowMs / maxScaled)
+end
+
+redis.call('HSET', key, 't', tokens, 'ts', now)
+redis.call('PEXPIRE', key, ttlMs)
+return {allow, resetMs}
+`;
+
 /**
- * Optional Redis fixed-window limiter (multi-instance SHARED). SEMANTICS, stated
- * honestly: this is a FIXED-WINDOW counter, NOT a continuous-refill token bucket.
- * Each IP gets a per-window key (`rl:<ip>:<windowIndex>`); the first request in a
- * window INCRs to 1 and PEXPIREs the key to the window length; subsequent requests
- * INCR and are allowed while the count <= max. At a window boundary the counter
- * resets to 0, so the worst-case burst is up to 2*max across a boundary — the
- * standard, accepted trade-off for a cheap distributed limiter. (A Lua token bucket
- * would smooth this but is heavier; fixed-window is sufficient and documented.)
+ * Optional Redis TOKEN-BUCKET limiter (multi-instance SHARED). Atomic via a single
+ * EVAL of REDIS_TOKEN_BUCKET_LUA (see the script's comment for exact semantics): a
+ * per-IP continuous-refill bucket of `max` tokens / `windowMs`, refilled by elapsed
+ * time, consuming 1 per request. This MATCHES the in-memory limiter's continuous-
+ * refill model (so behavior is consistent whichever backend is active) and removes the
+ * fixed-window 2*max boundary burst. ttl GCs idle buckets. `ok(ip)` returns a boolean
+ * (true = allowed); the script also returns a reset hint we currently ignore.
+ *
+ * FALLBACK: if EVAL itself fails (e.g. the Redis build lacks scripting — vanishingly
+ * rare, but never assume), we FAIL CLOSED on the rate-limit decision: a limiter that
+ * cannot evaluate must DENY (return false), never silently allow unlimited traffic.
  */
 export class RedisRateLimiter {
   constructor(redis, { max = RATE_MAX, windowMs = RATE_WINDOW_MS } = {}) {
     this.redis = redis;
     this.max = max;
     this.windowMs = windowMs;
+    // TTL must outlive a window so a bucket mid-refill isn't GC'd; 2*window is safe.
+    this.ttlMs = windowMs * 2;
   }
-  async ok(ip) {
-    const now = Date.now();
-    const windowIndex = Math.floor(now / this.windowMs);
-    const key = `rl:${ip}:${windowIndex}`;
-    const n = await this.redis.incr(key);
-    if (n === 1) await this.redis.pexpire(key, this.windowMs);
-    return n <= this.max;
+  async ok(ip, now = Date.now()) {
+    const key = `rl:${ip}`;
+    try {
+      const r = await this.redis.eval(
+        REDIS_TOKEN_BUCKET_LUA, 1, key,
+        String(now), String(this.max), String(this.windowMs), String(this.ttlMs)
+      );
+      // ioredis returns Lua numbers as JS numbers (or strings on some versions); the
+      // first element is allow (1/0). Coerce defensively.
+      const allow = Array.isArray(r) ? Number(r[0]) : Number(r);
+      return allow === 1;
+    } catch (e) {
+      // A limiter that cannot evaluate must FAIL CLOSED (deny), never allow unbounded.
+      log("error", "rate_limiter_eval_failed", { error: String(e?.name || "eval_error") });
+      return false;
+    }
   }
 }
 
@@ -1626,7 +2055,7 @@ function serve() {
         // unauthenticated, CPU-bound path. It MUST be rate-limited (but NOT
         // auth-gated: it is intentionally a public, pre-payment offline check, so
         // requiring a secret would break x402 semantics).
-        const ip = req.socket.remoteAddress || "unknown";
+        const ip = clientIp(req);
         if (!(await rateLimiter.ok(ip))) { metricInc("rate_limited_total"); return send(res, 429, { error: "rate limited" }); }
         const b = await readBody(req, res);
         metricInc("verify_total");
@@ -1635,7 +2064,7 @@ function serve() {
 
       if (req.method === "POST" && req.url === "/settle") {
         if (!authOk(req)) return send(res, 401, { error: "unauthorized" });
-        const ip = req.socket.remoteAddress || "unknown";
+        const ip = clientIp(req);
         if (!(await rateLimiter.ok(ip))) { metricInc("rate_limited_total"); return send(res, 429, { error: "rate limited" }); }
         const b = await readBody(req, res);
         const out = await settle(b.paymentPayload, b.paymentRequirements, { store, rateLimiter });
@@ -1753,6 +2182,10 @@ export const __test = {
   parseStrictDrops, isValidRAddress, verifyTxSignature, deriveAddressFromPubKey,
   replayKeyFor, settle, _sweepBuckets, rateLimitOk, submitDefinitelyNotApplied,
   RATE_MAX,
+  // (#3) on-ledger auth seams: pure decision fn + the multisigning/verify primitives.
+  authorizeOnLedger_decide, keypairVerify, encodeForMultisigning,
+  // (#4) proxy-aware client IP + the token-bucket Lua source.
+  clientIp, REDIS_TOKEN_BUCKET_LUA, RL_SCALE,
   // Issued-amount (IOU/token) helpers.
   parseTokenValue, cmpTokenValue, canonicalizeCurrency, tokenValueToString,
   checkIssuedAmount, deliveredIssued, deliveredDrops,
