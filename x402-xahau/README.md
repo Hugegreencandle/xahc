@@ -1,10 +1,10 @@
 # exact-xahau — reference x402 facilitator for Xahau
 
-> Also available as a standalone repo: **[github.com/Hugegreencandle/x402-xahau](https://github.com/Hugegreencandle/x402-xahau)** (history-preserved mirror of this directory).
+> Also available as a standalone repo: **[github.com/Hugegreencandle/x402-xahau](https://github.com/Hugegreencandle/x402-xahau)** (history-preserved mirror of this directory). Part of the Xahau Hooks quartet: written with [xahc](https://github.com/Hugegreencandle/xahc), simulated with [xahau-mcp](https://github.com/Hugegreencandle/xahau-mcp), proven safe with [xahc-prover](https://github.com/Hugegreencandle/xahc-prover).
 
-A runnable reference for the proposed `exact-xahau` x402 scheme
-(spec: [../docs/X402-XAHAU.md](../docs/X402-XAHAU.md)). It turns that proposal
-into working code so the design can be exercised and ratified.
+A runnable reference for the proposed `exact-xahau` x402 scheme (spec:
+[`X402-XAHAU.md` in the xahc repo](https://github.com/Hugegreencandle/xahc/blob/main/docs/X402-XAHAU.md)).
+It turns that proposal into working code so the design can be exercised and ratified.
 
 ## What it does
 
@@ -15,6 +15,36 @@ into working code so the design can be exercised and ratified.
 | `POST /settle` | Submit the signed tx to Xahau (`submitAndWait`) |
 | `GET /health` | Liveness JSON. **Minimal** `{ status, network, uptimeSec }` unauthenticated (LB probe); verbose internals require the shared secret |
 | `GET /metrics` | Counters as JSON (or Prometheus text on `Accept: text/plain`). **Auth-gated** behind the shared secret (open in reference mode) |
+| `GET /policy/:account` | **On-ledger budget introspection** — read the account's installed xahc guardrail Hook and surface its spending policy (per-tx `LIM` cap + `DST` allowlist) straight from the chain. Read-only, public. Needs `XAHAU_WSS` (503 if unset). Fail-transparent |
+| `GET /pubkey` | The facilitator's **ed25519 receipt verification key** (`{ alg, pubkey }`, raw 32-byte hex). Public. Lets a resource server verify signed receipts **offline** |
+| `GET /status/:id` | Look up a stored settlement by its `replayId` (or `hash:<txhash>`). **Auth-gated** (exposes payment data; open in reference mode). Honest `unknown` when not found/expired |
+| `POST /simulate` | **(Optional, config-gated)** Predict the guardrail Hook's accept/rollback for a payment **without submitting** (advisory). Only enabled when `X402_MCP_URL` is set (else 404) |
+
+### New features (summary)
+
+- **On-ledger policy (`GET /policy/:account`)** — the agent's spending policy *lives in a
+  Hook*, so this is the one thing no other x402 facilitator can report. We read
+  `account_objects type:hook`, identify the `agent_guardrail` Hook by its `LIM`
+  HookParameter, and decode `LIM` (8-byte big-endian drops per-tx cap) + `DST` (20-byte
+  account-id → r-address allowlist). The `agent_guardrail` Hook is **stateless** (a per-tx
+  cap, not a running budget): we report `stateful:false` and never invent a `remaining`.
+  **Fail-transparent:** any node/decode error returns `policy:null` + an honest `note` —
+  **never** a fabricated limit. A wrong policy readout would be a credibility bug.
+- **Signed receipts + `GET /pubkey`** — every **successful** settlement attaches a
+  facilitator-signed `proof` (ed25519) over a **canonical, deterministic** serialization of
+  the receipt's load-bearing fields, so a resource server can verify it **offline** with just
+  the pubkey. Failed/rejected settlements carry `proof:null` (a receipt proves a settlement
+  *occurred*, not future behavior). See the verification recipe below.
+- **`scheme: "exact" | "upto"`** — `paymentRequirements.scheme` selects the amount check:
+  `exact` ⇒ paid **must equal** `maxAmountRequired` (strict, native + IOU exact compare);
+  `upto` ⇒ paid `<=` max. **Default when `scheme` is absent = today's behavior** (the
+  `<=` ceiling, identical to `upto`) — fully back-compatible.
+- **Advisory simulation (`POST /simulate`, `dryRun`)** — when `X402_MCP_URL` is set, predict
+  the Hook outcome via xahau-mcp **without submitting**. **Advisory only:** it never changes
+  settle's security semantics (a predicted-accept still runs the full real settle). A
+  `dryRun:true` on `/settle` returns the prediction and does not submit; the opt-in
+  `preSimReject:true` may skip the submit on a *predicted-reject* (clearly labeled, reserves
+  no replay slot). Fails soft — a sim error never blocks the real settle.
 
 `/verify` decodes the payload with Xahau's binary codec and enforces (every
 check is mandatory — a missing bound is a **failure**, never a skip):
@@ -125,6 +155,16 @@ XAHAU_WSS=wss://… npm start   # enable /settle against a Xahau node
 #   XAHAU_NETWORK=xahau-testnet   expect NetworkID 21338 instead of 21337
 #   X402_REDIS_URL=redis://…      use a SHARED, durable replay store + limiter
 #                                 (needs `npm i ioredis`; fails fast if missing)
+#   X402_RECEIPT_SECRET=<hex|base64>  32-byte ed25519 SEED for signing receipts.
+#                                 If UNSET, an EPHEMERAL key is generated at boot (a
+#                                 warning is logged; receipts won't persist across
+#                                 restarts — resource servers must re-fetch /pubkey).
+#                                 The secret is NEVER logged.
+#   X402_MCP_URL=https://…/simulate   xahau-mcp HTTP shim for ADVISORY pre-settle
+#                                 simulation. When SET, enables POST /simulate +
+#                                 dryRun/preSimReject on /settle. When UNSET the
+#                                 feature is entirely OFF (no coupling, /simulate=404).
+#   X402_MCP_TIMEOUT_MS=5000      per-call simulation fetch timeout (fails soft)
 # operational (optional env):
 #   X402_CONNECT_TIMEOUT_MS=8000  per-attempt xrpl connect timeout
 #   X402_CONNECT_ATTEMPTS=3       bounded reconnect attempts (then fail closed)
@@ -159,6 +199,95 @@ curl -X POST localhost:4021/verify -d '{
   }
 }'
 ```
+
+```sh
+# On-ledger spending policy (reads the payer's guardrail Hook). Needs XAHAU_WSS.
+curl localhost:4021/policy/rMWaeQoWNZoKvuaiUh59z7eHWz6qsToPbg
+# -> { "account":"r...", "guardrailHookPresent":true,
+#      "policy": { "perTxLimitDrops":"5000000", "allowlist":["rPsf6..."],
+#                  "stateful":false, "note":"per-tx spend cap (stateless guardrail)..." },
+#      "source":"on-ledger", "asOfLedger": 9720000 }
+# Fail-transparent: node down / undecodable -> { ..., "policy":null, "note":"... unknown" }.
+
+# Facilitator receipt public key (for OFFLINE receipt verification).
+curl localhost:4021/pubkey            # -> { "alg":"ed25519", "pubkey":"<64-hex>" }
+
+# Look up a stored settlement (auth-gated when a secret is set).
+curl -H 'x-x402-secret: …' localhost:4021/status/acct:rPAYER:1234
+# -> { "found":true, "status":"settled", "receipt": { ... , "proof": {...} } }   (or found:false/unknown)
+
+# Pre-settle simulation (advisory; only when X402_MCP_URL is set).
+curl -X POST localhost:4021/simulate -d '{ "paymentPayload":{...}, "paymentRequirements":{...} }'
+# -> { "advisory":true, "simulation": { "available":true, "prediction":"accept"|"reject"|"unknown" } }
+
+# Exact-amount scheme (paid must EQUAL maxAmountRequired); upto = the default ceiling.
+curl -X POST localhost:4021/verify -d '{
+  "paymentPayload": {"txBlob":"<hex>"},
+  "paymentRequirements": {"payTo":"r...","maxAmountRequired":"1000000","network":"xahau","scheme":"exact"}
+}'
+
+# Dry-run a settle (predict + DO NOT submit / reserve). preSimReject:true opts into the
+# fee-saving predicted-reject short-circuit. Both are ADVISORY.
+curl -X POST -H 'x-x402-secret: …' localhost:4021/settle -d '{
+  "paymentPayload": {...}, "paymentRequirements": {...}, "dryRun": true
+}'
+```
+
+## Verifying a signed receipt offline
+
+Every **successful** `/settle` returns a receipt with a `proof`:
+
+```json
+{
+  "success": true, "transaction": "<txhash>", "network": "xahau",
+  "delivered": "1000000", "payer": "rPAYER", "payTo": "rPAYEE",
+  "txHash": "<txhash>", "required": "1000000", "asset": null, "ts": 1700000000000,
+  "proof": { "alg": "ed25519", "pubkey": "<64-hex>", "sig": "<128-hex>" }
+}
+```
+
+A resource server can verify it **offline** with just the facilitator's `/pubkey`. The
+signature is ed25519 over the **canonical bytes** of the receipt's load-bearing fields.
+**Canonical-bytes recipe** (the verifier MUST reproduce these exact bytes):
+
+1. Build the object with **exactly** these keys (an absent value is the JSON literal
+   `null`, never dropped): `{ v: 1, network, txHash, payer, payTo, asset, delivered,
+   required, ts }`.
+2. JSON-serialize with **keys sorted ascending at every level** and **no whitespace**
+   (recursive; arrays keep order). Non-finite numbers are not allowed.
+3. UTF-8 encode → those are the signed bytes. Verify `proof.sig` (hex) against the bytes
+   using `proof.pubkey` (raw 32-byte ed25519 key, hex).
+
+You should also confirm `proof.pubkey` equals the key you fetched from a trusted
+`GET /pubkey` — a valid signature under an *unknown* key is not trust.
+
+```js
+import crypto from "node:crypto";
+// `canon` = sorted-key, no-whitespace JSON (see step 2).
+const canon = (v) => v === null ? "null"
+  : typeof v === "string" || typeof v === "number" ? JSON.stringify(v)
+  : typeof v === "boolean" ? (v ? "true" : "false")
+  : Array.isArray(v) ? "[" + v.map(canon).join(",") + "]"
+  : "{" + Object.keys(v).filter(k => v[k] !== undefined).sort()
+      .map(k => JSON.stringify(k) + ":" + canon(v[k])).join(",") + "}";
+
+function verifyReceipt(r, expectedPubkey) {
+  const p = r.proof;
+  if (!p || p.alg !== "ed25519" || p.pubkey !== expectedPubkey) return false;
+  const payload = { v: 1, network: r.network, txHash: r.txHash, payer: r.payer,
+    payTo: r.payTo, asset: r.asset ?? null, delivered: r.delivered ?? null,
+    required: r.required ?? null, ts: r.ts };
+  const bytes = Buffer.from(canon(payload), "utf8");
+  const key = crypto.createPublicKey({ format: "jwk",
+    key: { kty: "OKP", crv: "Ed25519", x: Buffer.from(p.pubkey, "hex").toString("base64url") } });
+  return crypto.verify(null, bytes, key, Buffer.from(p.sig, "hex"));
+}
+```
+
+The facilitator also **exports** `verifyReceipt(receipt, { expectedPubkey })` from
+`server.mjs` for in-process verification. **Scope:** a receipt proves a settlement
+*occurred* (and the delivered amount), **not** future behavior. The on-ledger guardrail
+Hook (when installed) is the L1 spending authority — see `/policy/:account`.
 
 ## Operational hardening
 

@@ -460,6 +460,220 @@ function checkIssuedAmount(amount, asset, maxTokenValue) {
   return { value: v };
 }
 
+// ---------------------------------------------------------------------------
+// FEATURE 2 — verifiable signed receipts (ed25519, offline-verifiable)
+// ---------------------------------------------------------------------------
+// Every SUCCESSFUL settlement is signed by the facilitator over a CANONICAL,
+// deterministic byte-serialization of the receipt's load-bearing fields, so a
+// resource server can verify the receipt OFFLINE with just the facilitator's
+// public key (GET /pubkey). Only tesSUCCESS+delivered>=required settlements are
+// signed; a failed/rejected/replayed-failure settle carries proof:null.
+//
+// Signing key: ed25519 via node crypto (zero new deps). Sourced from env
+// X402_RECEIPT_SECRET (a 32-byte seed, hex or base64). If unset, an EPHEMERAL
+// keypair is generated at boot and a clear WARNING is logged — receipts won't
+// persist across restarts (resource servers must re-fetch /pubkey). The secret /
+// private key is NEVER logged.
+//
+// CANONICAL BYTES RECIPE (the verifier MUST reconstruct these exact bytes):
+//   1. Build the object { v, network, txHash, payer, payTo, asset, delivered,
+//      required, ts } using EXACTLY these keys (omit none; an absent value is the
+//      JSON literal null, never undefined-dropped).
+//   2. JSON.stringify with keys sorted ascending and NO whitespace
+//      (canonicalJSONStringify below: deterministic key order, recursive).
+//   3. UTF-8 encode -> those are the signed bytes.
+//   The signature is ed25519 over those bytes; pubkey is the raw 32-byte key as
+//   lowercase hex. proof = { alg:"ed25519", pubkey, sig } (sig = hex).
+
+// ASN.1 prefix for a PKCS#8-wrapped raw ed25519 seed (RFC 8410). Prepending this
+// to a 32-byte seed yields a DER PKCS#8 private key node crypto can import.
+const ED25519_PKCS8_PREFIX = Buffer.from("302e020100300506032b657004220420", "hex");
+
+/**
+ * Deterministic, canonical JSON serialization: object keys sorted ascending at
+ * every level, arrays in order, no whitespace. This is the LOAD-BEARING contract
+ * a verifier reconstructs — it must be stable regardless of insertion order. We
+ * intentionally support only the JSON value types a receipt uses (object, array,
+ * string, number, boolean, null); a non-finite number or undefined is rejected
+ * (throws) rather than silently producing bytes a verifier can't reproduce.
+ */
+function canonicalJSONStringify(value) {
+  if (value === null) return "null";
+  const t = typeof value;
+  if (t === "string") return JSON.stringify(value);
+  if (t === "boolean") return value ? "true" : "false";
+  if (t === "number") {
+    if (!Number.isFinite(value)) throw new Error("canonicalJSON: non-finite number");
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) return "[" + value.map(canonicalJSONStringify).join(",") + "]";
+  if (t === "object") {
+    const keys = Object.keys(value).filter((k) => value[k] !== undefined).sort();
+    return "{" + keys.map((k) => JSON.stringify(k) + ":" + canonicalJSONStringify(value[k])).join(",") + "}";
+  }
+  throw new Error(`canonicalJSON: unsupported type ${t}`);
+}
+
+/**
+ * Project a receipt to the canonical, signable payload. EXACTLY these keys, in a
+ * fixed shape — both the signer and any verifier build this same projection so the
+ * canonical bytes match. `delivered`/`asset` may be null (native vs IOU); we keep
+ * the key present with a null value rather than dropping it, so the shape is fixed.
+ */
+function receiptSignablePayload({ network, txHash, payer, payTo, asset, delivered, required, ts }) {
+  return {
+    v: 1,
+    network: network ?? null,
+    txHash: txHash ?? null,
+    payer: payer ?? null,
+    payTo: payTo ?? null,
+    asset: asset ?? null,
+    delivered: delivered ?? null,
+    required: required ?? null,
+    ts: ts ?? null,
+  };
+}
+
+// Lazily-built ed25519 signing key (private + raw-hex public). Null until init.
+let _receiptKey = null;       // { privateKey: KeyObject, pubHex: string }
+let _receiptKeyEphemeral = false;
+
+/**
+ * Build a node-crypto ed25519 private KeyObject from a 32-byte seed.
+ * Returns the KeyObject, or null if the seed is the wrong size / unparseable.
+ */
+function ed25519KeyFromSeed(seed) {
+  if (!Buffer.isBuffer(seed) || seed.length !== 32) return null;
+  try {
+    const pkcs8 = Buffer.concat([ED25519_PKCS8_PREFIX, seed]);
+    return crypto.createPrivateKey({ key: pkcs8, format: "der", type: "pkcs8" });
+  } catch { return null; }
+}
+
+/** Raw 32-byte public key (lowercase hex) for an ed25519 private/public KeyObject. */
+function ed25519PubHex(keyObject) {
+  const pub = keyObject.type === "private" ? crypto.createPublicKey(keyObject) : keyObject;
+  const jwk = pub.export({ format: "jwk" });
+  return Buffer.from(jwk.x, "base64url").toString("hex");
+}
+
+/**
+ * Parse X402_RECEIPT_SECRET (hex or base64/base64url) into a 32-byte seed Buffer,
+ * or null if absent/malformed. NEVER logs the value.
+ */
+function parseReceiptSecret(raw) {
+  if (typeof raw !== "string" || raw.length === 0) return null;
+  const s = raw.trim();
+  // hex (64 chars)?
+  if (/^[0-9a-fA-F]{64}$/.test(s)) { try { return Buffer.from(s, "hex"); } catch { return null; } }
+  // base64 / base64url -> 32 bytes?
+  try {
+    const b = Buffer.from(s, "base64");
+    if (b.length === 32) return b;
+  } catch { /* fall through */ }
+  return null;
+}
+
+/**
+ * Initialize the receipt signing key (idempotent). Uses X402_RECEIPT_SECRET when a
+ * valid 32-byte seed is present; otherwise generates an EPHEMERAL key and logs a
+ * clear WARNING (once). Returns { pubHex, ephemeral }. The private key is held in a
+ * KeyObject and never serialized/logged. A malformed-but-present secret FAILS the
+ * derivation and falls back to ephemeral with a distinct warning (never silently
+ * uses a wrong key).
+ */
+function initReceiptKey(env = process.env) {
+  if (_receiptKey) return { pubHex: _receiptKey.pubHex, ephemeral: _receiptKeyEphemeral };
+  const seed = parseReceiptSecret(env.X402_RECEIPT_SECRET);
+  if (seed) {
+    const priv = ed25519KeyFromSeed(seed);
+    if (priv) {
+      _receiptKey = { privateKey: priv, pubHex: ed25519PubHex(priv) };
+      _receiptKeyEphemeral = false;
+      logInfo("receipt_key_loaded", { source: "env", alg: "ed25519" });
+      return { pubHex: _receiptKey.pubHex, ephemeral: false };
+    }
+    // Present but unusable -> do NOT silently proceed with a wrong key; warn + ephemeral.
+    logWarn("receipt_key_secret_invalid", { note: "X402_RECEIPT_SECRET set but not a valid 32-byte seed (hex/base64) — using an EPHEMERAL key" });
+  } else if (typeof env.X402_RECEIPT_SECRET === "string" && env.X402_RECEIPT_SECRET.length > 0) {
+    logWarn("receipt_key_secret_invalid", { note: "X402_RECEIPT_SECRET set but not a valid 32-byte seed (hex/base64) — using an EPHEMERAL key" });
+  }
+  const { privateKey } = crypto.generateKeyPairSync("ed25519");
+  _receiptKey = { privateKey, pubHex: ed25519PubHex(privateKey) };
+  _receiptKeyEphemeral = true;
+  logWarn("receipt_key_ephemeral", { note: "no X402_RECEIPT_SECRET — receipts are signed with an EPHEMERAL key that changes on restart; resource servers must re-fetch /pubkey", alg: "ed25519" });
+  return { pubHex: _receiptKey.pubHex, ephemeral: true };
+}
+
+/** The facilitator's receipt public key as { alg, pubkey } (raw 32-byte hex). */
+function receiptPubkey() {
+  const k = initReceiptKey();
+  return { alg: "ed25519", pubkey: k.pubHex };
+}
+
+/**
+ * Sign the canonical bytes of a receipt's signable payload. Returns the proof
+ * object { alg:"ed25519", pubkey, sig } (both hex), or null if signing is
+ * impossible (should not happen — key is always available after init). The bytes
+ * signed are EXACTLY canonicalJSONStringify(receiptSignablePayload(fields)) in UTF-8.
+ */
+function signReceipt(fields) {
+  try {
+    initReceiptKey();
+    const payload = receiptSignablePayload(fields);
+    const bytes = Buffer.from(canonicalJSONStringify(payload), "utf8");
+    const sig = crypto.sign(null, bytes, _receiptKey.privateKey);
+    return { alg: "ed25519", pubkey: _receiptKey.pubHex, sig: sig.toString("hex") };
+  } catch (e) {
+    log("warn", "receipt_sign_failed", { error: String(e?.name || "sign_error") });
+    return null;
+  }
+}
+
+/**
+ * OFFLINE receipt verification (exported for resource servers). Given a receipt that
+ * carries `proof: { alg, pubkey, sig }`, reconstruct the canonical signable bytes
+ * from the receipt's own fields and verify the ed25519 signature against the proof's
+ * pubkey. Returns true iff the signature is valid for those exact bytes; false
+ * otherwise (missing/malformed proof, tampered field, wrong key, bad sig). NEVER
+ * throws. NOTE: this proves the BYTES were signed by the holder of `proof.pubkey`;
+ * the caller must separately check that `proof.pubkey` is the facilitator's expected
+ * key (from a trusted GET /pubkey fetch) — a valid sig under an UNKNOWN key is not
+ * trust. We expose that as a soundness contract, not an implicit guarantee.
+ */
+export function verifyReceipt(receipt, { expectedPubkey } = {}) {
+  try {
+    if (!receipt || typeof receipt !== "object") return false;
+    const proof = receipt.proof;
+    if (!proof || typeof proof !== "object") return false;
+    if (proof.alg !== "ed25519") return false;
+    if (typeof proof.pubkey !== "string" || !/^[0-9a-fA-F]{64}$/.test(proof.pubkey)) return false;
+    if (typeof proof.sig !== "string" || !/^[0-9a-fA-F]+$/.test(proof.sig) || proof.sig.length % 2 !== 0) return false;
+    if (expectedPubkey !== undefined && proof.pubkey.toLowerCase() !== String(expectedPubkey).toLowerCase()) return false;
+    // Reconstruct the signable payload from the RECEIPT's fields (the same projection
+    // the signer used). A tampered field changes the bytes -> verification fails.
+    const payload = receiptSignablePayload({
+      network: receipt.network,
+      txHash: receipt.txHash,
+      payer: receipt.payer,
+      payTo: receipt.payTo,
+      asset: receipt.asset,
+      delivered: receipt.delivered,
+      required: receipt.required,
+      ts: receipt.ts,
+    });
+    const bytes = Buffer.from(canonicalJSONStringify(payload), "utf8");
+    const rawPub = Buffer.from(proof.pubkey, "hex");
+    const pubKeyObj = crypto.createPublicKey({
+      key: { kty: "OKP", crv: "Ed25519", x: rawPub.toString("base64url") },
+      format: "jwk",
+    });
+    return crypto.verify(null, bytes, pubKeyObj, Buffer.from(proof.sig, "hex"));
+  } catch {
+    return false; // any parse/crypto error -> NOT verified (never throw, never fabricate)
+  }
+}
+
 /**
  * Cryptographically verify the tx blob's signature against its SigningPubKey
  * (single-sig) using the xrpl library. Returns true/false; null if xrpl is not
@@ -554,6 +768,21 @@ export function verifyExact(payload, req) {
   if (!isValidRAddress(req.payTo))
     return { isValid: false, invalidReason: "incomplete payment requirements (payTo missing/invalid)" };
 
+  // FEATURE 3 — x402 `scheme` ("exact" | "upto"). When ABSENT, the DEFAULT preserves
+  // TODAY's exact-xahau behavior byte-for-byte: paid <= maxAmountRequired (a ceiling).
+  // "exact" => paid MUST EQUAL maxAmountRequired (strict, both native + IOU exact).
+  // "upto"  => paid <= maxAmountRequired (the legacy default behavior, made explicit).
+  // Any other scheme value is rejected (hostile-input rule: never coerce an unknown
+  // scheme to a weaker check). NOTE the semantics: the legacy default is mathematically
+  // identical to "upto" (a max ceiling); we keep ABSENT distinct in NAME only for
+  // back-compat documentation, but it enforces the same <= bound as "upto".
+  let scheme = "upto"; // default == legacy ceiling behavior
+  if (req.scheme !== undefined && req.scheme !== null) {
+    if (req.scheme !== "exact" && req.scheme !== "upto")
+      return { isValid: false, invalidReason: "incomplete payment requirements (unknown scheme; expected 'exact' or 'upto')" };
+    scheme = req.scheme;
+  }
+
   // Asset selection: when req.asset is present this is an ISSUED-AMOUNT (IOU/token)
   // payment; when absent it is native XAH (today's behavior, UNCHANGED). For an IOU
   // the asset must be a well-formed { currency, issuer } and maxAmountRequired is a
@@ -613,14 +842,21 @@ export function verifyExact(payload, req) {
     paid = parseStrictDrops(tx.Amount);
     if (paid === null)
       return { isValid: false, invalidReason: "Amount malformed (must be positive drops string)" };
+    // "upto"/default: paid <= max (ceiling). "exact": paid MUST EQUAL max.
     if (paid > maxDrops)
       return { isValid: false, invalidReason: "Amount > maxAmountRequired" };
+    if (scheme === "exact" && paid !== maxDrops)
+      return { isValid: false, invalidReason: "Amount != maxAmountRequired (scheme: exact)" };
   } else {
     // Issued-amount (IOU/token) path.
     if (typeof tx.Amount === "string")
       return { isValid: false, invalidReason: "asset mismatch: issued amount required but Amount is native XAH" };
+    // checkIssuedAmount enforces the <= ceiling ("upto"/default). For "exact" we add a
+    // strict equality on top (exact token compare, no float).
     const chk = checkIssuedAmount(tx.Amount, asset, maxTokenValue);
     if (chk.error) return { isValid: false, invalidReason: chk.error };
+    if (scheme === "exact" && cmpTokenValue(chk.value, maxTokenValue) !== 0)
+      return { isValid: false, invalidReason: "Amount != maxAmountRequired (scheme: exact)" };
     paidTokenValue = chk.value;
   }
 
@@ -694,6 +930,7 @@ export function verifyExact(payload, req) {
       payer: tx.Account,
       amount: tokenValueToString(paidTokenValue),
       asset,
+      scheme,
       signatureVerified,
       replayId,
     };
@@ -705,6 +942,7 @@ export function verifyExact(payload, req) {
     payer: tx.Account,
     amount: paid.toString(),
     asset: null,
+    scheme,
     signatureVerified,
     replayId,
   };
@@ -988,6 +1226,170 @@ async function guardrailHookPresent(client, account) {
   } catch {
     return null;
   }
+}
+
+// ---------------------------------------------------------------------------
+// FEATURE 1 — on-ledger spending-POLICY introspection (read the agent's xahc
+// guardrail Hook + decode its parameters straight from the chain)
+// ---------------------------------------------------------------------------
+// The agent's spending policy lives in a Hook (agent_guardrail.c), so no other
+// x402 facilitator can report it — but THIS one can read the Hook's installed
+// HookParameters off the validated ledger and surface the per-tx limit (LIM) +
+// destination allowlist (DST), plus any cumulative-budget HookState if present.
+//
+// Hook parameter encoding (from the testnet proof + agent_guardrail.c):
+//   - HookParameter NAME is the HEX of the ASCII bytes ("LIM" -> "4C494D",
+//     "DST" -> "445354"). Account_objects returns each param as
+//     { HookParameter: { HookParameterName: <hex>, HookParameterValue: <hex> } }.
+//   - LIM value = 8-byte BIG-ENDIAN drops (per-tx cap).
+//   - DST value = 20-byte account-id (the single allowed destination), which we
+//     encode back to an r-address for the readout.
+//
+// HONEST / FAIL-TRANSPARENT contract: a wrong policy readout is a credibility bug,
+// so anything we cannot decode SOUNDLY is reported as null / "unknown" with a note —
+// NEVER a fabricated limit or remaining budget. If the node can't be read we return
+// guardrailHookPresent:null + policy:null. If a Hook is present but it is not the
+// recognizable guardrail (no LIM param) we report guardrailHookPresent:true but
+// policy:null with a note. The agent_guardrail Hook is STATELESS (a per-tx cap, no
+// running total): we report stateful:false and DO NOT invent a "remaining" budget.
+// If a future stateful guardrail keeps a cumulative total in HookState we surface the
+// raw state entries under `hookState` (best-effort) and still never fabricate a
+// decoded remaining unless the layout is known — here it is not, so we mark it
+// stateful:false and expose the raw state for transparency only.
+const HOOK_PARAM_LIM = Buffer.from("LIM", "ascii").toString("hex").toUpperCase(); // 4C494D
+const HOOK_PARAM_DST = Buffer.from("DST", "ascii").toString("hex").toUpperCase(); // 445354
+
+/** Encode a 20-byte account-id hex to a classic r-address, or null on failure. */
+let _encodeAccountID = undefined;
+function accountIdHexToRAddress(hex) {
+  if (typeof hex !== "string" || !/^[0-9a-fA-F]{40}$/.test(hex)) return null;
+  if (_encodeAccountID === undefined) {
+    try { _encodeAccountID = require_("ripple-address-codec").encodeAccountID; }
+    catch { _encodeAccountID = null; }
+  }
+  if (typeof _encodeAccountID !== "function") return null;
+  try { return _encodeAccountID(Buffer.from(hex, "hex")); }
+  catch { return null; }
+}
+
+/** Decode an 8-byte big-endian hex drops value to a decimal string, or null. */
+function decode8ByteDropsHex(hex) {
+  if (typeof hex !== "string" || !/^[0-9a-fA-F]{16}$/.test(hex)) return null;
+  try {
+    const n = BigInt("0x" + hex);
+    if (n < 0n || n > MAX_DROPS) return null;
+    return n.toString();
+  } catch { return null; }
+}
+
+/**
+ * Pull the HookParameters array out of a single account_objects hook entry.
+ * Returns a Map<NAME_HEX_UPPER, VALUE_HEX_UPPER> (empty if none). Tolerant of the
+ * two shapes a node may return (each element wrapped in { HookParameter: {...} }, or
+ * flat { HookParameterName, HookParameterValue }).
+ */
+function hookParamsMap(hookObj) {
+  const out = new Map();
+  const arr = hookObj?.HookParameters;
+  if (!Array.isArray(arr)) return out;
+  for (const el of arr) {
+    const p = el?.HookParameter || el;
+    const name = p?.HookParameterName;
+    const value = p?.HookParameterValue;
+    if (typeof name === "string" && typeof value === "string")
+      out.set(name.toUpperCase(), value.toUpperCase());
+  }
+  return out;
+}
+
+/**
+ * Read an account's installed Hook(s) and decode the guardrail spending policy.
+ * Read-only; uses ONLY validated-ledger reads. Returns the /policy response object:
+ *   { account, guardrailHookPresent: bool|null,
+ *     policy: { perTxLimitDrops?, allowlist?, stateful, remaining?, note? } | null,
+ *     source: "on-ledger", asOfLedger: <validated index>|null, note? }
+ * FAIL-TRANSPARENT on every error (node down, undecodable params): null fields + an
+ * honest note, never a fabricated limit. `client` is the (injected or pooled) node
+ * client; `asOfLedger` is read for provenance (best-effort).
+ */
+async function getPolicy(client, account) {
+  const out = {
+    account,
+    guardrailHookPresent: null,
+    policy: null,
+    source: "on-ledger",
+    asOfLedger: null,
+  };
+  // Provenance: which validated ledger this readout reflects (best-effort).
+  try { out.asOfLedger = await currentValidatedLedger(client); } catch { out.asOfLedger = null; }
+
+  let hooks;
+  try {
+    const r = await client.request({ command: "account_objects", account, type: "hook", ledger_index: "validated" });
+    hooks = r?.result?.account_objects;
+  } catch {
+    out.note = "node read failed — could not read account_objects (policy unknown)";
+    return out; // guardrailHookPresent:null, policy:null — never fabricate
+  }
+  if (!Array.isArray(hooks)) {
+    out.note = "node returned no account_objects (policy unknown)";
+    return out;
+  }
+  out.guardrailHookPresent = hooks.length > 0;
+  if (hooks.length === 0) {
+    out.note = "no Hook installed — there is no L1 spending policy on this account";
+    return out;
+  }
+
+  // Find a Hook that carries the guardrail's LIM parameter. account_objects may list
+  // the Hook object directly, or nested under a Hooks[] array per the SetHook layout;
+  // we scan both, collecting every HookParameters set we can see.
+  let limHex = null, dstHex = null, matched = false;
+  for (const h of hooks) {
+    // A hook entry may expose HookParameters directly, or under Hooks[].Hook.
+    const candidates = [];
+    candidates.push(h);
+    if (Array.isArray(h?.Hooks)) for (const hh of h.Hooks) candidates.push(hh?.Hook || hh);
+    for (const c of candidates) {
+      const params = hookParamsMap(c);
+      if (params.has(HOOK_PARAM_LIM)) {
+        matched = true;
+        limHex = params.get(HOOK_PARAM_LIM);
+        dstHex = params.get(HOOK_PARAM_DST) || null;
+        break;
+      }
+    }
+    if (matched) break;
+  }
+
+  if (!matched) {
+    // A Hook IS installed but it doesn't carry the recognizable guardrail LIM param.
+    // We refuse to guess a policy from an unrecognized Hook (could be any Hook).
+    out.note = "a Hook is installed but no recognizable guardrail policy (LIM parameter) was found — policy unknown";
+    return out;
+  }
+
+  const perTxLimitDrops = decode8ByteDropsHex(limHex);
+  if (perTxLimitDrops === null) {
+    // The guardrail param is present but its value isn't a sound 8-byte drops cap —
+    // do NOT fabricate a number; report present-but-undecodable.
+    out.note = "guardrail LIM parameter present but its value could not be decoded as an 8-byte drops cap — policy unknown";
+    return out;
+  }
+
+  const policy = {
+    perTxLimitDrops,
+    stateful: false, // agent_guardrail is a per-tx cap, NOT a running budget — no fabricated "remaining"
+    note: "per-tx spend cap (stateless guardrail). This is the maximum per transaction, NOT a cumulative remaining budget.",
+  };
+  if (dstHex) {
+    const dstAddr = accountIdHexToRAddress(dstHex);
+    // If DST is present but undecodable, say so rather than dropping it silently.
+    policy.allowlist = dstAddr ? [dstAddr] : [];
+    if (!dstAddr) policy.note += " (DST destination-lock present but its account-id could not be decoded)";
+  }
+  out.policy = policy;
+  return out;
 }
 
 /**
@@ -1298,11 +1700,74 @@ function settleStoreUnavailable(payer, e, stage) {
 }
 
 // ---------------------------------------------------------------------------
+// FEATURE 4 — pre-settle simulation (OPTIONAL, config-gated, ADVISORY ONLY)
+// ---------------------------------------------------------------------------
+// When X402_MCP_URL is set, the facilitator can ask xahau-mcp (the Hooks VM HTTP
+// shim) to PREDICT the payer guardrail Hook's accept/rollback for a payment WITHOUT
+// submitting it. This is ADVISORY: it must NEVER change settle's security semantics.
+// A predicted-accept STILL runs the full real settle. A predicted-reject MAY (opt-in)
+// short-circuit the submit to save a fee, but only ever returns a clearly-labeled
+// advisory rejection and NEVER consumes/keeps a real replay reservation. When unset,
+// the feature is entirely OFF (no coupling, no required dep). fetch with a timeout;
+// fail SOFT (any sim error -> "simulation unavailable", never blocks the real settle).
+const MCP_SIM_TIMEOUT_MS = Number(process.env.X402_MCP_TIMEOUT_MS) || 5000;
+
+/**
+ * Call the configured xahau-mcp shim to predict a payment's on-Hook outcome. Returns
+ * one of:
+ *   { available:false, note }                              — feature off / sim error
+ *   { available:true, prediction:"accept"|"reject"|"unknown", raw?, note? }
+ * NEVER throws. `_deps.simulateFn` can inject a fake for tests; `_deps.mcpUrl`
+ * overrides the env URL. A non-OK HTTP status / timeout / parse error -> available:false
+ * (fail soft). We map a clearly-rejecting VM result to "reject", a clearly-accepting one
+ * to "accept", and anything ambiguous to "unknown" (never guess accept on ambiguity).
+ */
+async function simulatePayment(payload, req, _deps = {}) {
+  const mcpUrl = _deps.mcpUrl !== undefined ? _deps.mcpUrl : process.env.X402_MCP_URL;
+  if (_deps.simulateFn) {
+    try { return await _deps.simulateFn(payload, req); }
+    catch (e) { return { available: false, note: "simulation unavailable", error: String(e?.name || "sim_error") }; }
+  }
+  if (!mcpUrl) return { available: false, note: "simulation not configured (X402_MCP_URL unset)" };
+  let controller, timer;
+  try {
+    controller = new AbortController();
+    timer = setTimeout(() => controller.abort(), MCP_SIM_TIMEOUT_MS);
+    const resp = await fetch(mcpUrl, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ paymentPayload: payload, paymentRequirements: req }),
+      signal: controller.signal,
+    });
+    if (!resp || !resp.ok) return { available: false, note: "simulation unavailable (mcp non-OK)" };
+    const data = await resp.json();
+    // Interpret the VM result conservatively. xahau-mcp typically returns an
+    // engine_result / accepted flag. A clearly-rejecting result -> "reject"; a clearly
+    // accepting one -> "accept"; otherwise "unknown" (never assume accept).
+    let prediction = "unknown";
+    const er = data?.engine_result ?? data?.result?.engine_result;
+    const accepted = data?.accepted ?? data?.result?.accepted;
+    if (accepted === true || (typeof er === "string" && /^tes/.test(er))) prediction = "accept";
+    else if (accepted === false || (typeof er === "string" && /^(tec|tem|tef|tel|ter)/.test(er))) prediction = "reject";
+    return { available: true, prediction, raw: { engine_result: er ?? null, accepted: accepted ?? null } };
+  } catch (e) {
+    return { available: false, note: "simulation unavailable", error: String(e?.name || "sim_error") };
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // settle
 // ---------------------------------------------------------------------------
 /**
  * Submit the signed tx to Xahau. Re-validates EVERYTHING (does not trust /verify
  * was called), enforces single-use replay binding, and checks delivered_amount.
+ *
+ * FEATURE 4 (advisory sim): `_deps.dryRun:true` (or a `dryRun` flag from the route)
+ * returns a prediction WITHOUT submitting and WITHOUT reserving a replay slot.
+ * `_deps.preSimReject:true` opts into the fee-saving short-circuit where a predicted-
+ * REJECT skips the real submit — still labeled advisory, still reserves NO slot.
  */
 async function settle(payload, req, _deps = {}) {
   // settle_total counts every settlement ATTEMPT that reaches this function.
@@ -1320,6 +1785,49 @@ async function settle(payload, req, _deps = {}) {
   if (!v.isValid) {
     recordSettleReject("verify_failed");
     return { success: false, network: NETWORK, transaction: "", payer: v.payer ?? "", errorReason: `verify failed: ${v.invalidReason}` };
+  }
+
+  // FEATURE 4 (advisory) — dryRun: predict the Hook outcome and return WITHOUT
+  // submitting and WITHOUT reserving a replay slot. This is a HINT, not ground truth:
+  // it never touches the store, never submits, and is clearly labeled advisory. A
+  // real settle (no dryRun) ignores this branch entirely.
+  if (_deps.dryRun === true) {
+    const sim = await simulatePayment(payload, req, _deps);
+    return {
+      success: false,
+      dryRun: true,
+      advisory: true,
+      network: NETWORK,
+      transaction: "",
+      payer: v.payer,
+      simulation: sim,
+      errorReason: "dryRun: not submitted (advisory simulation only)",
+    };
+  }
+
+  // FEATURE 4 (advisory, opt-in fee-saver) — a PREDICTED-REJECT short-circuit. ONLY
+  // active when the caller opts in via _deps.preSimReject AND a simulation is available
+  // AND it predicts a reject. It returns a clearly-labeled ADVISORY rejection and
+  // reserves NO replay slot / submits nothing. Because the sim is a hint (not ground
+  // truth), a predicted-ACCEPT or an UNAVAILABLE sim does NOT short-circuit — the full
+  // real settle runs. This can never weaken security: it only ever skips a submit the
+  // VM thinks would fail, and a false "reject" merely costs the caller a retry (the
+  // real settle is always available without the flag).
+  if (_deps.preSimReject === true) {
+    const sim = await simulatePayment(payload, req, _deps);
+    if (sim.available === true && sim.prediction === "reject") {
+      log("info", "settle_presim_reject", {});
+      return {
+        success: false,
+        advisory: true,
+        network: NETWORK,
+        transaction: "",
+        payer: v.payer,
+        simulation: sim,
+        errorReason: "predicted-reject (simulated, not submitted)",
+      };
+    }
+    // available accept / unknown / unavailable -> fall through to the FULL real settle.
   }
 
   // (4b) Replay protection — refuse a payment whose binding was already consumed.
@@ -1612,6 +2120,44 @@ async function settle(payload, req, _deps = {}) {
     recordSettleReject("delivered_short");
     log("warn", "settle_delivered_short", { reason: receipt.errorReason });
   }
+
+  // FEATURE 2 — attach a facilitator-SIGNED, offline-verifiable proof. ONLY a truly
+  // successful settlement (tesSUCCESS + delivered>=required) is signed; a failed/
+  // rejected settle gets proof:null (a receipt proves a settlement OCCURRED, not future
+  // behavior). The proof is an ed25519 signature over the CANONICAL bytes of the
+  // load-bearing fields (deterministic, sorted-key, no-whitespace) so a resource server
+  // can verify offline with just GET /pubkey. We also surface those exact canonical
+  // fields on the receipt (txHash, payTo, required, ts) so a verifier can reconstruct
+  // the bytes from the receipt alone (see verifyReceipt + README recipe).
+  const ts = now; // deterministic in tests (injected now); Date.now() in prod
+  // `delivered` on the receipt is a drops STRING (native) or an issued-amount OBJECT
+  // (IOU) or absent on failure. `required` mirrors that shape from the verified value.
+  const requiredField = isIou
+    ? (requiredTokenValue !== null ? { currency: v.asset.currency, issuer: v.asset.issuer, value: tokenValueToString(requiredTokenValue) } : null)
+    : (required !== null ? required.toString() : null);
+  receipt.txHash = receipt.transaction || null;
+  receipt.payTo = req && typeof req.payTo === "string" ? req.payTo : null;
+  receipt.required = requiredField;
+  // Surface `asset` on the receipt so a verifier reconstructs the SAME canonical
+  // bytes that were signed (IOU receipts otherwise reconstruct asset=null and the
+  // signature fails). Native = null on both sides.
+  receipt.asset = v.asset ?? null;
+  receipt.ts = ts;
+  if (receipt.success === true) {
+    receipt.proof = signReceipt({
+      network: NETWORK,
+      txHash: receipt.txHash,
+      payer: receipt.payer,
+      payTo: receipt.payTo,
+      asset: receipt.asset,
+      delivered: receipt.delivered ?? null,
+      required: requiredField,
+      ts,
+    });
+  } else {
+    receipt.proof = null; // failed/rejected settlements are not signed
+  }
+
   // (F2) Persist the receipt best-effort. The submit already happened, so the
   // computed receipt is the AUTHORITATIVE outcome even if persistence flaps (Redis
   // down post-submit). A throw here must NOT escape settle (that would 500 and lose
@@ -2050,6 +2596,73 @@ function serve() {
         // spec's `x402Version: 2` alongside the original {scheme, network}.
         return send(res, 200, { kinds: [{ x402Version: 2, scheme: "exact", network: NETWORK }] });
 
+      // FEATURE 2 — GET /pubkey: the facilitator's ed25519 receipt verification key
+      // (raw 32-byte hex). Public (a verification key is not a secret). Lets a resource
+      // server verify signed receipts OFFLINE. No auth, rate-limited like other GETs.
+      if (req.method === "GET" && req.url === "/pubkey") {
+        const ip = clientIp(req);
+        if (!(await rateLimiter.ok(ip))) { metricInc("rate_limited_total"); return send(res, 429, { error: "rate limited" }); }
+        return send(res, 200, receiptPubkey());
+      }
+
+      // FEATURE 1 — GET /policy/:account: read the agent's on-ledger guardrail Hook
+      // and surface its spending policy (per-tx LIM cap + DST allowlist) straight from
+      // the chain. Read-only, public (on-ledger data). Needs XAHAU_WSS (like settle);
+      // 503 if unset. FAIL-TRANSPARENT: node/decoding errors -> policy:null + a note,
+      // never a fabricated limit.
+      if (req.method === "GET" && typeof req.url === "string" && req.url.startsWith("/policy/")) {
+        const ip = clientIp(req);
+        if (!(await rateLimiter.ok(ip))) { metricInc("rate_limited_total"); return send(res, 429, { error: "rate limited" }); }
+        const account = decodeURIComponent(req.url.slice("/policy/".length).split("?")[0]);
+        if (!isValidRAddress(account)) return send(res, 400, { error: "invalid account address" });
+        if (!process.env.XAHAU_WSS) return send(res, 503, { error: "node not configured (set XAHAU_WSS)" });
+        let client;
+        try { client = await getClient(); }
+        catch {
+          // Node unreachable -> fail transparent (never fabricate). 503 so the caller retries.
+          return send(res, 503, { account, guardrailHookPresent: null, policy: null, source: "on-ledger", asOfLedger: null, note: "node unavailable — policy unknown" });
+        }
+        const out = await getPolicy(client, account);
+        return send(res, 200, out);
+      }
+
+      // FEATURE 3 — GET /status/:id: look up a stored settlement by its replayId or a
+      // `hash:<txhash>` key. AUTH-GATED (it exposes payment data) — 401 without the
+      // shared secret when one is configured; open in reference mode. Honest "unknown"
+      // when not found / expired. Pulls from the existing receipt store only.
+      if (req.method === "GET" && typeof req.url === "string" && req.url.startsWith("/status/")) {
+        if (!authOk(req)) return send(res, 401, { error: "unauthorized" });
+        const ip = clientIp(req);
+        if (!(await rateLimiter.ok(ip))) { metricInc("rate_limited_total"); return send(res, 429, { error: "rate limited" }); }
+        const id = decodeURIComponent(req.url.slice("/status/".length).split("?")[0]);
+        if (!id) return send(res, 400, { error: "missing id" });
+        let receipt;
+        try { receipt = await store.getReceipt(id); }
+        catch { return send(res, 503, { found: false, status: "unknown", error: "store unavailable", retryable: true }); }
+        if (receipt) {
+          // A memoized receipt with success:false is a terminal on-ledger settlement;
+          // status "settled" reflects that a final outcome was recorded (success flag
+          // tells the rest of the story). We expose found + the stored receipt verbatim.
+          return send(res, 200, { found: true, status: "settled", receipt });
+        }
+        // No receipt. The binding may still be live (in-flight) but we only expose the
+        // receipt store here; report "unknown" honestly rather than guessing.
+        return send(res, 200, { found: false, status: "unknown" });
+      }
+
+      // FEATURE 4 — POST /simulate: predict the guardrail Hook's accept/rollback for a
+      // payment WITHOUT submitting (advisory). ONLY enabled when X402_MCP_URL is set;
+      // otherwise 404 (feature entirely off, no coupling). Rate-limited; not auth-gated
+      // (it's a read-only prediction, like /verify). Fails SOFT.
+      if (req.method === "POST" && req.url === "/simulate") {
+        if (!process.env.X402_MCP_URL) return send(res, 404, { error: "simulation not enabled (set X402_MCP_URL)" });
+        const ip = clientIp(req);
+        if (!(await rateLimiter.ok(ip))) { metricInc("rate_limited_total"); return send(res, 429, { error: "rate limited" }); }
+        const b = await readBody(req, res);
+        const sim = await simulatePayment(b.paymentPayload, b.paymentRequirements, {});
+        return send(res, 200, { advisory: true, simulation: sim });
+      }
+
       if (req.method === "POST" && req.url === "/verify") {
         // /verify decodes a full tx blob + runs signature crypto — an
         // unauthenticated, CPU-bound path. It MUST be rate-limited (but NOT
@@ -2067,7 +2680,13 @@ function serve() {
         const ip = clientIp(req);
         if (!(await rateLimiter.ok(ip))) { metricInc("rate_limited_total"); return send(res, 429, { error: "rate limited" }); }
         const b = await readBody(req, res);
-        const out = await settle(b.paymentPayload, b.paymentRequirements, { store, rateLimiter });
+        // FEATURE 4 — an optional `dryRun:true` on the body returns the advisory
+        // prediction and does NOT submit / reserve a slot. The fee-saving predicted-
+        // reject short-circuit is opt-in via `preSimReject:true`. Both are advisory and
+        // never weaken the real settle (a predicted-accept still runs the full settle).
+        const dryRun = b && b.dryRun === true;
+        const preSimReject = b && b.preSimReject === true;
+        const out = await settle(b.paymentPayload, b.paymentRequirements, { store, rateLimiter, dryRun, preSimReject });
         // Replay store full of live (unexpired) bindings: fail closed with 503 so
         // the client retries later, rather than evicting a live binding (Hole 2).
         const status = out && out.retryable === true ? 503 : 200;
@@ -2200,6 +2819,14 @@ export const __test = {
   // metric helpers (so tests can assert counters move on real events).
   validateConfig, buildHealth, metricsPrometheus, recordSettleReject, closeBackends,
   metrics, metricInc,
+  // FEATURE 1 — on-ledger policy introspection seams.
+  getPolicy, hookParamsMap, decode8ByteDropsHex, accountIdHexToRAddress,
+  HOOK_PARAM_LIM, HOOK_PARAM_DST,
+  // FEATURE 2 — receipt signing/verification seams.
+  canonicalJSONStringify, receiptSignablePayload, signReceipt, verifyReceipt,
+  receiptPubkey, initReceiptKey, parseReceiptSecret, ed25519KeyFromSeed,
+  // FEATURE 4 — advisory simulation seam.
+  simulatePayment,
   // Live view of the default store's backing map (back-compat with raw-Map tests).
   get consumed() { return store.map; },
   get store() { return store; },

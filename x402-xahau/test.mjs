@@ -2006,4 +2006,587 @@ await new Promise((resolveTest, rejectTest) => {
   })().catch(rejectTest);
 });
 
-console.log("ok — all hardened verifyExact + settle cases pass (native + IOU + ops hardening + x402 spec fields)");
+// ===========================================================================
+// FEATURE 1 — GET /policy/:account (on-ledger budget introspection)
+// ===========================================================================
+// Decode the agent_guardrail Hook's HookParameters straight from the chain. The
+// canonical encoding (from docs/FACILITATOR-TESTNET-PROOF.md): param NAME = hex of
+// ASCII ("LIM"->4C494D, "DST"->445354); LIM value = 8-byte BE drops; DST = 20-byte
+// account-id. FAIL-TRANSPARENT: node/decode errors -> policy:null + note, never a
+// fabricated limit.
+{
+  const { getPolicy, hookParamsMap, decode8ByteDropsHex, accountIdHexToRAddress, HOOK_PARAM_LIM, HOOK_PARAM_DST } = __test;
+
+  // Param-name encoding is correct.
+  assert.equal(HOOK_PARAM_LIM, "4C494D", "LIM param name is hex of ASCII 'LIM'");
+  assert.equal(HOOK_PARAM_DST, "445354", "DST param name is hex of ASCII 'DST'");
+
+  // 8-byte BE drops decode (5 XAH = 5_000_000 drops = 0x00000000004C4B40 from the proof).
+  assert.equal(decode8ByteDropsHex("00000000004C4B40"), "5000000", "decodes 5 XAH per-tx cap from the proof");
+  assert.equal(decode8ByteDropsHex("0000000000000001"), "1", "decodes 1 drop");
+  assert.equal(decode8ByteDropsHex("zz"), null, "malformed hex -> null (no fabrication)");
+  assert.equal(decode8ByteDropsHex("00"), null, "wrong-length hex -> null");
+
+  // DST account-id -> r-address (the proof's DST decodes to PAYEE).
+  assert.equal(accountIdHexToRAddress("F1B9322DE209841AAE84BFBDA0118003D3A8B5F0"), "rPsf618mGxJgrvp5ubFYBTMEaJFY2KJWY3", "DST account-id decodes to the allowlisted r-address");
+  assert.equal(accountIdHexToRAddress("nothex"), null, "malformed DST -> null");
+
+  // hookParamsMap tolerates both shapes.
+  const m1 = hookParamsMap({ HookParameters: [{ HookParameter: { HookParameterName: "4c494d", HookParameterValue: "00000000004c4b40" } }] });
+  assert.equal(m1.get("4C494D"), "00000000004C4B40", "hookParamsMap uppercases + reads nested shape");
+  const m2 = hookParamsMap({ HookParameters: [{ HookParameterName: "445354", HookParameterValue: "abcd" }] });
+  assert.equal(m2.get("445354"), "ABCD", "hookParamsMap reads flat shape");
+  assert.equal(hookParamsMap({}).size, 0, "no params -> empty map");
+
+  // getPolicy: a guardrail Hook with LIM + DST -> decoded per-tx cap + allowlist.
+  const clientWithGuardrail = {
+    request: async (q) => {
+      if (q.command === "ledger") return { result: { ledger_index: 9720000 } };
+      if (q.command === "account_objects" && q.type === "hook") {
+        return { result: { account_objects: [
+          { HookParameters: [
+            { HookParameter: { HookParameterName: "4C494D", HookParameterValue: "00000000004C4B40" } },
+            { HookParameter: { HookParameterName: "445354", HookParameterValue: "F1B9322DE209841AAE84BFBDA0118003D3A8B5F0" } },
+          ] },
+        ] } };
+      }
+      return { result: {} };
+    },
+  };
+  let pol = await getPolicy(clientWithGuardrail, PAYER);
+  assert.equal(pol.guardrailHookPresent, true, "guardrail Hook reported present");
+  assert.equal(pol.source, "on-ledger", "source is on-ledger");
+  assert.equal(pol.asOfLedger, 9720000, "asOfLedger reflects the validated index");
+  assert.ok(pol.policy, "policy decoded");
+  assert.equal(pol.policy.perTxLimitDrops, "5000000", "per-tx limit decoded from LIM");
+  assert.equal(pol.policy.stateful, false, "stateless guardrail -> stateful:false (no fabricated remaining)");
+  assert.equal("remaining" in pol.policy, false, "no fabricated remaining budget for a stateless cap");
+  assert.deepEqual(pol.policy.allowlist, ["rPsf618mGxJgrvp5ubFYBTMEaJFY2KJWY3"], "DST allowlist decoded to r-address");
+
+  // getPolicy: LIM only (no DST) -> cap but no allowlist.
+  const clientLimOnly = {
+    request: async (q) => {
+      if (q.command === "ledger") return { result: { ledger_index: 100 } };
+      if (q.command === "account_objects") return { result: { account_objects: [ { HookParameters: [ { HookParameter: { HookParameterName: "4C494D", HookParameterValue: "0000000000989680" } } ] } ] } };
+      return { result: {} };
+    },
+  };
+  pol = await getPolicy(clientLimOnly, PAYER);
+  assert.equal(pol.policy.perTxLimitDrops, "10000000", "LIM-only decodes the cap (10 XAH)");
+  assert.equal("allowlist" in pol.policy, false, "no DST -> no allowlist key");
+
+  // getPolicy: no Hook installed -> guardrailHookPresent:false, policy:null, honest note.
+  const clientNoHook = {
+    request: async (q) => {
+      if (q.command === "ledger") return { result: { ledger_index: 100 } };
+      if (q.command === "account_objects") return { result: { account_objects: [] } };
+      return { result: {} };
+    },
+  };
+  pol = await getPolicy(clientNoHook, PAYER);
+  assert.equal(pol.guardrailHookPresent, false, "no Hook -> guardrailHookPresent:false");
+  assert.equal(pol.policy, null, "no Hook -> policy:null");
+  assert.match(pol.note, /no Hook installed/, "honest note for no Hook");
+
+  // getPolicy: a Hook present but NOT the guardrail (no LIM) -> present:true, policy:null.
+  const clientOtherHook = {
+    request: async (q) => {
+      if (q.command === "ledger") return { result: { ledger_index: 100 } };
+      if (q.command === "account_objects") return { result: { account_objects: [ { HookParameters: [ { HookParameter: { HookParameterName: "ABCDEF", HookParameterValue: "00" } } ] } ] } };
+      return { result: {} };
+    },
+  };
+  pol = await getPolicy(clientOtherHook, PAYER);
+  assert.equal(pol.guardrailHookPresent, true, "some Hook is present");
+  assert.equal(pol.policy, null, "unrecognized Hook -> policy:null (never guess)");
+  assert.match(pol.note, /no recognizable guardrail/, "honest note for unrecognized Hook");
+
+  // getPolicy: FAIL-TRANSPARENT on a node read error -> present:null, policy:null, note.
+  const clientNodeDown = {
+    request: async (q) => {
+      if (q.command === "ledger") throw new Error("node down");
+      throw new Error("node down");
+    },
+  };
+  pol = await getPolicy(clientNodeDown, PAYER);
+  assert.equal(pol.guardrailHookPresent, null, "node read failure -> guardrailHookPresent:null (never fabricate)");
+  assert.equal(pol.policy, null, "node read failure -> policy:null");
+  assert.match(pol.note, /node read failed/, "honest note on node failure");
+
+  // getPolicy: LIM present but value undecodable -> present:true, policy:null, note (no fabrication).
+  const clientBadLim = {
+    request: async (q) => {
+      if (q.command === "ledger") return { result: { ledger_index: 100 } };
+      if (q.command === "account_objects") return { result: { account_objects: [ { HookParameters: [ { HookParameter: { HookParameterName: "4C494D", HookParameterValue: "XYZ" } } ] } ] } };
+      return { result: {} };
+    },
+  };
+  pol = await getPolicy(clientBadLim, PAYER);
+  assert.equal(pol.policy, null, "undecodable LIM -> policy:null (never fabricate a limit)");
+  assert.match(pol.note, /could not be decoded/, "honest note for undecodable LIM");
+}
+
+// /policy integration over a spawned server: 503 when XAHAU_WSS unset, 400 on a bad
+// address. (We don't exercise the live-node path here — covered by the unit tests
+// above with an injected client.)
+await new Promise((resolveTest, rejectTest) => {
+  (async () => {
+    const { spawn } = await import("node:child_process");
+    const PORT = 4096;
+    const child = spawn(process.execPath, ["server.mjs"], {
+      env: { ...process.env, PORT: String(PORT), XAHAU_WSS: "" },
+      stdio: ["ignore", "ignore", "ignore"],
+    });
+    const getJson = (path) => new Promise((res) => {
+      const r = http.request({ host: "127.0.0.1", port: PORT, path, method: "GET" }, (resp) => {
+        let data = ""; resp.on("data", (c) => (data += c));
+        resp.on("end", () => { let body; try { body = JSON.parse(data); } catch { body = data; } res({ status: resp.statusCode, body }); });
+      });
+      r.on("error", () => res({ status: null, body: null })); r.end();
+    });
+    const waitListen = async () => {
+      for (let i = 0; i < 50; i++) {
+        const ok = await new Promise((res) => { const r = http.request({ host: "127.0.0.1", port: PORT, path: "/supported", method: "GET" }, (resp) => { resp.resume(); res(resp.statusCode === 200); }); r.on("error", () => res(false)); r.end(); });
+        if (ok) return true; await new Promise((r) => setTimeout(r, 100));
+      }
+      return false;
+    };
+    try {
+      assert.equal(await waitListen(), true, "facilitator should start for the /policy test");
+      // Bad address -> 400.
+      const bad = await getJson("/policy/not-an-address");
+      assert.equal(bad.status, 400, "/policy with a bad address -> 400");
+      // Valid address but XAHAU_WSS unset -> 503 (node not configured).
+      const noNode = await getJson(`/policy/${PAYER}`);
+      assert.equal(noNode.status, 503, "/policy with XAHAU_WSS unset -> 503");
+      resolveTest();
+    } catch (e) { rejectTest(e); }
+    finally { child.kill("SIGKILL"); }
+  })().catch(rejectTest);
+});
+
+// ===========================================================================
+// FEATURE 2 — verifiable signed receipts + GET /pubkey
+// ===========================================================================
+{
+  const { canonicalJSONStringify: cj, receiptSignablePayload: rsp, signReceipt, verifyReceipt, receiptPubkey, parseReceiptSecret, ed25519KeyFromSeed } = __test;
+
+  // Canonical serialization: sorted keys, no whitespace, deterministic across insertion order.
+  assert.equal(cj({ b: 1, a: 2 }), '{"a":2,"b":1}', "keys sorted ascending, no whitespace");
+  assert.equal(cj({ a: 2, b: 1 }), cj({ b: 1, a: 2 }), "insertion-order independent");
+  assert.equal(cj({ z: { y: 1, x: 2 }, a: [3, 2, 1] }), '{"a":[3,2,1],"z":{"x":2,"y":1}}', "recursive sort, array order preserved");
+  assert.equal(cj(null), "null");
+  // non-finite numbers are rejected (would produce bytes a verifier can't reproduce).
+  assert.throws(() => cj({ x: Infinity }), "non-finite number rejected");
+
+  // The signable projection has a FIXED key set; absent fields are null, not dropped.
+  const proj = rsp({ network: "xahau", txHash: "H", payer: "rP", payTo: "rT" });
+  assert.deepEqual(Object.keys(proj).sort(), ["asset", "delivered", "network", "payTo", "payer", "required", "ts", "txHash", "v"], "fixed key set");
+  assert.equal(proj.v, 1, "version pinned");
+  assert.equal(proj.delivered, null, "absent delivered -> null (not dropped)");
+
+  // pubkey shape.
+  const pk = receiptPubkey();
+  assert.equal(pk.alg, "ed25519", "pubkey alg ed25519");
+  assert.match(pk.pubkey, /^[0-9a-f]{64}$/, "pubkey is raw 32-byte hex");
+
+  // Sign a receipt, then verify OFFLINE; tamper any field -> verification fails.
+  const fields = { network: "xahau", txHash: "ABC123", payer: PAYER, payTo: PAY_TO, asset: null, delivered: "1000000", required: "1000000", ts: 1700000000000 };
+  const proof = signReceipt(fields);
+  assert.ok(proof && proof.alg === "ed25519", "signReceipt returns an ed25519 proof");
+  assert.equal(proof.pubkey, pk.pubkey, "proof pubkey matches /pubkey");
+  // Build the receipt the way settle does (the same fields + proof).
+  const receipt = { network: "xahau", txHash: "ABC123", payer: PAYER, payTo: PAY_TO, asset: null, delivered: "1000000", required: "1000000", ts: 1700000000000, proof };
+  assert.equal(verifyReceipt(receipt), true, "a well-formed signed receipt verifies offline");
+  assert.equal(verifyReceipt(receipt, { expectedPubkey: pk.pubkey }), true, "verifies against the expected pubkey");
+  assert.equal(verifyReceipt(receipt, { expectedPubkey: "00".repeat(32) }), false, "wrong expected pubkey -> false");
+
+  // Tamper detection: mutate each load-bearing field -> verification fails.
+  for (const k of ["txHash", "payer", "payTo", "asset", "delivered", "required", "ts", "network"]) {
+    const t = { ...receipt, [k]: (k === "ts" ? 1 : "TAMPERED") };
+    assert.equal(verifyReceipt(t), false, `tampered ${k} -> verification fails`);
+  }
+  // Tamper the signature itself -> fails.
+  assert.equal(verifyReceipt({ ...receipt, proof: { ...proof, sig: "00" + proof.sig.slice(2) } }), false, "tampered sig -> fails");
+  // Missing/malformed proof -> false (never throws).
+  assert.equal(verifyReceipt({ ...receipt, proof: null }), false, "no proof -> false");
+  assert.equal(verifyReceipt({ ...receipt, proof: { alg: "rsa", pubkey: pk.pubkey, sig: proof.sig } }), false, "wrong alg -> false");
+  assert.equal(verifyReceipt(null), false, "null receipt -> false (no throw)");
+
+  // parseReceiptSecret: hex + base64 32-byte seeds parse; junk -> null.
+  const seedHex = "07".repeat(32);
+  assert.ok(parseReceiptSecret(seedHex), "64-char hex seed parses");
+  assert.equal(parseReceiptSecret(Buffer.alloc(32, 7).toString("base64")).length, 32, "base64 32-byte seed parses");
+  assert.equal(parseReceiptSecret("tooshort"), null, "junk secret -> null");
+  assert.equal(parseReceiptSecret(""), null, "empty -> null");
+  // A fixed seed yields a STABLE key (persistence across restarts when X402_RECEIPT_SECRET set).
+  const k1 = ed25519KeyFromSeed(Buffer.alloc(32, 7));
+  const k2 = ed25519KeyFromSeed(Buffer.alloc(32, 7));
+  assert.ok(k1 && k2, "seed -> key");
+  assert.equal(__test.receiptPubkey().pubkey.length, 64, "pubkey hex is 32 bytes");
+}
+
+// FEATURE 2 — a settle SUCCESS receipt carries a verifiable proof; a FAILED settle
+// carries proof:null. End-to-end over the settle() seam.
+{
+  const prev = process.env.XAHAU_WSS;
+  process.env.XAHAU_WSS = "wss://invalid.example";
+  const { InMemoryStore, verifyReceipt } = __test;
+  const now = 1_000_000_000, curLedger = 100;
+  const store = new InMemoryStore({ now: () => now });
+  const client = fakeClient({ result: { hash: "SIGNEDOK", meta: { TransactionResult: "tesSUCCESS", delivered_amount: "1000000" } } });
+  const deps = { store, client, currentValidatedLedger: async () => curLedger, now: () => now };
+  const payment = { txBlob: blob({ LastLedgerSequence: curLedger + 5, Sequence: 401 }) };
+  const out = await __test.settle(payment, req, deps);
+  assert.equal(out.success, true, `signed settle succeeds: ${out.errorReason}`);
+  assert.ok(out.proof && out.proof.alg === "ed25519", "success receipt carries an ed25519 proof");
+  assert.equal(out.txHash, "SIGNEDOK", "receipt carries canonical txHash");
+  assert.equal(out.payTo, PAY_TO, "receipt carries canonical payTo");
+  assert.equal(out.required, "1000000", "receipt carries the required amount");
+  assert.equal(typeof out.ts, "number", "receipt carries a ts");
+  assert.equal(verifyReceipt(out), true, "the real settle receipt verifies offline");
+  // Tamper the delivered amount on the returned receipt -> verification fails.
+  assert.equal(verifyReceipt({ ...out, delivered: "999999999" }), false, "tampered delivered on a real receipt -> fails");
+
+  // IOU receipt round-trip: a token settle carries `asset` on the receipt so the
+  // SAME canonical bytes are signed + reconstructed (regression for the asset bug).
+  const storeI = new InMemoryStore({ now: () => now });
+  const clientI = fakeClient({ result: { hash: "IOUOK", meta: { TransactionResult: "tesSUCCESS", delivered_amount: { currency: "USD", issuer: ISSUER, value: "1.5" } } } });
+  const depsI = { store: storeI, client: clientI, currentValidatedLedger: async () => curLedger, now: () => now };
+  const outI = await __test.settle({ txBlob: iouBlob({ value: "1.5" }, { LastLedgerSequence: curLedger + 5, Sequence: 403 }) }, iouReq, depsI);
+  assert.equal(outI.success, true, `IOU signed settle succeeds: ${outI.errorReason}`);
+  assert.ok(outI.proof && outI.proof.alg === "ed25519", "IOU success receipt carries a proof");
+  assert.deepEqual(outI.asset, IOU_ASSET, "IOU receipt surfaces the asset (so verify reconstructs the signed bytes)");
+  assert.equal(verifyReceipt(outI), true, "the real IOU settle receipt verifies offline");
+  assert.equal(verifyReceipt({ ...outI, asset: null }), false, "stripping asset from an IOU receipt -> verification fails");
+
+  // A FAILED settle (tecHOOK_REJECTED) carries proof:null (not signed).
+  const store2 = new InMemoryStore({ now: () => now });
+  const client2 = fakeClient({ result: { hash: "REJ", meta: { TransactionResult: "tecHOOK_REJECTED" } } });
+  const deps2 = { store: store2, client: client2, currentValidatedLedger: async () => curLedger, now: () => now };
+  const out2 = await __test.settle({ txBlob: blob({ LastLedgerSequence: curLedger + 5, Sequence: 402 }) }, req, deps2);
+  assert.equal(out2.success, false, "rejected settle");
+  assert.equal(out2.proof, null, "a failed settle is NOT signed (proof:null)");
+
+  if (prev === undefined) delete process.env.XAHAU_WSS; else process.env.XAHAU_WSS = prev;
+}
+
+// FEATURE 2 — GET /pubkey over a spawned server, and the EPHEMERAL-key warning path.
+await new Promise((resolveTest, rejectTest) => {
+  (async () => {
+    const { spawn } = await import("node:child_process");
+    const PORT = 4095;
+    // No X402_RECEIPT_SECRET -> the server logs an ephemeral-key warning to stderr.
+    const child = spawn(process.execPath, ["server.mjs"], {
+      env: { ...process.env, PORT: String(PORT), XAHAU_WSS: "", X402_RECEIPT_SECRET: "" },
+      stdio: ["ignore", "ignore", "pipe"],
+    });
+    let stderr = "";
+    child.stderr.on("data", (c) => { stderr += c.toString(); });
+    const getJson = (path) => new Promise((res) => {
+      const r = http.request({ host: "127.0.0.1", port: PORT, path, method: "GET" }, (resp) => {
+        let data = ""; resp.on("data", (c) => (data += c));
+        resp.on("end", () => { let body; try { body = JSON.parse(data); } catch { body = data; } res({ status: resp.statusCode, body }); });
+      });
+      r.on("error", () => res({ status: null, body: null })); r.end();
+    });
+    const waitListen = async () => {
+      for (let i = 0; i < 50; i++) {
+        const ok = await new Promise((res) => { const r = http.request({ host: "127.0.0.1", port: PORT, path: "/supported", method: "GET" }, (resp) => { resp.resume(); res(resp.statusCode === 200); }); r.on("error", () => res(false)); r.end(); });
+        if (ok) return true; await new Promise((r) => setTimeout(r, 100));
+      }
+      return false;
+    };
+    try {
+      assert.equal(await waitListen(), true, "facilitator should start for the /pubkey test");
+      const pk = await getJson("/pubkey");
+      assert.equal(pk.status, 200, "/pubkey returns 200");
+      assert.equal(pk.body.alg, "ed25519", "/pubkey alg ed25519");
+      assert.match(pk.body.pubkey, /^[0-9a-f]{64}$/, "/pubkey returns raw 32-byte hex");
+      // The ephemeral-key warning must have been logged (no secret configured). The
+      // pubkey is materialized lazily on first /pubkey, so wait a tick for the log.
+      await new Promise((r) => setTimeout(r, 100));
+      assert.match(stderr, /receipt_key_ephemeral/, "ephemeral-key warning logged when no X402_RECEIPT_SECRET");
+      // The warning must NEVER contain a private key/secret (we only log a note).
+      assert.doesNotMatch(stderr, /X402_RECEIPT_SECRET=|privateKey/, "no secret/private key is ever logged");
+      resolveTest();
+    } catch (e) { rejectTest(e); }
+    finally { child.kill("SIGKILL"); }
+  })().catch(rejectTest);
+});
+
+// FEATURE 2 — a CONFIGURED secret yields a STABLE pubkey across two boots (receipts
+// persist across restarts), proving X402_RECEIPT_SECRET pins the key.
+await new Promise((resolveTest, rejectTest) => {
+  (async () => {
+    const { spawn } = await import("node:child_process");
+    const SECRET = "07".repeat(32); // fixed hex seed
+    const bootPubkey = async (PORT) => {
+      const child = spawn(process.execPath, ["server.mjs"], {
+        env: { ...process.env, PORT: String(PORT), XAHAU_WSS: "", X402_RECEIPT_SECRET: SECRET },
+        stdio: ["ignore", "ignore", "ignore"],
+      });
+      const getJson = (path) => new Promise((res) => {
+        const r = http.request({ host: "127.0.0.1", port: PORT, path, method: "GET" }, (resp) => { let d = ""; resp.on("data", (c) => (d += c)); resp.on("end", () => { try { res(JSON.parse(d)); } catch { res(null); } }); });
+        r.on("error", () => res(null)); r.end();
+      });
+      const waitListen = async () => { for (let i = 0; i < 50; i++) { const ok = await new Promise((res) => { const r = http.request({ host: "127.0.0.1", port: PORT, path: "/supported", method: "GET" }, (resp) => { resp.resume(); res(resp.statusCode === 200); }); r.on("error", () => res(false)); r.end(); }); if (ok) return true; await new Promise((r) => setTimeout(r, 100)); } return false; };
+      try {
+        if (!(await waitListen())) throw new Error("server did not start");
+        const pk = await getJson("/pubkey");
+        return pk.pubkey;
+      } finally { child.kill("SIGKILL"); }
+    };
+    try {
+      const p1 = await bootPubkey(4094);
+      const p2 = await bootPubkey(4093);
+      assert.equal(p1, p2, "a configured X402_RECEIPT_SECRET pins a STABLE pubkey across boots (persistent receipts)");
+      resolveTest();
+    } catch (e) { rejectTest(e); }
+  })().catch(rejectTest);
+});
+
+// ===========================================================================
+// FEATURE 3 — x402 `upto` scheme + GET /status/:id
+// ===========================================================================
+// Scheme semantics: absent/`upto` => paid <= max (legacy ceiling); `exact` => paid
+// MUST EQUAL max. Both native + IOU, at/over/under boundaries.
+{
+  // NATIVE — default (absent scheme) keeps the ceiling behavior.
+  let r2 = verifyExact({ txBlob: blob({ Amount: "1000000" }) }, { payTo: PAY_TO, maxAmountRequired: "1000000", network: "xahau" });
+  assert.equal(r2.isValid, true, "native default: paid==max passes");
+  assert.equal(r2.scheme, "upto", "absent scheme defaults to upto (legacy ceiling)");
+  r2 = verifyExact({ txBlob: blob({ Amount: "500000" }) }, { payTo: PAY_TO, maxAmountRequired: "1000000", network: "xahau" });
+  assert.equal(r2.isValid, true, "native default: paid<max passes (ceiling)");
+
+  // NATIVE — explicit "upto".
+  r2 = verifyExact({ txBlob: blob({ Amount: "500000" }) }, { payTo: PAY_TO, maxAmountRequired: "1000000", network: "xahau", scheme: "upto" });
+  assert.equal(r2.isValid, true, "native upto: paid<max passes");
+  assert.equal(r2.scheme, "upto");
+  r2 = verifyExact({ txBlob: blob({ Amount: "1500000" }) }, { payTo: PAY_TO, maxAmountRequired: "1000000", network: "xahau", scheme: "upto" });
+  assert.equal(r2.isValid, false, "native upto: paid>max fails");
+
+  // NATIVE — "exact": paid MUST EQUAL max.
+  r2 = verifyExact({ txBlob: blob({ Amount: "1000000" }) }, { payTo: PAY_TO, maxAmountRequired: "1000000", network: "xahau", scheme: "exact" });
+  assert.equal(r2.isValid, true, "native exact: paid==max passes");
+  assert.equal(r2.scheme, "exact");
+  r2 = verifyExact({ txBlob: blob({ Amount: "999999" }) }, { payTo: PAY_TO, maxAmountRequired: "1000000", network: "xahau", scheme: "exact" });
+  assert.equal(r2.isValid, false, "native exact: paid<max FAILS (must equal)");
+  assert.match(r2.invalidReason, /!= maxAmountRequired/);
+  r2 = verifyExact({ txBlob: blob({ Amount: "1000001" }) }, { payTo: PAY_TO, maxAmountRequired: "1000000", network: "xahau", scheme: "exact" });
+  assert.equal(r2.isValid, false, "native exact: paid>max fails (over the ceiling)");
+
+  // IOU — "upto" vs "exact".
+  r2 = verifyExact({ txBlob: iouBlob({ value: "1.0" }) }, { ...iouReq, scheme: "upto" });
+  assert.equal(r2.isValid, true, "IOU upto: 1.0 <= 1.5 passes");
+  r2 = verifyExact({ txBlob: iouBlob({ value: "1.0" }) }, { ...iouReq, scheme: "exact" });
+  assert.equal(r2.isValid, false, "IOU exact: 1.0 != 1.5 FAILS");
+  assert.match(r2.invalidReason, /!= maxAmountRequired/);
+  r2 = verifyExact({ txBlob: iouBlob({ value: "1.5" }) }, { ...iouReq, scheme: "exact" });
+  assert.equal(r2.isValid, true, "IOU exact: 1.5 == 1.5 passes");
+  r2 = verifyExact({ txBlob: iouBlob({ value: "1.5" }) }, { payTo: PAY_TO, maxAmountRequired: "1.50", network: "xahau", asset: IOU_ASSET, scheme: "exact" });
+  assert.equal(r2.isValid, true, "IOU exact: 1.5 == 1.50 (exact compare, trailing zero) passes");
+
+  // Unknown scheme is rejected (never coerced to a weaker check).
+  r2 = verifyExact({ txBlob: blob() }, { payTo: PAY_TO, maxAmountRequired: "1000000", network: "xahau", scheme: "atmost" });
+  assert.equal(r2.isValid, false, "unknown scheme rejected");
+  assert.match(r2.invalidReason, /unknown scheme/);
+
+  // settle honors the scheme (re-verifies): an exact-scheme under-pay is rejected before submit.
+  (async () => {})(); // (settle exact path covered below in the integration test)
+}
+
+// FEATURE 3 — settle re-validates the scheme (exact under-pay rejected, no submit).
+{
+  const prev = process.env.XAHAU_WSS;
+  process.env.XAHAU_WSS = "wss://invalid.example";
+  const { InMemoryStore } = __test;
+  const now = 1_000_000_000, curLedger = 100;
+  const store = new InMemoryStore({ now: () => now });
+  let submitCount = 0;
+  const client = { isConnected: () => true, request: async () => ({ result: { account_objects: [] } }), submitAndWait: async () => { submitCount++; return { result: { hash: "X", meta: { TransactionResult: "tesSUCCESS", delivered_amount: "1000000" } } }; } };
+  const deps = { store, client, currentValidatedLedger: async () => curLedger, now: () => now };
+  const exactReq = { payTo: PAY_TO, maxAmountRequired: "1000000", network: "xahau", scheme: "exact" };
+  const out = await __test.settle({ txBlob: blob({ Amount: "999999", LastLedgerSequence: curLedger + 5, Sequence: 411 }) }, exactReq, deps);
+  assert.equal(out.success, false, "settle rejects an exact-scheme under-pay");
+  assert.match(out.errorReason, /verify failed/);
+  assert.equal(submitCount, 0, "no submit for a scheme-rejected payment");
+  // An exact-scheme payment that DOES equal max settles fine.
+  const out2 = await __test.settle({ txBlob: blob({ Amount: "1000000", LastLedgerSequence: curLedger + 5, Sequence: 412 }) }, exactReq, deps);
+  assert.equal(out2.success, true, `exact-scheme paid==max settles: ${out2.errorReason}`);
+  assert.equal(submitCount, 1, "exact-scheme exact-match submits once");
+  if (prev === undefined) delete process.env.XAHAU_WSS; else process.env.XAHAU_WSS = prev;
+}
+
+// FEATURE 3 — GET /status/:id: auth-gate + found/unknown over a spawned server.
+await new Promise((resolveTest, rejectTest) => {
+  (async () => {
+    const { spawn } = await import("node:child_process");
+    const PORT = 4092;
+    const SECRET = "status-secret";
+    const child = spawn(process.execPath, ["server.mjs"], {
+      env: { ...process.env, PORT: String(PORT), XAHAU_WSS: "", X402_SHARED_SECRET: SECRET },
+      stdio: ["ignore", "ignore", "ignore"],
+    });
+    const getJson = (path, headers = {}) => new Promise((res) => {
+      const r = http.request({ host: "127.0.0.1", port: PORT, path, method: "GET", headers }, (resp) => {
+        let data = ""; resp.on("data", (c) => (data += c));
+        resp.on("end", () => { let body; try { body = JSON.parse(data); } catch { body = data; } res({ status: resp.statusCode, body }); });
+      });
+      r.on("error", () => res({ status: null, body: null })); r.end();
+    });
+    const waitListen = async () => { for (let i = 0; i < 50; i++) { const ok = await new Promise((res) => { const r = http.request({ host: "127.0.0.1", port: PORT, path: "/supported", method: "GET" }, (resp) => { resp.resume(); res(resp.statusCode === 200); }); r.on("error", () => res(false)); r.end(); }); if (ok) return true; await new Promise((r) => setTimeout(r, 100)); } return false; };
+    try {
+      assert.equal(await waitListen(), true, "facilitator should start for the /status test");
+      // WITHOUT the secret -> 401 (auth-gated).
+      const unauth = await getJson("/status/some-id");
+      assert.equal(unauth.status, 401, "/status without the secret -> 401");
+      // WITH the secret, an unknown id -> found:false, status:unknown.
+      const unknown = await getJson("/status/never-settled", { "x-x402-secret": SECRET });
+      assert.equal(unknown.status, 200, "/status (with secret) returns 200");
+      assert.equal(unknown.body.found, false, "unknown id -> found:false");
+      assert.equal(unknown.body.status, "unknown", "unknown id -> status:unknown (honest)");
+      resolveTest();
+    } catch (e) { rejectTest(e); }
+    finally { child.kill("SIGKILL"); }
+  })().catch(rejectTest);
+});
+
+// FEATURE 3 — /status returns a stored receipt (found:settled) via the injected store.
+// We can't easily settle a real tx over the spawned server (no node), so assert the
+// store-exposure contract directly: a receipt set in the store is returned by getReceipt
+// (the same call /status makes), and an absent key is "unknown".
+{
+  const { InMemoryStore } = __test;
+  const now = Date.now();
+  const s = new InMemoryStore({ now: () => now });
+  const rcpt = { success: true, transaction: "STATUSHASH", payer: PAYER, network: "xahau" };
+  await s.setReceipt("acct:" + PAYER + ":999", rcpt, now + 3_600_000);
+  assert.deepEqual(await s.getReceipt("acct:" + PAYER + ":999"), rcpt, "/status surfaces a stored receipt verbatim (found:settled)");
+  assert.equal(await s.getReceipt("acct:" + PAYER + ":nope"), undefined, "/status returns unknown for an absent id");
+}
+
+// ===========================================================================
+// FEATURE 4 — pre-settle simulation (ADVISORY, config-gated)
+// ===========================================================================
+{
+  const { simulatePayment } = __test;
+
+  // Feature OFF when no URL + no injected fn -> available:false, never throws.
+  let sim = await simulatePayment({ txBlob: blob() }, req, { mcpUrl: undefined });
+  assert.equal(sim.available, false, "simulation off when X402_MCP_URL unset");
+  assert.match(sim.note, /not configured/, "honest 'not configured' note");
+
+  // Injected simulateFn returning an accept-prediction.
+  sim = await simulatePayment({ txBlob: blob() }, req, { simulateFn: async () => ({ available: true, prediction: "accept" }) });
+  assert.equal(sim.available, true); assert.equal(sim.prediction, "accept");
+
+  // A throwing simulateFn fails SOFT (available:false, no throw).
+  sim = await simulatePayment({ txBlob: blob() }, req, { simulateFn: async () => { throw new Error("mcp down"); } });
+  assert.equal(sim.available, false, "sim error fails soft (available:false)");
+  assert.match(sim.note, /unavailable/, "honest 'unavailable' note");
+}
+
+// FEATURE 4 — dryRun on settle returns a prediction and NEVER submits / reserves.
+{
+  const prev = process.env.XAHAU_WSS;
+  process.env.XAHAU_WSS = "wss://invalid.example";
+  const { InMemoryStore } = __test;
+  const now = 1_000_000_000, curLedger = 100;
+  const store = new InMemoryStore({ now: () => now });
+  let submitCount = 0;
+  const client = { isConnected: () => true, request: async () => ({ result: { account_objects: [] } }), submitAndWait: async () => { submitCount++; return { result: { hash: "SHOULD_NOT", meta: { TransactionResult: "tesSUCCESS" } } }; } };
+  const deps = {
+    store, client, currentValidatedLedger: async () => curLedger, now: () => now,
+    dryRun: true, simulateFn: async () => ({ available: true, prediction: "accept" }),
+  };
+  const out = await __test.settle({ txBlob: blob({ LastLedgerSequence: curLedger + 5, Sequence: 421 }) }, req, deps);
+  assert.equal(out.dryRun, true, "dryRun flagged");
+  assert.equal(out.advisory, true, "dryRun is advisory");
+  assert.equal(out.success, false, "dryRun is not a real settlement");
+  assert.equal(out.simulation.prediction, "accept", "dryRun returns the prediction");
+  assert.equal(submitCount, 0, "dryRun NEVER submits");
+  assert.equal(store.map.size, 0, "dryRun reserves NO replay slot");
+  assert.equal(await store.getReceipt("acct:" + PAYER + ":421"), undefined, "dryRun stores no receipt");
+
+  // A dryRun on an INVALID payload is still rejected by verify (security preserved).
+  const outBad = await __test.settle({ txBlob: blob({ Amount: "9000000", LastLedgerSequence: curLedger + 5, Sequence: 422 }) }, req, { ...deps, dryRun: true });
+  assert.equal(outBad.success, false, "dryRun still re-verifies");
+  assert.match(outBad.errorReason, /verify failed/, "an over-max dryRun is rejected by verify, not 'advisory'");
+
+  if (prev === undefined) delete process.env.XAHAU_WSS; else process.env.XAHAU_WSS = prev;
+}
+
+// FEATURE 4 — opt-in preSimReject short-circuits a PREDICTED-REJECT (no submit, no
+// slot), but a predicted-ACCEPT (or unavailable sim) still runs the FULL real settle.
+{
+  const prev = process.env.XAHAU_WSS;
+  process.env.XAHAU_WSS = "wss://invalid.example";
+  const { InMemoryStore } = __test;
+  const now = 1_000_000_000, curLedger = 100;
+
+  // (a) predicted reject + opt-in -> advisory rejection, no submit, no slot.
+  {
+    const store = new InMemoryStore({ now: () => now });
+    let submitCount = 0;
+    const client = { isConnected: () => true, request: async () => ({ result: { account_objects: [] } }), submitAndWait: async () => { submitCount++; return { result: { hash: "NO", meta: { TransactionResult: "tesSUCCESS" } } }; } };
+    const deps = { store, client, currentValidatedLedger: async () => curLedger, now: () => now, preSimReject: true, simulateFn: async () => ({ available: true, prediction: "reject" }) };
+    const out = await __test.settle({ txBlob: blob({ LastLedgerSequence: curLedger + 5, Sequence: 431 }) }, req, deps);
+    assert.equal(out.success, false, "predicted-reject short-circuits");
+    assert.equal(out.advisory, true, "predicted-reject is clearly advisory");
+    assert.match(out.errorReason, /predicted-reject \(simulated, not submitted\)/, "advisory rejection labeled honestly");
+    assert.equal(submitCount, 0, "predicted-reject does NOT submit");
+    assert.equal(store.map.size, 0, "predicted-reject reserves NO replay slot");
+  }
+
+  // (b) predicted ACCEPT + opt-in -> still runs the FULL real settle (security unchanged).
+  {
+    const store = new InMemoryStore({ now: () => now });
+    let submitCount = 0;
+    const client = { isConnected: () => true, request: async () => ({ result: { account_objects: [] } }), submitAndWait: async () => { submitCount++; return { result: { hash: "REALSUBMIT", meta: { TransactionResult: "tesSUCCESS", delivered_amount: "1000000" } } }; } };
+    const deps = { store, client, currentValidatedLedger: async () => curLedger, now: () => now, preSimReject: true, simulateFn: async () => ({ available: true, prediction: "accept" }) };
+    const out = await __test.settle({ txBlob: blob({ LastLedgerSequence: curLedger + 5, Sequence: 432 }) }, req, deps);
+    assert.equal(out.success, true, "predicted-accept runs the full real settle");
+    assert.equal(submitCount, 1, "predicted-accept actually submits (advisory never replaces real settle)");
+  }
+
+  // (c) UNAVAILABLE sim + opt-in -> NOT short-circuited; full real settle runs.
+  {
+    const store = new InMemoryStore({ now: () => now });
+    let submitCount = 0;
+    const client = { isConnected: () => true, request: async () => ({ result: { account_objects: [] } }), submitAndWait: async () => { submitCount++; return { result: { hash: "REAL2", meta: { TransactionResult: "tesSUCCESS", delivered_amount: "1000000" } } }; } };
+    const deps = { store, client, currentValidatedLedger: async () => curLedger, now: () => now, preSimReject: true, simulateFn: async () => ({ available: false, note: "simulation unavailable" }) };
+    const out = await __test.settle({ txBlob: blob({ LastLedgerSequence: curLedger + 5, Sequence: 433 }) }, req, deps);
+    assert.equal(out.success, true, "an unavailable sim does NOT block the real settle (fail soft)");
+    assert.equal(submitCount, 1, "unavailable sim -> full real settle still submits");
+  }
+
+  if (prev === undefined) delete process.env.XAHAU_WSS; else process.env.XAHAU_WSS = prev;
+}
+
+// FEATURE 4 — /simulate route is 404 when X402_MCP_URL is unset (feature entirely off).
+await new Promise((resolveTest, rejectTest) => {
+  (async () => {
+    const { spawn } = await import("node:child_process");
+    const PORT = 4091;
+    const child = spawn(process.execPath, ["server.mjs"], {
+      env: { ...process.env, PORT: String(PORT), XAHAU_WSS: "", X402_MCP_URL: "" },
+      stdio: ["ignore", "ignore", "ignore"],
+    });
+    const postJson = (path) => new Promise((res) => {
+      const body = "{}";
+      const r = http.request({ host: "127.0.0.1", port: PORT, path, method: "POST", headers: { "content-type": "application/json", "content-length": Buffer.byteLength(body) } }, (resp) => { resp.resume(); resp.on("end", () => res(resp.statusCode)); });
+      r.on("error", () => res(null)); r.write(body); r.end();
+    });
+    const waitListen = async () => { for (let i = 0; i < 50; i++) { const ok = await new Promise((res) => { const r = http.request({ host: "127.0.0.1", port: PORT, path: "/supported", method: "GET" }, (resp) => { resp.resume(); res(resp.statusCode === 200); }); r.on("error", () => res(false)); r.end(); }); if (ok) return true; await new Promise((r) => setTimeout(r, 100)); } return false; };
+    try {
+      assert.equal(await waitListen(), true, "facilitator should start for the /simulate-off test");
+      const s = await postJson("/simulate");
+      assert.equal(s, 404, "/simulate is 404 when X402_MCP_URL is unset (feature off, no coupling)");
+      resolveTest();
+    } catch (e) { rejectTest(e); }
+    finally { child.kill("SIGKILL"); }
+  })().catch(rejectTest);
+});
+
+console.log("ok — all hardened verifyExact + settle cases pass (native + IOU + ops hardening + x402 spec fields + policy/receipts/scheme/status/simulate)");
