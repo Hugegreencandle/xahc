@@ -1,5 +1,7 @@
 # exact-xahau — reference x402 facilitator for Xahau
 
+> Also available as a standalone repo: **[github.com/Hugegreencandle/x402-xahau](https://github.com/Hugegreencandle/x402-xahau)** (history-preserved mirror of this directory).
+
 A runnable reference for the proposed `exact-xahau` x402 scheme
 (spec: [../docs/X402-XAHAU.md](../docs/X402-XAHAU.md)). It turns that proposal
 into working code so the design can be exercised and ratified.
