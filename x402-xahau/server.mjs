@@ -7,8 +7,14 @@
  *   GET  /supported  -> advertise {kinds:[{x402Version:2, scheme:"exact", network:"xahau"}]}
  *   POST /verify     -> offline checks on a signed Xahau Payment vs the requirements
  *   POST /settle     -> submit the signed tx to Xahau (needs XAHAU_WSS)
- *   GET  /health     -> liveness/readiness JSON (no auth, cheap, never throws)
- *   GET  /metrics    -> counters as JSON, or Prometheus text on Accept: text/plain
+ *   GET  /health     -> liveness JSON. UNAUTHENTICATED callers get a minimal
+ *                       { status, network, uptimeSec } (LB liveness). Sensitive
+ *                       internals (backends, redis/xrpl connectivity, networkID,
+ *                       replayBindings) are returned ONLY to an authenticated caller
+ *                       (shared secret, same as /settle). Cheap, never throws.
+ *   GET  /metrics    -> counters as JSON, or Prometheus text on Accept: text/plain.
+ *                       AUTH-GATED behind the shared secret (401 otherwise; open in
+ *                       reference mode when no SHARED_SECRET is configured).
  *
  * x402 SPEC ALIGNMENT (non-breaking; originals retained): /verify returns the
  * spec's {isValid, invalidReason?, payer}; /settle returns {success, transaction,
@@ -60,8 +66,14 @@
  * failure that spent the sequence) memoize a receipt keyed by the replay id; a retry
  * returns that receipt (replayed:true) — never a re-submit — while an in-flight /
  * ambiguous payment returns "already consumed" (inFlight:true) with no fabricated
- * receipt. Both public POST paths (/verify and /settle) are rate-limited; /settle
- * additionally requires the shared secret.
+ * receipt. Both public POST paths (/verify and /settle) are rate-limited; /settle,
+ * /metrics, and the VERBOSE form of /health additionally require the shared secret.
+ * A pre-submit replay-store outage (Redis down on isConsumed/getReceipt/reserve) is
+ * caught and surfaced as a RETRYABLE 503 (fail-CLOSED — never proceeds to submit),
+ * not an opaque 500. The HTTP server is bounded against slowloris/flood: a request/
+ * headers timeout caps how long a slow client may drip a request, maxConnections caps
+ * concurrent sockets, and graceful shutdown closes idle keep-alive sockets so a slow
+ * client can't ride out the drain budget (all applied in serve(), never at import).
  * Signatures are bound to Account (deriveAddress == Account); RegularKey/multisig
  * are offline-unverifiable and are flagged (signatureVerified:false), not passed.
  *
@@ -827,7 +839,12 @@ export class RedisStore {
   async reserve(key, expiryMs, now = this._now()) {
     // Fail-closed hard cap (Hole 2): refuse when at the cap and the key is absent.
     // DBSIZE is a coarse, shared-store approximation of "live entries"; we count
-    // hash+receipt keys against it, which only makes the cap MORE conservative.
+    // hash+receipt keys against it, which only makes the cap MORE conservative. It
+    // ALSO counts the SHARED rate-limiter (`rl:<ip>:<window>`) keys when the Redis
+    // rate limiter shares this DB, so under rate-limit traffic the cap is more
+    // conservative still (it can refuse a reservation before REPLAY_MAX replay
+    // bindings exist). This only ever errs toward refusing early (fail-closed), never
+    // toward over-admitting — acceptable for a hard cap; size it with that headroom.
     const px = this._px(expiryMs, now);
     // Atomic test-and-set: OK iff newly reserved, nil iff a live binding exists.
     const r = await this.redis.set(key, "1", "NX", "PX", px);
@@ -1013,6 +1030,21 @@ function submitDefinitelyNotApplied(e) {
   return /\btem[A-Z][A-Z_]{2,}\b/.test(msg);
 }
 
+/**
+ * (F3) Uniform fail-CLOSED + RETRYABLE reply for a PRE-SUBMIT replay-store/backend
+ * outage (e.g. Redis unreachable on isConsumed/getReceipt/reserve). The submit has
+ * NOT happened, so refusing is always safe; marking it retryable lets the handler
+ * surface a 503 (vs an opaque 500) so the client retries instead of treating it as a
+ * hard failure. The store error CLASS only is logged (never the payment / payer PII
+ * inside the error). This path NEVER appears AFTER submitAndWait — a post-submit
+ * persistence failure is handled best-effort (F2), not as a retryable reject.
+ */
+function settleStoreUnavailable(payer, e, stage) {
+  recordSettleReject("other");
+  log("error", "settle_store_unavailable", { stage, error: String(e?.name || "store_error") });
+  return { success: false, network: NETWORK, transaction: "", payer: payer ?? "", errorReason: "replay store unavailable", retryable: true };
+}
+
 // ---------------------------------------------------------------------------
 // settle
 // ---------------------------------------------------------------------------
@@ -1045,8 +1077,21 @@ async function settle(payload, req, _deps = {}) {
   // binding exists but no receipt yet (in-flight, or the ambiguous-retained case),
   // the outcome is genuinely unknown: return the existing "already consumed" reply
   // (inFlight:true) and NEVER re-submit.
-  if (await st.isConsumed(v.replayId)) {
-    const receipt = await st.getReceipt(v.replayId);
+  //
+  // (F3) These are PRE-SUBMIT store reads. If the backend (Redis) is down they THROW.
+  // That MUST fail CLOSED — we have not submitted, so refusing is safe — but it must
+  // also be RETRYABLE (503), not an opaque 500. A store throw here can NEVER be
+  // swallowed into "not consumed -> proceed to submit": that would be fail-OPEN
+  // (re-submitting a maybe-already-settled payment). So on any store error we REJECT
+  // with retryable:true and return WITHOUT submitting. settleStoreUnavailable() builds
+  // that uniform reply; the handler maps retryable -> 503.
+  let alreadyConsumed;
+  try { alreadyConsumed = await st.isConsumed(v.replayId); }
+  catch (e) { return settleStoreUnavailable(v.payer, e, "isConsumed"); }
+  if (alreadyConsumed) {
+    let receipt;
+    try { receipt = await st.getReceipt(v.replayId); }
+    catch (e) { return settleStoreUnavailable(v.payer, e, "getReceipt"); }
     if (receipt) { metricInc("settle_replayed"); return { ...receipt, payer: receipt.payer ?? v.payer, replayed: true }; }
     recordSettleReject("replay_inflight");
     return { success: false, network: NETWORK, transaction: "", payer: v.payer, errorReason: "replay: payment already consumed", inFlight: true };
@@ -1107,7 +1152,12 @@ async function settle(payload, req, _deps = {}) {
   // tx's REAL on-ledger window (Hole 1). "full" = store at cap with only LIVE
   // entries (Hole 2, fail closed) -> surface 503. "exists" = another settle already
   // holds it -> idempotent replay branch (return receipt if any, else in-flight).
-  const res = await st.reserve(v.replayId, expiryMs, now);
+  // (F3) reserve() is the last PRE-SUBMIT store call. A backend throw here likewise
+  // fails CLOSED + RETRYABLE: we have NOT submitted, so refusing is safe, and we must
+  // never treat a thrown reserve as "reserved" and proceed (fail-OPEN). Reject 503.
+  let res;
+  try { res = await st.reserve(v.replayId, expiryMs, now); }
+  catch (e) { return settleStoreUnavailable(v.payer, e, "reserve"); }
   if (res === "full") {
     recordSettleReject("store_full");
     log("warn", "settle_store_full", {});
@@ -1146,12 +1196,34 @@ async function settle(payload, req, _deps = {}) {
     return { success: false, network: NETWORK, transaction: "", payer: v.payer, errorReason: "submit result unknown — reservation retained until validity window expires", guardrailHookPresent: hookPresent };
   }
 
-  const meta = r.result.meta || {};
-  const code = meta.TransactionResult;
-  const hash = r.result.hash;
+  // (F1) Guard the RESOLVED submitAndWait response shape. submitAndWait can RESOLVE
+  // (no throw) yet hand back a shape we cannot classify (r/r.result missing/not an
+  // object, or no usable TransactionResult code). A resolved-but-unreadable submit
+  // means the tx MAY be on-ledger — so we must fail CLOSED EXACTLY like the
+  // ambiguous-retained throw path: KEEP the reservation (already held), store NO
+  // receipt, count it in the submit_ambiguous bucket, and return the unknown-outcome
+  // reply. NEVER 500, NEVER release — releasing here would reopen the Hole-1 window
+  // for a maybe-applied tx (double-settle). A retry then sees the live binding and is
+  // treated as in-flight (no re-submit).
+  const result = (r && typeof r === "object") ? r.result : undefined;
+  const meta = (result && typeof result === "object" && result.meta) ? result.meta : {};
+  const code = (result && typeof result === "object") ? result.meta?.TransactionResult : undefined;
+  const hash = (result && typeof result === "object") ? result.hash : undefined;
+  if (!result || typeof result !== "object" || typeof code !== "string" || code.length === 0) {
+    // Genuinely unclassifiable resolved response -> ambiguous-retained (fail closed).
+    recordSettleReject("submit_ambiguous");
+    log("warn", "settle_submit_unreadable_response", { reservationRetained: true });
+    return { success: false, network: NETWORK, transaction: "", payer: v.payer, errorReason: "submit result unknown — reservation retained until validity window expires", guardrailHookPresent: hookPresent };
+  }
   // The hash binding shares the tx's window. If the store is momentarily full it
   // is fine to skip the redundant hash entry — replayId already holds the slot.
-  if (hash) await st.set(`hash:${hash}`, expiryMs, now);
+  // (F2) Best-effort: a store-write failure here must NEVER 500 — the submit already
+  // happened and the reservation is already held, so a retry still can't double-submit.
+  // Log + continue; the authoritative receipt is still returned below.
+  if (hash) {
+    try { await st.set(`hash:${hash}`, expiryMs, now); }
+    catch (e) { log("warn", "settle_receipt_persist_failed", { stage: "hash", error: String(e?.name || "store_error") }); }
+  }
 
   // Build the terminal receipt + persist it keyed by replayId (same window expiry),
   // so a retry of this terminal payment returns the real outcome (replayed:true)
@@ -1236,7 +1308,14 @@ async function settle(payload, req, _deps = {}) {
     recordSettleReject("delivered_short");
     log("warn", "settle_delivered_short", { reason: receipt.errorReason });
   }
-  await st.setReceipt(v.replayId, receipt, expiryMs);
+  // (F2) Persist the receipt best-effort. The submit already happened, so the
+  // computed receipt is the AUTHORITATIVE outcome even if persistence flaps (Redis
+  // down post-submit). A throw here must NOT escape settle (that would 500 and lose
+  // the receipt for an APPLIED tx, and a retry would see inFlight forever). The
+  // reservation is already held, so failing to memoize the receipt only costs a
+  // future retry its idempotent "replayed" receipt — strictly safer than a 500.
+  try { await st.setReceipt(v.replayId, receipt, expiryMs); }
+  catch (e) { log("warn", "settle_receipt_persist_failed", { stage: "receipt", error: String(e?.name || "store_error") }); }
   return receipt;
 }
 
@@ -1411,7 +1490,8 @@ export function validateConfig(env = process.env) {
   if (env.X402_REDIS_URL !== undefined && env.X402_REDIS_URL !== "") {
     let ok = false;
     try { const u = new URL(env.X402_REDIS_URL); ok = u.protocol === "redis:" || u.protocol === "rediss:"; } catch { ok = false; }
-    if (!ok) fatal.push(`X402_REDIS_URL="${env.X402_REDIS_URL}" is not a redis:// or rediss:// URL`);
+    // Do NOT echo the value — a redis URL can carry an embedded password.
+    if (!ok) fatal.push(`X402_REDIS_URL is set but is not a redis:// or rediss:// URL`);
   }
 
   return { fatal, warnings };
@@ -1421,26 +1501,38 @@ export function validateConfig(env = process.env) {
 // /health + /metrics builders (cheap, never throw)
 // ---------------------------------------------------------------------------
 /**
- * Build the /health liveness+readiness object. NEVER throws (caught internally),
- * NEVER requires auth, and is HONEST: connectivity it cannot determine is reported
- * as a falsy/unknown value rather than fabricated as healthy.
+ * Build the /health object. NEVER throws (caught internally) and is HONEST:
+ * connectivity it cannot determine is reported as a falsy/unknown value rather than
+ * fabricated as healthy.
+ *
+ * AUTH SPLIT: an UNAUTHENTICATED caller (LB liveness probe) gets only the MINIMAL
+ * shape { status, network, uptimeSec } — enough to decide "alive?" without exposing
+ * internals. An AUTHENTICATED caller (authed===true; same shared-secret check as
+ * /settle) additionally gets the sensitive operational internals (replayStore /
+ * rateLimiter backend, redisConnected, xrplConnected, xrplConfigured, networkID,
+ * replayBindings). When NO secret is configured (reference mode) the route treats
+ * every caller as authed, so the verbose object is returned (matches /settle being
+ * open in that mode).
  *
  * `xrplConnected` is only truthy if a pooled client object reports isConnected();
  * we do NOT open a connection here (health must be cheap) — if no client has been
  * built yet it is reported `false` (unknown-but-not-claimed-healthy). Same honesty
  * for Redis: only reported connected if the client exposes a 'ready' status.
  */
-function buildHealth() {
+function buildHealth(authed = true) {
+  // Minimal liveness shape — always safe to expose unauthenticated.
   const h = {
     status: "ok",
     network: NETWORK,
-    networkID: EXPECTED_NETWORK_ID,
-    replayStore: "memory",
-    rateLimiter: "memory",
-    xrplConfigured: !!process.env.XAHAU_WSS,
     uptimeSec: Math.floor((Date.now() - BOOT_TS) / 1000),
-    replayBindings: 0,
   };
+  if (!authed) return h;
+  // Verbose (authenticated) internals.
+  h.networkID = EXPECTED_NETWORK_ID;
+  h.replayStore = "memory";
+  h.rateLimiter = "memory";
+  h.xrplConfigured = !!process.env.XAHAU_WSS;
+  h.replayBindings = 0;
   try {
     const usingRedis = !!process.env.X402_REDIS_URL;
     h.replayStore = (store instanceof RedisStore) ? "redis" : "memory";
@@ -1471,6 +1563,16 @@ function buildHealth() {
 // before we force-close. Kept short so orchestrators' kill grace isn't exceeded.
 const SHUTDOWN_DRAIN_MS = Number(process.env.X402_SHUTDOWN_DRAIN_MS) || 10000;
 
+// Slowloris / resource-exhaustion bounds (applied on the server in serve(), never
+// at import). requestTimeout caps the total time to receive a full request (a slow
+// drip body can't tie up a socket forever); headersTimeout caps time to receive the
+// headers; maxConnections caps concurrent sockets so a connection flood can't
+// exhaust fds. These complement the existing MAX_BODY_BYTES (size) bound with TIME +
+// COUNT bounds. Values are conservative defaults; maxConnections is env-tunable.
+const REQUEST_TIMEOUT_MS = Number(process.env.X402_REQUEST_TIMEOUT_MS) || 15000;
+const HEADERS_TIMEOUT_MS = Number(process.env.X402_HEADERS_TIMEOUT_MS) || 10000;
+const MAX_CONNECTIONS = Math.max(1, Number(process.env.X402_MAX_CONNECTIONS) || 1024);
+
 function serve() {
   // (6) Boot-time config validation: FAIL FAST on a fatal misconfig (bad PORT,
   // malformed URLs, inconsistent network id); LOG warnings for non-fatal gaps
@@ -1490,12 +1592,21 @@ function serve() {
   rateLimiter = createRateLimiter();
   const server = http.createServer(async (req, res) => {
     try {
-      // --- liveness/readiness: cheap, unauthenticated, never throws ----------
+      // --- liveness/readiness: cheap, never throws ---------------------------
+      // The MINIMAL { status, network, uptimeSec } shape is ALWAYS unauthenticated
+      // (LB liveness probes must not need a secret). The verbose operational
+      // internals are returned ONLY to an authenticated caller (authOk — same
+      // shared-secret check as /settle). In reference mode (no SHARED_SECRET) authOk
+      // is always true, so the verbose object is returned to everyone.
       if (req.method === "GET" && req.url === "/health")
-        return send(res, 200, buildHealth());
+        return send(res, 200, buildHealth(authOk(req)));
 
       // --- metrics: JSON by default, Prometheus text on Accept: text/plain ---
+      // /metrics exposes operational counters and is auth-gated behind the same
+      // shared secret as /settle (401 if it fails). In reference mode (no
+      // SHARED_SECRET) it stays open, mirroring /settle.
       if (req.method === "GET" && req.url === "/metrics") {
+        if (!authOk(req)) return send(res, 401, { error: "unauthorized" });
         const accept = String(req.headers["accept"] || "");
         if (/text\/plain/i.test(accept)) {
           const body = metricsPrometheus();
@@ -1555,6 +1666,13 @@ function serve() {
     res.on("close", () => { /* finish already decremented; close after finish is a no-op */ });
   });
 
+  // Slowloris / flood bounds (set HERE on the live server, never at import). A slow
+  // client cannot drip a request indefinitely (requestTimeout/headersTimeout) and a
+  // connection flood cannot exhaust file descriptors (maxConnections).
+  server.requestTimeout = REQUEST_TIMEOUT_MS;
+  server.headersTimeout = HEADERS_TIMEOUT_MS;
+  server.maxConnections = MAX_CONNECTIONS;
+
   server.listen(PORT, () => logInfo("listening", { port: Number(PORT), network: NETWORK, networkID: EXPECTED_NETWORK_ID }));
 
   // (5) Graceful shutdown — attached ONLY here (never at import) so tests don't get
@@ -1572,6 +1690,13 @@ function serve() {
       logInfo("shutdown_complete", {});
       process.exit(0);
     });
+    // Close IDLE (keep-alive but not actively serving) connections immediately so a
+    // slow/idle client holding a socket open can't ride out the entire drain budget
+    // and stall server.close(). In-flight requests (their sockets are NOT idle) are
+    // left alone to finish within the bounded drain below. Guarded: older Node may
+    // lack closeIdleConnections.
+    try { if (typeof server.closeIdleConnections === "function") server.closeIdleConnections(); }
+    catch (e) { logWarn("shutdown_close_idle_failed", { error: String(e?.message || e) }); }
     // Bounded drain: if in-flight work doesn't finish in time, force-close + exit.
     const timer = setTimeout(async () => {
       logWarn("shutdown_drain_timeout", { inFlight, drainMs: SHUTDOWN_DRAIN_MS });

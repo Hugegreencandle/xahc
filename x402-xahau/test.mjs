@@ -750,6 +750,112 @@ function fakeClient({ result, throwErr } = {}) {
   if (prev === undefined) delete process.env.XAHAU_WSS; else process.env.XAHAU_WSS = prev;
 }
 
+// (F1) RESOLVED-BUT-UNREADABLE submit response -> ambiguous-retained (fail closed).
+//      submitAndWait RESOLVES (no throw) but hands back a malformed shape with no
+//      usable TransactionResult. settle must KEEP the reservation, store NO receipt,
+//      NOT throw/500, and a SECOND settle must be treated as in-flight / already-
+//      consumed with NO re-submit. (F1 is already implemented; this only tests it.)
+for (const badResult of [ {}, { result: {} }, { result: { meta: {} } }, { result: { meta: { TransactionResult: "" } } } ]) {
+  const prev = process.env.XAHAU_WSS;
+  process.env.XAHAU_WSS = "wss://invalid.example";
+  const { InMemoryStore } = __test;
+  const now = 1_000_000_000, curLedger = 100;
+  const store = new InMemoryStore({ now: () => now });
+  // fakeClient returns { result } — wrap so we control the WHOLE resolved value.
+  let submitCount = 0;
+  const client = {
+    isConnected: () => true,
+    request: async () => ({ result: { account_objects: [] } }),
+    submitAndWait: async () => { submitCount++; return badResult; },
+  };
+  const deps = { store, client, currentValidatedLedger: async () => curLedger, now: () => now };
+  const payment = { txBlob: blob({ LastLedgerSequence: curLedger + 5, Sequence: 301 }) };
+
+  const out1 = await __test.settle(payment, req, deps);
+  assert.equal(out1.success, false, "unreadable resolved response -> failure (not success)");
+  assert.match(out1.errorReason, /result unknown|retained/, "errorReason flags unknown/retained outcome");
+  assert.equal(out1.transaction, "", "no tx hash on an unreadable resolved response");
+  assert.equal(submitCount, 1, "submitted exactly once");
+  assert.equal(await store.isConsumed("acct:" + PAYER + ":301"), true, "reservation RETAINED on unreadable resolve");
+  assert.equal(await store.getReceipt("acct:" + PAYER + ":301"), undefined, "no receipt stored for the ambiguous-retained outcome");
+
+  const out2 = await __test.settle(payment, req, deps);
+  assert.equal(out2.success, false, "second settle still a failure");
+  assert.match(out2.errorReason, /already consumed/, "second settle -> already consumed (in-flight)");
+  assert.equal(out2.inFlight, true, "second settle flagged inFlight (no fabricated receipt)");
+  assert.equal(submitCount, 1, "unreadable-resolve retry does NOT re-submit");
+
+  if (prev === undefined) delete process.env.XAHAU_WSS; else process.env.XAHAU_WSS = prev;
+}
+
+// (F2) POST-SUBMIT receipt-persistence failure is BEST-EFFORT: a setReceipt that
+//      throws must NOT lose the success receipt or 500 — the submit already applied,
+//      so settle still returns success:true with the real tx. (Already implemented;
+//      this only tests it.)
+{
+  const prev = process.env.XAHAU_WSS;
+  process.env.XAHAU_WSS = "wss://invalid.example";
+  const now = 1_000_000_000, curLedger = 100;
+  const inner = new __test.InMemoryStore({ now: () => now });
+  let setReceiptCalls = 0;
+  const store = {
+    async reserve(k, e, n) { return inner.reserve(k, e, n); },
+    async isConsumed(k, n) { return inner.isConsumed(k, n); },
+    async getReceipt(k, n) { return inner.getReceipt(k, n); },
+    async setReceipt() { setReceiptCalls++; throw new Error("redis down (post-submit)"); },
+    async set(k, e, n) { return inner.set(k, e, n); },
+    async get(k, n) { return inner.get(k, n); },
+    async release(k) { return inner.release(k); },
+    async size() { return inner.size(); },
+  };
+  const client = fakeClient({ result: { hash: "F2HASH", meta: { TransactionResult: "tesSUCCESS", delivered_amount: "1000000" } } });
+  const deps = { store, client, currentValidatedLedger: async () => curLedger, now: () => now };
+  const payment = { txBlob: blob({ LastLedgerSequence: curLedger + 5, Sequence: 302 }) };
+
+  let out, threw = false;
+  try { out = await __test.settle(payment, req, deps); } catch { threw = true; }
+  assert.equal(threw, false, "a post-submit setReceipt throw does NOT escape settle (no 500)");
+  assert.equal(out.success, true, "success receipt still returned despite the persistence failure");
+  assert.equal(out.transaction, "F2HASH", "the real tx hash is preserved on the success receipt");
+  assert.equal(out.delivered, "1000000", "delivered amount preserved");
+  assert.ok(setReceiptCalls >= 1, "setReceipt WAS attempted (best-effort), and its throw was swallowed");
+
+  if (prev === undefined) delete process.env.XAHAU_WSS; else process.env.XAHAU_WSS = prev;
+}
+
+// (F3) PRE-SUBMIT store outage -> retryable 503-class reject, fail CLOSED: a store
+//      whose isConsumed/reserve throws makes settle return success:false +
+//      retryable:true and NEVER submit (submitCount stays 0 — never fail-OPEN).
+for (const failOn of ["isConsumed", "reserve"]) {
+  const prev = process.env.XAHAU_WSS;
+  process.env.XAHAU_WSS = "wss://invalid.example";
+  const now = 1_000_000_000, curLedger = 100;
+  const inner = new __test.InMemoryStore({ now: () => now });
+  const store = {
+    async reserve(k, e, n) { if (failOn === "reserve") throw new Error("redis down (reserve)"); return inner.reserve(k, e, n); },
+    async isConsumed(k, n) { if (failOn === "isConsumed") throw new Error("redis down (isConsumed)"); return inner.isConsumed(k, n); },
+    async getReceipt(k, n) { return inner.getReceipt(k, n); },
+    async setReceipt(k, r, e) { return inner.setReceipt(k, r, e); },
+    async set(k, e, n) { return inner.set(k, e, n); },
+    async get(k, n) { return inner.get(k, n); },
+    async release(k) { return inner.release(k); },
+    async size() { return inner.size(); },
+  };
+  const client = fakeClient({ result: { hash: "F3HASH", meta: { TransactionResult: "tesSUCCESS", delivered_amount: "1000000" } } });
+  const deps = { store, client, currentValidatedLedger: async () => curLedger, now: () => now };
+  const payment = { txBlob: blob({ LastLedgerSequence: curLedger + 5, Sequence: 303 }) };
+
+  let out, threw = false;
+  try { out = await __test.settle(payment, req, deps); } catch { threw = true; }
+  assert.equal(threw, false, `pre-submit store throw on ${failOn} does NOT escape settle (no 500)`);
+  assert.equal(out.success, false, `${failOn} throw -> settle fails closed`);
+  assert.equal(out.retryable, true, `${failOn} throw -> retryable:true (handler maps to 503)`);
+  assert.match(out.errorReason, /replay store unavailable/, "errorReason names the store outage");
+  assert.equal(client.submitCount, 0, `FAIL-CLOSED: never submitted on a ${failOn} store outage (submitCount 0)`);
+
+  if (prev === undefined) delete process.env.XAHAU_WSS; else process.env.XAHAU_WSS = prev;
+}
+
 // (F) RedisStore adapter unit test against a minimal in-process FAKE ioredis,
 //     proving the adapter calls SET NX PX / PTTL / DEL / GET correctly without a
 //     live Redis.
@@ -1359,6 +1465,18 @@ function iouFakeClient({ result, throwErr } = {}) {
   // fabricated true.
   if ("xrplConnected" in h) assert.equal(typeof h.xrplConnected, "boolean", "xrplConnected is a real boolean");
   if ("redisConnected" in h) assert.equal(typeof h.redisConnected, "boolean", "redisConnected is a real boolean");
+
+  // Auth split: an UNAUTHENTICATED health build is the MINIMAL liveness shape only —
+  // no sensitive internals (backends, connectivity, networkID, replayBindings).
+  const hm = buildHealth(false);
+  assert.equal(hm.status, "ok", "minimal health still reports status");
+  assert.equal(hm.network, "xahau", "minimal health reports network");
+  assert.equal(typeof hm.uptimeSec, "number", "minimal health reports uptimeSec");
+  assert.equal("replayBindings" in hm, false, "minimal health hides replayBindings");
+  assert.equal("replayStore" in hm, false, "minimal health hides replayStore backend");
+  assert.equal("rateLimiter" in hm, false, "minimal health hides rateLimiter backend");
+  assert.equal("networkID" in hm, false, "minimal health hides networkID");
+  assert.equal("xrplConfigured" in hm, false, "minimal health hides xrplConfigured");
 }
 
 // ---- metrics increment on REAL events (unit) -------------------------------
@@ -1436,10 +1554,12 @@ await new Promise((resolveTest, rejectTest) => {
   (async () => {
     const { spawn } = await import("node:child_process");
     const PORT = 4097;
+    const SECRET = "test-metrics-secret";
     const child = spawn(process.execPath, ["server.mjs"], {
-      env: { ...process.env, PORT: String(PORT), X402_RATE_MAX: "2", XAHAU_WSS: "" },
+      env: { ...process.env, PORT: String(PORT), X402_RATE_MAX: "2", XAHAU_WSS: "", X402_SHARED_SECRET: SECRET },
       stdio: ["ignore", "ignore", "ignore"],
     });
+    const SEC = { "x-x402-secret": SECRET };
     const getJson = (path, headers = {}) => new Promise((res) => {
       const r = http.request({ host: "127.0.0.1", port: PORT, path, method: "GET", headers }, (resp) => {
         let data = ""; resp.on("data", (c) => (data += c));
@@ -1467,9 +1587,21 @@ await new Promise((resolveTest, rejectTest) => {
     try {
       assert.equal(await waitListen(), true, "facilitator should start for the health/metrics test");
 
-      // /health: 200 + documented shape, no auth.
-      const h = await getJson("/health");
-      assert.equal(h.status, 200, "/health returns 200");
+      // /health WITHOUT the secret: 200 + MINIMAL liveness shape only (LB probe). The
+      // sensitive internals must NOT be present unauthenticated.
+      const hMin = await getJson("/health");
+      assert.equal(hMin.status, 200, "/health (no secret) still returns 200 (LB liveness)");
+      assert.equal(hMin.body.status, "ok", "/health minimal body.status ok");
+      assert.equal(hMin.body.network, "xahau", "/health minimal reports network");
+      assert.equal(typeof hMin.body.uptimeSec, "number", "/health minimal uptimeSec is a number");
+      assert.equal("replayBindings" in hMin.body, false, "/health minimal hides replayBindings (no secret)");
+      assert.equal("replayStore" in hMin.body, false, "/health minimal hides replayStore backend (no secret)");
+      assert.equal("rateLimiter" in hMin.body, false, "/health minimal hides rateLimiter backend (no secret)");
+      assert.equal("networkID" in hMin.body, false, "/health minimal hides networkID (no secret)");
+
+      // /health WITH the secret: 200 + FULL documented shape.
+      const h = await getJson("/health", SEC);
+      assert.equal(h.status, 200, "/health (with secret) returns 200");
       assert.equal(h.body.status, "ok", "/health body.status ok");
       assert.equal(h.body.network, "xahau", "/health reports network");
       assert.equal(h.body.networkID, EXPECTED_NETWORK_ID, "/health reports networkID");
@@ -1478,9 +1610,13 @@ await new Promise((resolveTest, rejectTest) => {
       assert.equal(typeof h.body.replayBindings, "number", "/health replayBindings is a number");
       assert.equal(h.body.replayStore, "memory", "/health replayStore=memory (no redis configured)");
 
-      // /metrics: 200 JSON counters, snapshot verify_total + rate_limited_total.
-      const m1 = await getJson("/metrics");
-      assert.equal(m1.status, 200, "/metrics returns 200");
+      // /metrics WITHOUT the secret: 401 (auth-gated, same secret as /settle).
+      const mUnauth = await getJson("/metrics");
+      assert.equal(mUnauth.status, 401, "/metrics without the secret -> 401 (auth-gated)");
+
+      // /metrics WITH the secret: 200 JSON counters, snapshot verify_total + rate_limited_total.
+      const m1 = await getJson("/metrics", SEC);
+      assert.equal(m1.status, 200, "/metrics (with secret) returns 200");
       assert.equal(typeof m1.body.verify_total, "number", "/metrics exposes verify_total");
       assert.equal(typeof m1.body.rate_limited_total, "number", "/metrics exposes rate_limited_total");
       const v0 = m1.body.verify_total;
@@ -1494,12 +1630,12 @@ await new Promise((resolveTest, rejectTest) => {
       assert.equal(s2, 200, "verify #2 allowed");
       assert.equal(s3, 429, "verify #3 rate-limited");
 
-      const m2 = await getJson("/metrics");
+      const m2 = await getJson("/metrics", SEC);
       assert.equal(m2.body.verify_total, v0 + 2, "verify_total incremented by the 2 allowed verifies (real event)");
       assert.equal(m2.body.rate_limited_total, rl0 + 1, "rate_limited_total incremented by the 1 rejected request (real event)");
 
-      // /metrics Prometheus text on Accept: text/plain.
-      const mp = await getJson("/metrics", { accept: "text/plain" });
+      // /metrics Prometheus text on Accept: text/plain (still auth-gated).
+      const mp = await getJson("/metrics", { ...SEC, accept: "text/plain" });
       assert.equal(mp.status, 200, "/metrics text returns 200");
       assert.match(mp.raw, /x402_verify_total \d+/, "/metrics text emits prometheus counter");
 

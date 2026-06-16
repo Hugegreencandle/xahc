@@ -11,8 +11,8 @@ into working code so the design can be exercised and ratified.
 | `GET /supported` | Advertise `{kinds:[{x402Version:2, scheme:"exact", network:"xahau"}]}` |
 | `POST /verify` | Offline checks on a signed Xahau Payment vs the x402 requirements |
 | `POST /settle` | Submit the signed tx to Xahau (`submitAndWait`) |
-| `GET /health` | Liveness/readiness JSON (no auth, cheap, never throws) |
-| `GET /metrics` | Counters as JSON (or Prometheus text on `Accept: text/plain`) |
+| `GET /health` | Liveness JSON. **Minimal** `{ status, network, uptimeSec }` unauthenticated (LB probe); verbose internals require the shared secret |
+| `GET /metrics` | Counters as JSON (or Prometheus text on `Accept: text/plain`). **Auth-gated** behind the shared secret (open in reference mode) |
 
 `/verify` decodes the payload with Xahau's binary codec and enforces (every
 check is mandatory — a missing bound is a **failure**, never a skip):
@@ -83,7 +83,9 @@ npm start                     # facilitator on :4021
 XAHAU_WSS=wss://… npm start   # enable /settle against a Xahau node
 
 # /settle hardening (optional env):
-#   X402_SHARED_SECRET=…   require an x-x402-secret header on /settle
+#   X402_SHARED_SECRET=…   require an x-x402-secret header on /settle AND /metrics,
+#                          and to see /health's verbose internals (else /health is
+#                          the minimal liveness shape only)
 #   X402_RATE_MAX=20       per-IP token-bucket size (default 20 / 60s)
 #   XAHAU_NETWORK=xahau-testnet   expect NetworkID 21338 instead of 21337
 #   X402_REDIS_URL=redis://…      use a SHARED, durable replay store + limiter
@@ -93,12 +95,16 @@ XAHAU_WSS=wss://… npm start   # enable /settle against a Xahau node
 #   X402_CONNECT_ATTEMPTS=3       bounded reconnect attempts (then fail closed)
 #   X402_CONNECT_BACKOFF_MS=500   backoff between connect attempts
 #   X402_SHUTDOWN_DRAIN_MS=10000  graceful-shutdown in-flight drain budget
+#   X402_REQUEST_TIMEOUT_MS=15000 max time to receive a full request (slowloris)
+#   X402_HEADERS_TIMEOUT_MS=10000 max time to receive request headers (slowloris)
+#   X402_MAX_CONNECTIONS=1024     cap concurrent sockets (connection-flood bound)
 ```
 
 ```sh
-curl localhost:4021/health     # liveness/readiness (no auth)
-curl localhost:4021/metrics    # counters (JSON)
-curl -H 'Accept: text/plain' localhost:4021/metrics   # Prometheus text
+curl localhost:4021/health     # minimal liveness (no auth)
+curl -H 'x-x402-secret: …' localhost:4021/health    # verbose internals (auth)
+curl -H 'x-x402-secret: …' localhost:4021/metrics   # counters (JSON, auth-gated)
+curl -H 'x-x402-secret: …' -H 'Accept: text/plain' localhost:4021/metrics  # Prometheus text
 ```
 
 ```sh
@@ -121,20 +127,26 @@ curl -X POST localhost:4021/verify -d '{
 
 ## Operational hardening
 
-- **`GET /health`** — unauthenticated, cheap, never throws. Returns `{ status,
-  network, networkID, replayStore: "memory"|"redis", rateLimiter: "memory"|"redis",
-  redisConnected?, xrplConfigured, xrplConnected?, uptimeSec, replayBindings }`.
+- **`GET /health`** — cheap, never throws. **Auth-tiered:** an unauthenticated caller
+  (LB liveness probe) gets only the minimal `{ status, network, uptimeSec }`; an
+  **authenticated** caller (the `x-x402-secret` shared secret, same as `/settle`)
+  additionally gets the operational internals `{ networkID, replayStore:
+  "memory"|"redis", rateLimiter: "memory"|"redis", redisConnected?, xrplConfigured,
+  xrplConnected?, replayBindings }`. In **reference mode** (no `X402_SHARED_SECRET`)
+  every caller is treated as authenticated, so the verbose object is returned.
   **Honest by design:** connectivity it cannot cheaply determine is reported
   falsy/absent, never fabricated as healthy (`xrplConnected` is only `true` if a
   pooled client reports `isConnected()`; `redisConnected` only if ioredis status is
   `ready`). It does not open a connection to answer.
-- **`GET /metrics`** — JSON counters by default, Prometheus exposition text on
-  `Accept: text/plain`. Counters move on **real events only**, wired at the exact
-  code points: `verify_total`, `settle_total`, `settle_success`, `settle_replayed`,
-  `settle_rejected` (+ breakdown buckets `verify_failed`, `replay_inflight`,
-  `store_full`, `submit_ambiguous`, `tem_rejected`, `on_ledger_failure`,
-  `delivered_short`, `other`), `rate_limited_total`, `body_too_large_total`. **No
-  PII** (no addresses/amounts) is ever recorded.
+- **`GET /metrics`** — **auth-gated** behind the same shared secret as `/settle`
+  (`401` without it; open in reference mode when no secret is configured). JSON
+  counters by default, Prometheus exposition text on `Accept: text/plain`. Counters
+  move on **real events only**, wired at the exact code points: `verify_total`,
+  `settle_total`, `settle_success`, `settle_replayed`, `settle_rejected` (+ breakdown
+  buckets `verify_failed`, `replay_inflight`, `store_full`, `submit_ambiguous`,
+  `tem_rejected`, `on_ledger_failure`, `delivered_short`, `other`),
+  `rate_limited_total`, `body_too_large_total`. **No PII** (no addresses/amounts) is
+  ever recorded.
 - **Structured logging** — dependency-free JSON lines to **stderr**
   (`{ ts, level, event, ... }`), honest level (error/warn/info). Never logs secrets,
   full tx blobs, or signatures.
@@ -142,10 +154,27 @@ curl -X POST localhost:4021/verify -d '{
   bounded by `X402_CONNECT_TIMEOUT_MS` with a bounded backoff retry
   (`X402_CONNECT_ATTEMPTS`). **Not** an unbounded in-request retry loop: after the
   bounded attempts it **fails closed** and `/settle` returns a clear `errorReason`.
-- **Graceful shutdown** — `SIGTERM`/`SIGINT` stop accepting new connections, drain
+- **Graceful shutdown** — `SIGTERM`/`SIGINT` stop accepting new connections,
+  **close idle keep-alive sockets immediately** (`server.closeIdleConnections()`, so a
+  slow/idle client can't ride out the drain and stall `server.close()`), drain
   in-flight requests within `X402_SHUTDOWN_DRAIN_MS`, then close the xrpl client and
   Redis connection and exit. **Handlers are attached only inside `serve()`** (never
   at import) so importing the module for tests installs no signal handlers / exit.
+- **Slowloris / flood bounds** — set on the live server in `serve()` (never at
+  import): `requestTimeout` (`X402_REQUEST_TIMEOUT_MS`, default **15000ms**) caps the
+  total time to receive a full request so a slow drip can't hold a socket forever;
+  `headersTimeout` (`X402_HEADERS_TIMEOUT_MS`, default **10000ms**) caps header
+  receipt; `maxConnections` (`X402_MAX_CONNECTIONS`, default **1024**) caps concurrent
+  sockets so a connection flood can't exhaust file descriptors. These add **time +
+  count** bounds alongside the existing 64 KiB body-**size** bound.
+- **Pre-submit store outage → retryable `503`, fail-closed** — if the replay store
+  (Redis) is unreachable on a **pre-submit** read (`isConsumed`/`getReceipt`/
+  `reserve`), `/settle` returns `{ success:false, errorReason:"replay store
+  unavailable", retryable:true }` → HTTP **`503`** (not an opaque `500`). It **never**
+  proceeds to submit on a store error (that would be fail-**open**, risking a
+  double-submit) — the submit only happens after the reservation is held. A
+  **post-submit** persistence failure is handled separately as best-effort: the
+  authoritative receipt is still returned (the tx already applied), never a `500`.
 - **Boot-time config validation** — on `serve()`, validates `PORT`, the `XAHAU_WSS`
   ws/wss URL form, `XAHAU_NETWORK`/`XAHAU_NETWORK_ID` consistency, and the
   `X402_REDIS_URL` form. A **fatal** misconfig logs a structured error and exits
