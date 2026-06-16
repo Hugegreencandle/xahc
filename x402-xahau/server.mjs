@@ -2030,6 +2030,14 @@ async function settle(payload, req, _deps = {}) {
     catch (e) { log("warn", "settle_receipt_persist_failed", { stage: "hash", error: String(e?.name || "store_error") }); }
   }
 
+  // READ-ONLY transparency: decode the guardrail Hook's on-ledger execution result
+  // from the validated tx meta. This is INFORMATIONAL ONLY — it is attached to the
+  // receipt AFTER the proof is signed (below), so it is NEVER part of the signed
+  // canonical bytes, and it is read here but NEVER consulted for any accept/reject/
+  // replay decision (those are driven solely by `code` + delivered_amount). Defensive
+  // + bounded; an absent/unknown HookExecutions shape decodes to [] without throwing.
+  const hookExecutions = decodeHookExecutions(meta);
+
   // Build the terminal receipt + persist it keyed by replayId (same window expiry),
   // so a retry of this terminal payment returns the real outcome (replayed:true)
   // instead of re-submitting. ALL branches below are TERMINAL: the tx is on-ledger
@@ -2158,6 +2166,14 @@ async function settle(payload, req, _deps = {}) {
     receipt.proof = null; // failed/rejected settlements are not signed
   }
 
+  // Attach the READ-ONLY Hook execution transparency AFTER signing the proof, so it
+  // can never enter the signed canonical bytes (the proof is built solely from the
+  // explicit fields above). Most useful on a tecHOOK_REJECTED, where returnString
+  // carries the guardrail's rejection reason. Empty array when the tx had no Hook
+  // executions. This rides ON the persisted receipt too, so a replayed receipt keeps
+  // it; it is purely informational and never re-evaluated.
+  receipt.hookExecutions = hookExecutions;
+
   // (F2) Persist the receipt best-effort. The submit already happened, so the
   // computed receipt is the AUTHORITATIVE outcome even if persistence flaps (Redis
   // down post-submit). A throw here must NOT escape settle (that would 500 and lose
@@ -2187,6 +2203,82 @@ function deliveredIssued(meta) {
   if (d === null || typeof d !== "object" || Array.isArray(d)) return null;
   if (typeof d.currency !== "string" || typeof d.issuer !== "string" || typeof d.value !== "string") return null;
   return d;
+}
+
+// ---------------------------------------------------------------------------
+// READ-ONLY transparency: surface the guardrail Hook's on-ledger execution result
+// ---------------------------------------------------------------------------
+// A validated Payment from a hooked account carries Hook execution data in its tx
+// meta as `HookExecutions`: an array of `{ HookExecution: { HookAccount, HookHash,
+// HookReturnCode, HookReturnString, HookEmitCount, Flags } }`. This decodes that
+// array into a small, informational shape for the settle response.
+//
+// CRITICAL invariants (this is purely additive + read-only):
+//   - It is NEVER part of the signed receipt proof (it rides alongside, unsigned).
+//   - It NEVER influences any accept/reject/replay/idempotency decision.
+//   - No fabrication: only what is actually in the meta is reported; an absent /
+//     unrecognizable HookExecutions array -> []. It NEVER throws (defensive at every
+//     access), so it can't break the settle hot path on an unexpected meta shape.
+//
+// Bound: at most MAX_HOOK_EXECUTIONS entries are reported and each decoded
+// returnString is clamped to MAX_HOOK_RETURNSTRING_CHARS printable chars.
+const MAX_HOOK_EXECUTIONS = 16;
+const MAX_HOOK_RETURNSTRING_CHARS = 256;
+
+/**
+ * Decode a hex HookReturnString to a bounded, printable UTF-8 string. Strips
+ * non-printable control bytes, clamps length. Returns "" for absent/empty/odd-
+ * length/non-hex input. NEVER throws.
+ */
+function decodeHookReturnString(hex) {
+  if (typeof hex !== "string" || hex.length === 0) return "";
+  if (hex.length % 2 !== 0 || !/^[0-9a-fA-F]+$/.test(hex)) return "";
+  let s;
+  try { s = Buffer.from(hex, "hex").toString("utf8"); } catch { return ""; }
+  // Strip C0/C1 control chars + DEL (keep printable + space); bound the length.
+  // eslint-disable-next-line no-control-regex
+  s = s.replace(/[\u0000-\u001F\u007F-\u009F]/g, "");
+  if (s.length > MAX_HOOK_RETURNSTRING_CHARS) s = s.slice(0, MAX_HOOK_RETURNSTRING_CHARS);
+  return s;
+}
+
+/**
+ * Decode a validated tx meta's `HookExecutions` into a bounded array of
+ * informational records, or [] if absent/unrecognizable. Pure, defensive, never
+ * throws. Output record shape (only fields actually present are included as
+ * non-undefined; missing numeric fields are omitted, missing strings -> ""):
+ *   { hookAccount, hookHash, returnCode, returnString, emitCount?, flags? }
+ * `hookHash` is shortened (first 16 hex chars) for readability; `returnString` is
+ * the decoded, bounded, printable form of HookReturnString.
+ */
+function decodeHookExecutions(meta) {
+  try {
+    if (!meta || typeof meta !== "object") return [];
+    const raw = meta.HookExecutions;
+    if (!Array.isArray(raw)) return [];
+    const out = [];
+    for (const entry of raw) {
+      if (out.length >= MAX_HOOK_EXECUTIONS) break;
+      // Canonical XRPL/Xahau shape wraps each execution in { HookExecution: {...} };
+      // accept a bare object too (defensive against node shape variance).
+      const he = (entry && typeof entry === "object" && entry.HookExecution && typeof entry.HookExecution === "object")
+        ? entry.HookExecution
+        : (entry && typeof entry === "object" ? entry : null);
+      if (!he) continue;
+      const rec = {
+        hookAccount: typeof he.HookAccount === "string" ? he.HookAccount : "",
+        hookHash: typeof he.HookHash === "string" ? he.HookHash.slice(0, 16) : "",
+        returnCode: he.HookReturnCode != null && Number.isFinite(Number(he.HookReturnCode)) ? Number(he.HookReturnCode) : null,
+        returnString: decodeHookReturnString(he.HookReturnString),
+      };
+      if (he.HookEmitCount != null && Number.isFinite(Number(he.HookEmitCount))) rec.emitCount = Number(he.HookEmitCount);
+      if (he.Flags != null && Number.isFinite(Number(he.Flags))) rec.flags = Number(he.Flags);
+      out.push(rec);
+    }
+    return out;
+  } catch {
+    return []; // unknown/hostile meta shape -> [] (never throw into the settle path)
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -2808,6 +2900,8 @@ export const __test = {
   // Issued-amount (IOU/token) helpers.
   parseTokenValue, cmpTokenValue, canonicalizeCurrency, tokenValueToString,
   checkIssuedAmount, deliveredIssued, deliveredDrops,
+  // READ-ONLY Hook-execution transparency (informational; not in the signed proof).
+  decodeHookExecutions, decodeHookReturnString,
   TOKEN_EXP_MIN, TOKEN_EXP_MAX, TOKEN_MAX_MANT_DIGITS,
   // Hole-1/Hole-2 hooks: replay-store internals + the chosen bounds.
   _sweepConsumed, _markConsumed, _isConsumed, _consumedExpiryFor, _reserveConsumed,

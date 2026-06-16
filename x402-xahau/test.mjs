@@ -2268,6 +2268,119 @@ await new Promise((resolveTest, rejectTest) => {
   assert.equal(out2.success, false, "rejected settle");
   assert.equal(out2.proof, null, "a failed settle is NOT signed (proof:null)");
 
+  // -------------------------------------------------------------------------
+  // READ-ONLY Hook-execution transparency in the settle response.
+  // -------------------------------------------------------------------------
+  // The decodeHookExecutions helper is pure + defensive (unit-tested directly).
+  {
+    const { decodeHookExecutions, decodeHookReturnString } = __test;
+    // Canonical { HookExecution: {...} } wrapper shape.
+    const okMeta = { HookExecutions: [ { HookExecution: {
+      HookAccount: PAYER,
+      HookHash: "ABCDEF0123456789FEDCBA9876543210AABBCCDDEEFF0011",
+      HookReturnCode: "0",
+      HookReturnString: Buffer.from("within policy", "utf8").toString("hex"),
+      HookEmitCount: "1",
+      Flags: "0",
+    } } ] };
+    const dec = decodeHookExecutions(okMeta);
+    assert.equal(dec.length, 1, "one hook execution decoded");
+    assert.equal(dec[0].hookAccount, PAYER, "hookAccount surfaced");
+    assert.equal(dec[0].hookHash, "ABCDEF0123456789", "hookHash shortened to 16 hex chars");
+    assert.equal(dec[0].returnCode, 0, "returnCode decoded as a number");
+    assert.equal(dec[0].returnString, "within policy", "returnString hex-decoded to utf8");
+    assert.equal(dec[0].emitCount, 1, "emitCount surfaced");
+    assert.equal(dec[0].flags, 0, "flags surfaced");
+    // Absent / unknown / hostile shapes -> [] and NEVER throw.
+    assert.deepEqual(decodeHookExecutions({}), [], "no HookExecutions -> []");
+    assert.deepEqual(decodeHookExecutions(null), [], "null meta -> []");
+    assert.deepEqual(decodeHookExecutions({ HookExecutions: "nope" }), [], "non-array HookExecutions -> []");
+    assert.deepEqual(decodeHookExecutions({ HookExecutions: [ 123, null ] }), [], "garbage entries -> []");
+    // returnString decode strips control chars, keeps printable (incl. '-'), bounds length.
+    assert.equal(decodeHookReturnString(Buffer.from("a\x00b\x07c-d", "utf8").toString("hex")), "abc-d", "control chars stripped, hyphen kept");
+    assert.equal(decodeHookReturnString("oddlen1"), "", "odd-length hex -> empty");
+    assert.equal(decodeHookReturnString("zz"), "", "non-hex -> empty");
+    assert.equal(decodeHookReturnString(""), "", "empty -> empty");
+  }
+
+  // (T1) tesSUCCESS with a guardrail HookExecutions array -> decoded hookExecutions
+  //      surfaced on the SUCCESS receipt; the signed proof bytes are UNCHANGED by it.
+  {
+    const storeH = new InMemoryStore({ now: () => now });
+    const guardrailHex = Buffer.from("ok: under LIM", "utf8").toString("hex");
+    const clientH = fakeClient({ result: { hash: "HOOKOK", meta: {
+      TransactionResult: "tesSUCCESS",
+      delivered_amount: "1000000",
+      HookExecutions: [ { HookExecution: {
+        HookAccount: PAYER,
+        HookHash: "1122334455667788990011223344556677889900AABBCCDD",
+        HookReturnCode: "0",
+        HookReturnString: guardrailHex,
+        HookEmitCount: "0",
+      } } ],
+    } } });
+    const depsH = { store: storeH, client: clientH, currentValidatedLedger: async () => curLedger, now: () => now };
+    const outH = await __test.settle({ txBlob: blob({ LastLedgerSequence: curLedger + 5, Sequence: 450 }) }, req, depsH);
+    assert.equal(outH.success, true, `success settle with a hook execution: ${outH.errorReason}`);
+    assert.ok(Array.isArray(outH.hookExecutions), "hookExecutions is an array on the receipt");
+    assert.equal(outH.hookExecutions.length, 1, "one hook execution surfaced");
+    assert.equal(outH.hookExecutions[0].returnCode, 0, "decoded returnCode on the receipt");
+    assert.equal(outH.hookExecutions[0].returnString, "ok: under LIM", "decoded returnString on the receipt");
+    assert.equal(outH.hookExecutions[0].hookAccount, PAYER, "decoded hookAccount on the receipt");
+    // CRITICAL: hookExecutions is NOT part of the signed proof. The receipt still
+    // verifies, AND stripping hookExecutions entirely does not change verification.
+    assert.equal(verifyReceipt(outH), true, "receipt with hookExecutions still verifies offline");
+    const { hookExecutions, ...withoutHooks } = outH;
+    assert.equal(verifyReceipt(withoutHooks), true, "removing hookExecutions does NOT break the proof (not signed over it)");
+    // Mutating hookExecutions must NOT affect verification (it is not in the bytes).
+    assert.equal(verifyReceipt({ ...outH, hookExecutions: [{ returnCode: 999, returnString: "tampered" }] }), true, "tampering hookExecutions does NOT break the proof");
+    // The canonical signable projection has no hookExecutions key.
+    const payload = __test.receiptSignablePayload({
+      network: outH.network, txHash: outH.txHash, payer: outH.payer, payTo: outH.payTo,
+      asset: outH.asset, delivered: outH.delivered, required: outH.required, ts: outH.ts,
+    });
+    assert.equal("hookExecutions" in payload, false, "signable payload does NOT contain hookExecutions");
+    assert.equal(__test.canonicalJSONStringify(payload).includes("hookExecutions"), false, "canonical signed bytes do NOT mention hookExecutions");
+  }
+
+  // (T2) tecHOOK_REJECTED with a rejection HookReturnString -> decoded hookExecutions
+  //      surfaced on the FAILED receipt (this is exactly when it is most useful).
+  {
+    const storeR = new InMemoryStore({ now: () => now });
+    const rejectHex = Buffer.from("over policy: amount exceeds LIM", "utf8").toString("hex");
+    const clientR = fakeClient({ result: { hash: "HOOKREJ", meta: {
+      TransactionResult: "tecHOOK_REJECTED",
+      HookExecutions: [ { HookExecution: {
+        HookAccount: PAYER,
+        HookHash: "DEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEF0",
+        HookReturnCode: "-1",
+        HookReturnString: rejectHex,
+        HookEmitCount: "0",
+      } } ],
+    } } });
+    const depsR = { store: storeR, client: clientR, currentValidatedLedger: async () => curLedger, now: () => now };
+    const outR = await __test.settle({ txBlob: blob({ LastLedgerSequence: curLedger + 5, Sequence: 451 }) }, req, depsR);
+    assert.equal(outR.success, false, "rejected settle");
+    assert.match(outR.errorReason, /tecHOOK_REJECTED/, "rejection reason is the tec code");
+    assert.equal(outR.proof, null, "a rejected settle is still NOT signed (proof:null)");
+    assert.ok(Array.isArray(outR.hookExecutions), "hookExecutions present on a FAILED receipt");
+    assert.equal(outR.hookExecutions.length, 1, "one hook execution surfaced on the failed receipt");
+    assert.equal(outR.hookExecutions[0].returnCode, -1, "decoded negative returnCode");
+    assert.equal(outR.hookExecutions[0].returnString, "over policy: amount exceeds LIM", "decoded guardrail rejection reason");
+  }
+
+  // (T3) A settle whose meta has NO HookExecutions -> hookExecutions is [] (omitted
+  //      meaning empty), and the proof is unaffected.
+  {
+    const storeN = new InMemoryStore({ now: () => now });
+    const clientN = fakeClient({ result: { hash: "NOHOOK", meta: { TransactionResult: "tesSUCCESS", delivered_amount: "1000000" } } });
+    const depsN = { store: storeN, client: clientN, currentValidatedLedger: async () => curLedger, now: () => now };
+    const outN = await __test.settle({ txBlob: blob({ LastLedgerSequence: curLedger + 5, Sequence: 452 }) }, req, depsN);
+    assert.equal(outN.success, true, "non-hooked success settle");
+    assert.deepEqual(outN.hookExecutions, [], "no hook executions -> empty array");
+    assert.equal(verifyReceipt(outN), true, "non-hooked receipt still verifies (proof unchanged)");
+  }
+
   if (prev === undefined) delete process.env.XAHAU_WSS; else process.env.XAHAU_WSS = prev;
 }
 

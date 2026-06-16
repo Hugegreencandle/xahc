@@ -1,6 +1,12 @@
 # exact-xahau — reference x402 facilitator for Xahau
 
-> Also available as a standalone repo: **[github.com/Hugegreencandle/x402-xahau](https://github.com/Hugegreencandle/x402-xahau)** (history-preserved mirror of this directory). Part of the Xahau Hooks quartet: written with [xahc](https://github.com/Hugegreencandle/xahc), simulated with [xahau-mcp](https://github.com/Hugegreencandle/xahau-mcp), proven safe with [xahc-prover](https://github.com/Hugegreencandle/xahc-prover).
+> **Standalone mirror.** This is the canonical standalone home of the x402-xahau
+> facilitator. It is also developed inside the **xahc** toolchain repo at
+> [`Hugegreencandle/xahc/x402-xahau`](https://github.com/Hugegreencandle/xahc/tree/main/x402-xahau),
+> where its companion tools live: the guardrail Hook is **written** with
+> [xahc](https://github.com/Hugegreencandle/xahc), **simulated** with
+> [xahau-mcp](https://github.com/Hugegreencandle/xahau-mcp), and **proven** safe with
+> [xahc-prover](https://github.com/Hugegreencandle/xahc-prover). MIT-licensed.
 
 A runnable reference for the proposed `exact-xahau` x402 scheme (spec:
 [`X402-XAHAU.md` in the xahc repo](https://github.com/Hugegreencandle/xahc/blob/main/docs/X402-XAHAU.md)).
@@ -133,6 +139,24 @@ drops comparison. It is protected by an
 optional shared-secret header (`X402_SHARED_SECRET` → `x-x402-secret`) and a
 per-IP rate limit.
 
+**Hook-execution transparency (read-only).** When a payment from a hooked account
+is submitted, the validated tx's `meta` carries `HookExecutions` — each with the
+executing `HookAccount`/`HookHash`, the `HookReturnCode`, a `HookReturnString`, and
+emitted-txn info. `/settle` surfaces this on the receipt as a `hookExecutions: [...]`
+array, decoding each entry to
+`{ hookAccount, hookHash (short), returnCode, returnString (hex→utf8, bounded +
+printable), emitCount?, flags? }`. This is **purely informational**: it is included
+on both successful **and failed** receipts (a `tecHOOK_REJECTED` is exactly when the
+guardrail's `returnString` rejection reason is most useful). A tx with no Hook
+executions yields `[]`. **It is NOT part of the signed receipt proof** — it rides
+alongside, unsigned (the `proof` is computed over the fixed canonical fields only, so
+the proof bytes are byte-for-byte unchanged by this field), and it **never** affects
+any accept/reject/replay/idempotency decision. Decoding is defensive and bounded
+(unknown meta shape → `[]`, never throws), and reports only what is actually in the
+meta (no fabrication). Note: exact `HookExecutions` shape can vary across node
+implementations/versions; the decoder accepts the canonical `{ HookExecution: {...} }`
+wrapper and a bare object, and falls back to `[]` on anything it can't recognize.
+
 ## Run
 
 ```sh
@@ -242,12 +266,15 @@ Every **successful** `/settle` returns a receipt with a `proof`:
   "success": true, "transaction": "<txhash>", "network": "xahau",
   "delivered": "1000000", "payer": "rPAYER", "payTo": "rPAYEE",
   "txHash": "<txhash>", "required": "1000000", "asset": null, "ts": 1700000000000,
+  "hookExecutions": [],
   "proof": { "alg": "ed25519", "pubkey": "<64-hex>", "sig": "<128-hex>" }
 }
 ```
 
 A resource server can verify it **offline** with just the facilitator's `/pubkey`. The
 signature is ed25519 over the **canonical bytes** of the receipt's load-bearing fields.
+(`hookExecutions` is read-only/informational and is **NOT** among those signed fields,
+so it never affects verification — see the Hook-execution transparency note above.)
 **Canonical-bytes recipe** (the verifier MUST reproduce these exact bytes):
 
 1. Build the object with **exactly** these keys (an absent value is the JSON literal
