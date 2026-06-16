@@ -39,6 +39,8 @@ const INVARIANTS: &[(&str, &str)] = &[
     ("reserve", "prove_reserve.py"),
     ("time-nonce", "prove_time_nonce.py"),
     ("emission", "prove_emission.py"),
+    ("period-budget", "prove_period_budget.py"),
+    ("reentrancy", "prove_reentrancy.py"),
 ];
 
 /// Resolve the xahc-prover checkout.
