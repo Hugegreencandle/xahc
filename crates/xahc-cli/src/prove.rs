@@ -41,6 +41,7 @@ const INVARIANTS: &[(&str, &str)] = &[
     ("emission", "prove_emission.py"),
     ("period-budget", "prove_period_budget.py"),
     ("reentrancy", "prove_reentrancy.py"),
+    ("unchecked-return", "prove_unchecked_return.py"),
 ];
 
 /// Resolve the xahc-prover checkout.
