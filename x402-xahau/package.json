@@ -1,6 +1,6 @@
 {
   "name": "x402-xahau-facilitator",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "description": "Reference x402 facilitator for the proposed exact-xahau scheme: /verify offline (signature-verified), /settle on Xahau (replay-protected, delivered_amount-checked). The payer's xahc guardrail Hook is the L1 spending authority.",
