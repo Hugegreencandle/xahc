@@ -1,2 +1,6 @@
 node_modules
 package-lock.json
+# Live testnet proof harness (untracked — human reviews + commits only docs/).
+# Keeps faucet secrets out of version control; secrets live in /tmp scratch only.
+testnet-proof.mjs
+*.secrets.json
