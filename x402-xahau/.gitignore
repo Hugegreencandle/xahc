@@ -4,3 +4,9 @@ package-lock.json
 # Keeps faucet secrets out of version control; secrets live in /tmp scratch only.
 testnet-proof.mjs
 *.secrets.json
+# Demo: any local secret scratch / env that could hold a seed. The demo source
+# (demo/*.mjs, demo/README.md, demo/DEMO-RUN.md) holds NO secrets and is committable;
+# the agent loads its seed from the /tmp scratch above, never from a tracked file.
+demo/*.secrets.json
+demo/.env
+demo/.env.*
