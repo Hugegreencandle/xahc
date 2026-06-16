@@ -1,0 +1,71 @@
+# docker-compose for the x402-xahau facilitator + a Redis backing store.
+#
+# Secrets and network config come from the environment / a .env file (see
+# deploy/.env.example). NEVER hardcode X402_SHARED_SECRET here.
+#
+# The Redis service provides the SHARED, DURABLE replay store + shared rate limiter
+# (server.mjs loads ioredis lazily when X402_REDIS_URL is set). With the in-memory
+# default the replay store is single-instance and NOT durable across restarts — use
+# Redis for any multi-instance / restart-safe deployment.
+#
+# IMPORTANT (replay safety): Redis MUST NOT evict the facilitator's keys. Each replay
+# binding's lifetime is tied to its tx's on-ledger validity window; if Redis silently
+# drops a live binding under memory pressure, replay protection is lost and a payment
+# could settle twice. The redis service below sets `maxmemory-policy noeviction` so a
+# write fails loudly (the facilitator fail-closes to a retryable 503) instead of
+# silently dropping a live binding. A `volatile-*` policy would also be acceptable
+# (the facilitator's keys are TTL'd), but `noeviction` is the safest default.
+
+services:
+  facilitator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        # Build the Redis-capable image (installs the optional ioredis dep).
+        WITH_REDIS: "true"
+    image: x402-xahau-facilitator:local
+    restart: unless-stopped
+    ports:
+      - "${PORT:-4021}:4021"
+    environment:
+      # Bind port inside the container (keep aligned with the published port above).
+      PORT: "4021"
+      # Xahau WS endpoint. REQUIRED for /settle; if unset, only offline /verify works.
+      # NOTE: Xahau rippled speaks WS api_version 1 — see deploy/DEPLOY.md caveats.
+      XAHAU_WSS: "${XAHAU_WSS}"
+      # Network selection. Set the id explicitly OR the named network (not both unless
+      # they agree). Mainnet=21337, testnet=21338.
+      XAHAU_NETWORK_ID: "${XAHAU_NETWORK_ID:-21337}"
+      # Shared secret guarding /settle, /metrics, and the verbose form of /health.
+      # MUST be set for production (empty = reference/open mode).
+      X402_SHARED_SECRET: "${X402_SHARED_SECRET}"
+      # Point the replay store + limiter at the redis service on the compose network.
+      X402_REDIS_URL: "redis://redis:6379"
+    depends_on:
+      redis:
+        condition: service_healthy
+    # In-image HEALTHCHECK already probes /health; restated here for compose visibility.
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4021/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # noeviction: never silently drop a live replay binding (see header note).
+    # appendonly yes: durability across restarts so reservations survive a Redis bounce.
+    command: ["redis-server", "--maxmemory-policy", "noeviction", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  redis-data:

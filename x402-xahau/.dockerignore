@@ -1,0 +1,45 @@
+# Dependencies are reinstalled in-image from the lockfile (npm ci). Never copy the host's.
+node_modules
+**/node_modules
+
+# VCS / editor / OS noise
+.git
+.gitignore
+.gitattributes
+.DS_Store
+*.swp
+.idea
+.vscode
+
+# Agent / tooling scratch
+.letta
+
+# Tests are not needed in the runtime image
+test.mjs
+
+# Live testnet proof harness (gitignored; pulls faucet secrets) — must never enter the image
+testnet-proof.mjs
+
+# Any secret scratch files (gitignored patterns)
+*.secrets.json
+demo/*.secrets.json
+demo/.env
+demo/.env.*
+
+# Demo apps (agent / resource-server / facilitator-testnet) — not part of the facilitator runtime
+demo
+
+# Docs not needed at runtime
+README.md
+docs
+deploy
+*.md
+
+# Deploy artifacts themselves should not bloat the build context
+Dockerfile
+.dockerignore
+docker-compose.yml
+
+# Local env files (never bake secrets into an image)
+.env
+.env.*
