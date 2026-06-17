@@ -44,6 +44,7 @@ const INVARIANTS: &[(&str, &str)] = &[
     ("unchecked-return", "prove_unchecked_return.py"),
     ("validate-range", "prove_validate_range.py"),
     ("bootloader", "prove_bootloader.py"),
+    ("resource-conservation", "prove_resource_conservation.py"),
 ];
 
 /// Resolve the xahc-prover checkout.
