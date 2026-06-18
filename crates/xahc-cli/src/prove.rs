@@ -62,7 +62,7 @@ const INVARIANTS: &[(&str, &str)] = &[
 /// the contents. In CI or any untrusted working directory, set `XAHC_PROVER_DIR`
 /// explicitly to a known-good checkout so a stray sibling/cwd `xahc-prover` can't
 /// be picked up and run.
-fn prover_dir() -> Result<PathBuf> {
+pub(crate) fn prover_dir() -> Result<PathBuf> {
     if let Ok(d) = std::env::var("XAHC_PROVER_DIR") {
         let p = PathBuf::from(d);
         if p.join("src").is_dir() {
@@ -89,7 +89,7 @@ fn prover_dir() -> Result<PathBuf> {
 }
 
 /// Prefer the prover's venv interpreter (it has z3), else fall back to python3.
-fn python(dir: &Path) -> PathBuf {
+pub(crate) fn python(dir: &Path) -> PathBuf {
     let venv = dir.join(".venv/bin/python");
     if venv.exists() {
         venv

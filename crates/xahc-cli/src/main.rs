@@ -8,6 +8,7 @@ mod guardpass;
 mod installtx;
 mod lint;
 mod prove;
+mod registry;
 mod scaffold;
 mod sim;
 mod test;
@@ -186,6 +187,15 @@ enum Cmd {
         #[arg(last = true)]
         rest: Vec<String>,
     },
+    /// Proof Registry: tamper-evident, queryable record of PROVEN hook proofs
+    /// (write → simulate → prove → watch → REGISTER). Subcommands forwarded to the
+    /// prover's registry CLI: add | get | check | verify | list | head | keygen.
+    /// Exit: 0 ok/PROVEN · 2 UNPROVEN/TAMPERED · 3 usage.
+    Registry {
+        /// Subcommand + args, e.g. `check hook.wasm --json` or `add m.json --key k`
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Check the local toolchain can build hooks (clang/wasm-ld), with fix hints.
     Doctor,
     /// Scaffold a buildable hook project.
@@ -309,6 +319,10 @@ fn main() -> Result<()> {
             if !v.agree {
                 std::process::exit(1);
             }
+        }
+        Cmd::Registry { args } => {
+            let code = registry::run(&args)?;
+            std::process::exit(code);
         }
         Cmd::Doctor => {
             doctor::run()?;
