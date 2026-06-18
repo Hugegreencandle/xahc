@@ -1,6 +1,7 @@
 //! xahc — Xahau Hooks, Checked.
 //! Safe build/clean/lint toolchain for C Hooks on Xahau.
 
+mod author;
 mod build;
 mod clean;
 mod doctor;
@@ -187,6 +188,29 @@ enum Cmd {
         #[arg(last = true)]
         rest: Vec<String>,
     },
+    /// Self-certifying generator: intent → proven-safe Hook. Maps a plain-English
+    /// intent to a proven archetype, builds it, PROVES its invariant(s), and only emits a
+    /// certified hook (+ optional install-tx / registry entry) if every invariant is PROVEN.
+    /// Fail-closed: it never ships a hook it could not prove. Requires the prover checkout.
+    Author {
+        /// What the hook should do, e.g. "limit payments to 5 XAH" or "owner-only".
+        intent: String,
+        /// Output basename (default: the archetype name). Writes <name>.c and <name>.wasm.
+        #[arg(long)]
+        name: Option<String>,
+        /// Account to emit an install-tx for (r-address). Omit to just author + certify.
+        #[arg(long)]
+        account: Option<String>,
+        /// testnet | mainnet (for the install-tx)
+        #[arg(long, default_value = "testnet")]
+        network: String,
+        /// Register the proof(s) in the proof registry once certified.
+        #[arg(long)]
+        register: bool,
+        /// Attester keyfile for signing registry entries (with --register).
+        #[arg(long)]
+        key: Option<String>,
+    },
     /// Proof Registry: tamper-evident, queryable record of PROVEN hook proofs
     /// (write → simulate → prove → watch → REGISTER). Subcommands forwarded to the
     /// prover's registry CLI: add | get | check | verify | list | head | keygen.
@@ -318,6 +342,42 @@ fn main() -> Result<()> {
             }
             if !v.agree {
                 std::process::exit(1);
+            }
+        }
+        Cmd::Author { intent, name, account, network, register, key } => {
+            let report = author::run(&author::Opts {
+                intent: &intent,
+                name: name.as_deref(),
+                account: account.as_deref(),
+                network: &network,
+                register,
+                key: key.as_deref(),
+            })?;
+            if cli.json {
+                print_json(&report);
+            } else {
+                let mark = if report.certified {
+                    "✓ CERTIFIED".green().bold().to_string()
+                } else {
+                    "✗ NOT CERTIFIED".red().bold().to_string()
+                };
+                println!("{}  archetype={}  -> {}", mark, report.archetype, report.wasm_path);
+                println!("  guarantee: {}", report.guarantee.dimmed());
+                for r in &report.invariants {
+                    let m = if r.exit_code == 0 { "✓".green().to_string() } else { "✗".red().to_string() };
+                    println!("  {} {:<22} {}", m, r.invariant, r.verdict);
+                }
+                if report.registered {
+                    println!("  {} proof(s) registered", "registry:".bold());
+                }
+                if let Some(tx) = &report.install_tx {
+                    println!("\n{}", tx);
+                    eprintln!("{} UNSIGNED SetHook — sign offline; params baked from your intent.",
+                        "note:".yellow().bold());
+                }
+            }
+            if !report.certified {
+                std::process::exit(2);
             }
         }
         Cmd::Registry { args } => {
