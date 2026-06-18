@@ -47,6 +47,8 @@ const INVARIANTS: &[(&str, &str)] = &[
     ("resource-conservation", "prove_resource_conservation.py"),
     ("commitment", "prove_commitment.py"),
     ("preview-faithfulness", "prove_preview_faithfulness.py"),
+    ("boot-upgrade-authz", "prove_boot_upgrade.py"),
+    ("permissioned-transfer", "prove_permissioned_transfer.py"),
 ];
 
 /// Resolve the xahc-prover checkout.
