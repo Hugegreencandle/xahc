@@ -50,6 +50,7 @@ const INVARIANTS: &[(&str, &str)] = &[
     ("boot-upgrade-authz", "prove_boot_upgrade.py"),
     ("permissioned-transfer", "prove_permissioned_transfer.py"),
     ("dst-lock", "prove_dst_lock.py"),
+    ("rate-limit", "prove_rate_limit.py"),
 ];
 
 /// Resolve the xahc-prover checkout.
