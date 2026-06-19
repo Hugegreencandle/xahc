@@ -32,6 +32,7 @@ List without installing: `npx skills add Hugegreencandle/xahc --list`.
 | **xahau-amendment** | Check whether an amendment changed semantics a deployed Hook relies on, and re-prove if so. |
 | **evernode-dapp** | HotPocket / Evernode dApp model and where a Xahau Hook is the on-ledger settlement seam. |
 | **xahc-guardrail** | Build + install an on-chain spending guardrail for an autonomous agent (per-tx cap, destination lock). |
+| **x402-xahau** | Stand up + drive the x402-xahau facilitator — the provable spending-authority layer for agentic payments (the agent's budget is a proven Hook, readable via `GET /policy/:account`; it provably can't overspend). |
 
 ## Requirements & safety
 
