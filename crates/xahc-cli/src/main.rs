@@ -81,10 +81,12 @@ struct ProveJson {
 }
 
 /// Map the prover's exit code to a stable verdict string.
-/// 0 PROVEN, 2 COUNTEREXAMPLE, 3 INCONCLUSIVE, anything else = prover/tool error.
+/// 0 PROVEN, 1 N/A (not exercised — not a pass), 2 COUNTEREXAMPLE, 3 INCONCLUSIVE,
+/// anything else = prover/tool error.
 fn prove_verdict(code: i32) -> &'static str {
     match code {
         0 => "proven",
+        1 => "n/a", // property not exercised by the hook — NOT a pass
         2 => "counterexample",
         3 => "inconclusive",
         _ => "error",
