@@ -5,6 +5,7 @@ mod author;
 mod build;
 mod clean;
 mod compose;
+mod fuzz;
 mod doctor;
 mod guardpass;
 mod installtx;
@@ -212,6 +213,31 @@ enum Cmd {
         #[arg(long)]
         key: Option<String>,
     },
+    /// Hunt counterexamples to an invariant with boundary-biased concrete fuzzing — the
+    /// complement to `prove` for INCONCLUSIVE cases. A found counterexample DISPROVES the
+    /// hook; finding none raises confidence but NEVER proves it (only `prove` proves).
+    /// Stateless invariants: limit | overflow | authz | guardrail. Exit: 0 none · 2 DISPROVEN.
+    Fuzz {
+        /// Hook .wasm (or .c, built first)
+        input: PathBuf,
+        #[arg(long, default_value = "limit")]
+        invariant: String,
+        /// Number of fuzz runs
+        #[arg(long, default_value_t = 20000)]
+        runs: u64,
+        /// PRNG seed (reproducible)
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+        /// LIM hook-param the oracle checks against (drops)
+        #[arg(long, default_value_t = 1_000_000)]
+        lim: u64,
+        /// TIP hook-param for the overflow invariant (drops)
+        #[arg(long, default_value_t = 10)]
+        tip: u64,
+        /// 40-hex destination accountID for the guardrail DST lock (optional)
+        #[arg(long)]
+        dst: Option<String>,
+    },
     /// Composition prover: prove a safety property over a CHAIN of hooks on one account.
     /// Proves each hook's claimed invariant, then proves the composition is sound — every
     /// invariant PROVEN + no state-namespace interference among stateful hooks. The chain
@@ -386,6 +412,50 @@ fn main() -> Result<()> {
                 }
             }
             if !report.certified {
+                std::process::exit(2);
+            }
+        }
+        Cmd::Fuzz { input, invariant, runs, seed, lim, tip, dst } => {
+            // Build a .c input first; fuzz a .wasm directly.
+            let wasm = if input.extension().is_some_and(|e| e == "c") {
+                let out = input.with_extension("wasm");
+                build::run(&input, &out, &[], true)?;
+                out
+            } else {
+                input.clone()
+            };
+            let rep = fuzz::run(&wasm, &fuzz::Opts {
+                invariant: &invariant, runs, seed, lim, tip, dst: dst.as_deref(),
+            })?;
+            // Honesty signal in BOTH modes (stderr keeps --json stdout clean): if no input
+            // reached an accept, absence of a counterexample means little.
+            if !rep.exercised_accept {
+                eprintln!("{} accept path never hit — fuzz is weak; widen inputs or check params",
+                    "warning:".yellow().bold());
+            }
+            if cli.json {
+                print_json(&rep);
+            } else {
+                let verdict = if rep.disproven() {
+                    "✗ DISPROVEN".red().bold().to_string()
+                } else {
+                    "no counterexample".yellow().bold().to_string()
+                };
+                println!("{}  invariant={}  ({} runs, seed {})", verdict, rep.invariant, rep.runs, rep.seed);
+                println!("  outcomes: {} accept · {} rollback · {} guard-violation · {} returned",
+                    rep.accepts, rep.rollbacks, rep.guard_violations, rep.returned);
+                for c in rep.counterexamples.iter().take(5) {
+                    println!("  {} {}  [drops={} tip={} owner={} dst={}]",
+                        "CEX:".red().bold(), c.why, c.drops, c.tip, c.account_is_owner, c.destination_hex);
+                }
+                if rep.disproven() {
+                    println!("  -> DISPROVEN: {} counterexample(s). The hook violates `{}`.",
+                        rep.counterexamples.len(), rep.invariant);
+                } else {
+                    println!("  -> no counterexample in {} runs. NOT a proof — run `xahc prove` for ∀-inputs.", rep.runs);
+                }
+            }
+            if rep.disproven() {
                 std::process::exit(2);
             }
         }
