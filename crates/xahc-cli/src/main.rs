@@ -4,6 +4,7 @@
 mod author;
 mod build;
 mod clean;
+mod compose;
 mod doctor;
 mod guardpass;
 mod installtx;
@@ -211,6 +212,14 @@ enum Cmd {
         #[arg(long)]
         key: Option<String>,
     },
+    /// Composition prover: prove a safety property over a CHAIN of hooks on one account.
+    /// Proves each hook's claimed invariant, then proves the composition is sound — every
+    /// invariant PROVEN + no state-namespace interference among stateful hooks. The chain
+    /// inherits the conjunction of per-hook safety invariants. Fail-closed. Takes a chain TOML.
+    Compose {
+        /// Chain spec TOML: ordered [[hook]] entries with wasm, namespace, invariants.
+        chain: PathBuf,
+    },
     /// Proof Registry: tamper-evident, queryable record of PROVEN hook proofs
     /// (write → simulate → prove → watch → REGISTER). Subcommands forwarded to the
     /// prover's registry CLI: add | get | check | verify | list | head | keygen.
@@ -377,6 +386,42 @@ fn main() -> Result<()> {
                 }
             }
             if !report.certified {
+                std::process::exit(2);
+            }
+        }
+        Cmd::Compose { chain } => {
+            let report = compose::run(&chain)?;
+            if cli.json {
+                print_json(&report);
+            } else {
+                let mark = if report.composable {
+                    "✓ COMPOSABLE".green().bold().to_string()
+                } else {
+                    "✗ NOT COMPOSABLE".red().bold().to_string()
+                };
+                println!("{}  ({} hooks)  -> {}", mark, report.hooks.len(), report.chain_file);
+                for h in &report.hooks {
+                    let tags = format!("{}{}{}",
+                        if h.stateful { "state " } else { "" },
+                        if h.emits { "emit " } else { "" },
+                        if h.dynamic { "cbak " } else { "" });
+                    println!("  {} [ns {}…] {}", h.wasm, &h.namespace[..8.min(h.namespace.len())], tags.dimmed());
+                    for p in &h.invariants {
+                        let m = if p.exit_code == 0 { "✓".green().to_string() } else { "✗".red().to_string() };
+                        println!("      {} {:<20} {}", m, p.invariant, p.verdict);
+                    }
+                }
+                if report.composable {
+                    println!("\n  chain guarantees: {}", report.chain_invariants.join(", ").green());
+                    println!("  emit bound: {}", report.emit_bound);
+                } else if let Some(why) = &report.reason {
+                    println!("\n  {} {}", "reason:".red().bold(), why);
+                }
+                for c in &report.caveats {
+                    println!("  {} {}", "caveat:".yellow().bold(), c);
+                }
+            }
+            if !report.composable {
                 std::process::exit(2);
             }
         }

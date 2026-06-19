@@ -89,7 +89,7 @@ fn all_type_values() -> HashSet<u32> {
     TX_TYPES.iter().map(|(_, v)| *v).collect()
 }
 
-fn norm_hex_namespace(s: &str) -> Result<String> {
+pub(crate) fn norm_hex_namespace(s: &str) -> Result<String> {
     let h = s.trim().trim_start_matches("0x");
     if h.len() != 64 || !h.bytes().all(|b| b.is_ascii_hexdigit()) {
         bail!("namespace must be 64 hex chars (32 bytes)");
@@ -107,7 +107,7 @@ pub struct Opts<'a> {
     pub params: &'a [String],            // "nameHex=valueHex" pairs -> HookParameters
 }
 
-fn sha256_hex(s: &str) -> String {
+pub(crate) fn sha256_hex(s: &str) -> String {
     use sha2::{Digest, Sha256};
     let d = Sha256::digest(s.as_bytes());
     d.iter().map(|b| format!("{:02X}", b)).collect()
