@@ -51,6 +51,7 @@ const INVARIANTS: &[(&str, &str)] = &[
     ("permissioned-transfer", "prove_permissioned_transfer.py"),
     ("dst-lock", "prove_dst_lock.py"),
     ("rate-limit", "prove_rate_limit.py"),
+    ("cron", "prove_cron.py"),
 ];
 
 /// Resolve the xahc-prover checkout.
