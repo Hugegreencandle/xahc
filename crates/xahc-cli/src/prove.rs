@@ -54,6 +54,7 @@ const INVARIANTS: &[(&str, &str)] = &[
     ("cron", "prove_cron.py"),
     ("partial-payment", "prove_partial_payment.py"),
     ("constant-product", "prove_constant_product.py"),
+    ("native-amount", "prove_native_amount.py"),
 ];
 
 /// Resolve the xahc-prover checkout.
