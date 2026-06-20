@@ -56,6 +56,7 @@ const INVARIANTS: &[(&str, &str)] = &[
     ("constant-product", "prove_constant_product.py"),
     ("native-amount", "prove_native_amount.py"),
     ("emit-budget", "prove_emit_budget.py"),
+    ("emit-dst-lock", "prove_emit_dst_lock.py"),
 ];
 
 /// Resolve the xahc-prover checkout.
