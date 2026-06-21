@@ -64,6 +64,7 @@ const INVARIANTS: &[(&str, &str)] = &[
     ("hashlock", "prove_hashlock.py"),
     ("quorum", "prove_quorum.py"),
     ("master-disuse", "prove_master_disuse.py"),
+    ("qday-freeze", "prove_qday_freeze.py"),
 ];
 
 /// Resolve the xahc-prover checkout.
