@@ -60,6 +60,7 @@ const INVARIANTS: &[(&str, &str)] = &[
     ("trigger-lock", "prove_trigger_lock.py"),
     ("time-release", "prove_time_release.py"),
     ("inactivity-release", "prove_inactivity_release.py"),
+    ("split-conservation", "prove_split_conservation.py"),
 ];
 
 /// Resolve the xahc-prover checkout.
