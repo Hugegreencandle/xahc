@@ -100,9 +100,15 @@ static inline uint32_t xahc_build_payment(
     } while (0)
 
 /* ---- Issued (IOU / trustline) payment -------------------------------------
- * Worst-case size: the native builder + 40 extra bytes of amount (48-byte
- * issued STAmount vs 8-byte native). Matches stock PREPARE_PAYMENT_SIMPLE_TRUSTLINE_SIZE. */
-#define XAHC_PAYMENT_IOU_SIZE 287U
+ * Without a callback (mirrors XAHC_PAYMENT_SIZE). The builder writes 172 bytes before
+ * etxn_details (header 35 + issued Amount 49 + Fee 9 + SigningPubKey 35 + Account 22 +
+ * Destination 22), and xahaud requires etxn_details write_len >= 116 for a no-callback emit
+ * (SetHook_test.cpp:4285 `etxn_details(115)==TOO_SMALL`, :4290 `(116)==116`). So the buffer
+ * must be >= 172 + 116 = 288. (Was 287 -> etxn_details got only 115 -> TOO_SMALL -> every IOU
+ * emit rolled back on-chain. Off-by-one fixed 2026-07-18, caught by xahc-prover.)
+ * NOTE: a hook that registers an ACTIVE callback needs etxn_details >= 138 (+22B sfEmitCallback);
+ * such a hook must use a larger buffer than this no-callback macro provides. */
+#define XAHC_PAYMENT_IOU_SIZE 288U
 
 /* Build an issued-amount payment. The Amount field is serialized by the
  * float_sto host fn from (xfl, currency20, issuer20) — xahaud does the STAmount
