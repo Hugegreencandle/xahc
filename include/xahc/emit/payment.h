@@ -94,7 +94,12 @@ static inline uint32_t xahc_build_payment(
     do {                                                                    \
         uint8_t _xahc_tx[XAHC_PAYMENT_SIZE];                                \
         _Static_assert(sizeof(_xahc_tx) >= XAHC_PAYMENT_SIZE, "tx buf too small"); \
-        etxn_reserve(1);                                                    \
+        /* CHECK THE RESERVE. Calling it bare swallowed the failure: the builder below calls    \
+         * etxn_details, which needs the reservation, so a failed reserve resurfaced later as a \
+         * rollback at the etxn_details line — pointing at the wrong call and sending you        \
+         * debugging the builder instead of the reservation. Found 2026-07-29 chasing a          \
+         * tecHOOK_REJECTED on a minimal emitting hook. */                                       \
+        XAHC_TRY(etxn_reserve(1));                                          \
         uint32_t _xahc_len = xahc_build_payment(_xahc_tx, (to20), (drops), (dtag), (stag)); \
         XAHC_TRY(emit(0, 0, (uint32_t)_xahc_tx, _xahc_len));                \
     } while (0)
@@ -166,7 +171,12 @@ static inline uint32_t xahc_build_payment_iou(
     do {                                                                    \
         uint8_t _xahc_tx[XAHC_PAYMENT_IOU_SIZE];                            \
         _Static_assert(sizeof(_xahc_tx) >= XAHC_PAYMENT_IOU_SIZE, "tx buf too small"); \
-        etxn_reserve(1);                                                    \
+        /* CHECK THE RESERVE. Calling it bare swallowed the failure: the builder below calls    \
+         * etxn_details, which needs the reservation, so a failed reserve resurfaced later as a \
+         * rollback at the etxn_details line — pointing at the wrong call and sending you        \
+         * debugging the builder instead of the reservation. Found 2026-07-29 chasing a          \
+         * tecHOOK_REJECTED on a minimal emitting hook. */                                       \
+        XAHC_TRY(etxn_reserve(1));                                          \
         uint32_t _xahc_len = xahc_build_payment_iou(                        \
             _xahc_tx, (to20), (xfl), (currency20), (issuer20), (dtag), (stag)); \
         XAHC_TRY(emit(0, 0, (uint32_t)_xahc_tx, _xahc_len));                \
