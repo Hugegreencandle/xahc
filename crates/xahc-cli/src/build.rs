@@ -90,13 +90,13 @@ pub fn run(input: &Path, output: &Path, extra_includes: &[PathBuf], do_lint: boo
     if grep.unverified > 0 {
         eprintln!(
             "{} {} loop(s) contain a guard this pass could NOT prove runs first at the loop head.\n         \
-             xahaud requires `_g` to be the FIRST branch after the loop instruction, and rejects the \n         \
-             module at SetHook with temMALFORMED otherwise. The usual cause is a guard written in the\n         \
-             `for` CONDITION:\n           \
-               for (int i = 0; XAHC_GUARD(20), i < 20; ++i)      // REJECTED by the ledger\n           \
+             xahaud requires the guard's BYTES immediately after the `loop` opcode (Guard.h:386) and\n         \
+             rejects the module at SetHook with temMALFORMED otherwise. The usual cause is a guard\n         \
+             written in the `for` CONDITION, which clang is free to hoist out of the body:\n           \
+               for (int i = 0; XAHC_GUARD(20), i < 20; ++i)      // may be REJECTED by the ledger\n           \
                for (int i = 0; i < 20; ++i) {{ XAHC_GUARD(20); }} // correct\n         \
              Move the guard to be the first statement INSIDE the loop body.\n         \
-             See docs/KNOWN_ISSUE_guard_in_condition.md",
+             See docs/GUARD_PLACEMENT.md",
             "error".red(), grep.unverified
         );
         anyhow::bail!("guard placement could not be verified for {} loop(s)", grep.unverified);
@@ -120,7 +120,8 @@ opcode (found {} instead of i32.const/i32.const/call _g).",
 immediately\n         after `loop`, and rejects the module at SetHook with temMALFORMED otherwise.\n         \
 Write the guard as the FIRST STATEMENT INSIDE the loop body:\n           \
   for (int i = 0; i < N; ++i) {{ XAHC_GUARD(N); ... }}   // correct\n           \
-  for (int i = 0; XAHC_GUARD(N), i < N; ++i) ...         // clang hoists it -> REJECTED"
+  for (int i = 0; XAHC_GUARD(N), i < N; ++i) ...         // clang hoists it -> REJECTED\n         \
+See docs/GUARD_PLACEMENT.md"
             );
             anyhow::bail!("guard not byte-adjacent to the loop opcode in {} loop(s)", bad.len());
         }

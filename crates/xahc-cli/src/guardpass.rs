@@ -28,7 +28,7 @@ pub struct Report {
     /// CONDITION, which clang compiles into a nested block. These previously counted as
     /// `already_ok` and were reported as nothing at all, so `xahc build` said "lint no issues" for a
     /// module SetHook then rejected with temMALFORMED. An unrecognised guard shape must never be
-    /// indistinguishable from a correct one. See docs/KNOWN_ISSUE_guard_in_condition.md.
+    /// indistinguishable from a correct one. See docs/GUARD_PLACEMENT.md.
     pub unverified: usize,
 }
 
@@ -306,15 +306,17 @@ pub fn verify_byte_adjacency(wasm: &[u8]) -> Result<Vec<Misplaced>> {
     // imported functions occupy the low indices in order. Taking it from the bytes we are about to
     // ship avoids any mismatch with walrus's own numbering.
     let mut guard_idx: Option<u32> = None;
+    // Imported functions occupy the low indices, so the code section's first entry is function
+    // number `imported_funcs` — not 0. Getting this wrong misnames the function in the error.
+    let mut imported_funcs: u32 = 0;
     {
-        let mut n: u32 = 0;
         for payload in Parser::new(0).parse_all(wasm) {
             if let Payload::ImportSection(r) = payload.context("decode imports")? {
                 for imp in r {
                     let imp = imp.context("import")?;
                     if let wasmparser::TypeRef::Func(_) = imp.ty {
-                        if imp.module == "env" && imp.name == "_g" { guard_idx = Some(n); }
-                        n += 1;
+                        if imp.module == "env" && imp.name == "_g" { guard_idx = Some(imported_funcs); }
+                        imported_funcs += 1;
                     }
                 }
             }
@@ -323,7 +325,7 @@ pub fn verify_byte_adjacency(wasm: &[u8]) -> Result<Vec<Misplaced>> {
     // No guard import at all -> no loops to check against it; nothing to verify.
     let guard_idx = match guard_idx { Some(g) => g, None => return Ok(Vec::new()) };
     let mut bad = Vec::new();
-    let mut fidx: u32 = 0;
+    let mut fidx: u32 = imported_funcs;
     for payload in Parser::new(0).parse_all(wasm) {
         let payload = payload.context("decode wasm")?;
         if let Payload::CodeSectionEntry(body) = payload {
@@ -364,4 +366,131 @@ pub fn verify_byte_adjacency(wasm: &[u8]) -> Result<Vec<Misplaced>> {
         }
     }
     Ok(bad)
+}
+
+// ---------------------------------------------------------------------------
+// Tests for the byte-adjacency gate.
+//
+// These are written in WAT rather than compiled from C on purpose: the property
+// under test is a property of the EMITTED BYTES, and clang's decision to hoist a
+// guard out of a loop body depends on the body and on the optimiser's mood. A C
+// fixture would therefore be testing clang, not this pass. The WAT below encodes
+// the exact shapes observed on-chain — see docs/GUARD_PLACEMENT.md and the C
+// originals in tests/fixtures/loop{A,B,C,D}.c.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Wrap a function body in a module importing `env._g` (function index 0).
+    fn module(body: &str) -> Vec<u8> {
+        let wat = format!(
+            r#"(module
+                 (import "env" "_g" (func $g (param i32 i32) (result i32)))
+                 (func (export "hook") (param i32) (result i64)
+                   {body}
+                   (i64.const 0)))"#
+        );
+        wat::parse_str(wat).expect("valid wat")
+    }
+
+    /// The guard's three operators, byte-adjacent to the loop opcode.
+    const GUARD: &str = "(drop (call $g (i32.const 1) (i32.const 21)))";
+
+    /// loopB: guard first inside the body. This is the only correct form.
+    #[test]
+    fn guard_first_in_body_is_accepted() {
+        let m = module(&format!("(loop {GUARD})"));
+        assert!(verify_byte_adjacency(&m).unwrap().is_empty());
+    }
+
+    /// loopA: clang hoisted the guard, so the loop opens with a load. Rejected
+    /// on-chain with temMALFORMED; must be caught here.
+    #[test]
+    fn guard_hoisted_out_of_body_is_caught() {
+        let m = module("(loop (drop (local.get 0)))");
+        let bad = verify_byte_adjacency(&m).unwrap();
+        assert_eq!(bad.len(), 1);
+        assert!(bad[0].found.contains("LocalGet"), "found: {}", bad[0].found);
+    }
+
+    /// loopC: a guard at the BOTTOM of the body is crossed every iteration and is
+    /// still rejected — adjacency is syntactic, not semantic.
+    #[test]
+    fn guard_last_in_body_is_caught() {
+        let m = module(&format!("(loop (drop (local.get 0)) {GUARD})"));
+        assert_eq!(verify_byte_adjacency(&m).unwrap().len(), 1);
+    }
+
+    /// loopD: the hoisted guard is still there AND a body-head guard was added.
+    /// Installs on-chain, so this pass must not flag it.
+    #[test]
+    fn hoisted_guard_plus_body_head_guard_is_accepted() {
+        let m = module(&format!("{GUARD} (loop {GUARD})"));
+        assert!(verify_byte_adjacency(&m).unwrap().is_empty());
+    }
+
+    /// The two i32.consts must be followed by a call to `_g` specifically, not to
+    /// whatever function happens to sit at that index.
+    #[test]
+    fn call_to_a_different_function_is_caught() {
+        let wat = r#"(module
+             (import "env" "_g" (func $g (param i32 i32) (result i32)))
+             (func $other (param i32 i32) (result i32) (i32.const 0))
+             (func (export "hook") (param i32) (result i64)
+               (loop (drop (call $other (i32.const 1) (i32.const 21))))
+               (i64.const 0)))"#;
+        let m = wat::parse_str(wat).unwrap();
+        let bad = verify_byte_adjacency(&m).unwrap();
+        assert_eq!(bad.len(), 1);
+        assert!(bad[0].found.contains("Call"), "found: {}", bad[0].found);
+    }
+
+    /// A loop whose body ends before the guard sequence completes.
+    #[test]
+    fn loop_that_ends_before_the_guard_completes_is_caught() {
+        let m = module("(loop (i32.const 1) (drop))");
+        let bad = verify_byte_adjacency(&m).unwrap();
+        assert_eq!(bad.len(), 1);
+    }
+
+    /// Every loop is reported, not just the first — multisig_ok had four.
+    #[test]
+    fn every_bad_loop_is_reported() {
+        let m = module("(loop (drop (local.get 0))) (loop (drop (local.get 0)))");
+        assert_eq!(verify_byte_adjacency(&m).unwrap().len(), 2);
+    }
+
+    /// The reported function index must account for imported functions, which
+    /// occupy the low indices. With one import, the first defined function is 1.
+    #[test]
+    fn reported_function_index_skips_imports() {
+        let m = module("(loop (drop (local.get 0)))");
+        assert_eq!(verify_byte_adjacency(&m).unwrap()[0].func, 1);
+    }
+
+    /// A module that imports no guard has no adjacency obligation.
+    #[test]
+    fn module_without_a_guard_import_has_nothing_to_verify() {
+        let wat = r#"(module
+             (func (export "hook") (param i32) (result i64)
+               (loop (drop (local.get 0)))
+               (i64.const 0)))"#;
+        let m = wat::parse_str(wat).unwrap();
+        assert!(verify_byte_adjacency(&m).unwrap().is_empty());
+    }
+
+    /// A loop-free module is fine.
+    #[test]
+    fn module_without_loops_is_accepted() {
+        let m = module(GUARD);
+        assert!(verify_byte_adjacency(&m).unwrap().is_empty());
+    }
+
+    /// FAIL CLOSED: an undecodable module is never "fine". Returning Ok(vec![])
+    /// here would let a corrupt module through the one gate meant to stop it.
+    #[test]
+    fn undecodable_module_is_an_error_not_a_pass() {
+        assert!(verify_byte_adjacency(b"\0asm\x01\x00\x00\x00\xff\xff\xff").is_err());
+        assert!(verify_byte_adjacency(b"not wasm at all").is_err());
+    }
 }
