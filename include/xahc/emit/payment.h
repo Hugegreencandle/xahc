@@ -36,8 +36,23 @@ extern int64_t float_sto(uint32_t write_ptr, uint32_t write_len,
                          int64_t float1, uint32_t field_code);
 
 /* Worst-case serialized size of a simple XAH payment with emit details.
- * Without a callback. Matches stock PREPARE_PAYMENT_SIMPLE_SIZE. */
-#define XAHC_PAYMENT_SIZE 248U
+ *
+ * The builder writes 132 bytes before etxn_details (TransactionType 3 + Flags 5 + SourceTag 5 +
+ * Sequence 5 + DestinationTag 5 + FirstLedgerSequence 6 + LastLedgerSequence 6 + Amount 9 +
+ * Fee 9 + SigningPubKey 35 + Account 22 + Destination 22).
+ *
+ * xahaud requires (applyHook.cpp, etxn_details):
+ *     expected_size = 138; if (!hasCallback) expected_size -= 22;   // 116 without, 138 with
+ *
+ * 248 gave etxn_details exactly 116 — correct for a hook with NO callback, and 22 SHORT for one
+ * that exports `cbak`. The result was silent: TOO_SMALL, then a rollback deep inside
+ * xahc_build_payment at the etxn_details line, so EVERY emit from a cbak-exporting hook failed and
+ * pointed the developer at the wrong call. Confirmed on testnet 2026-07-29: the same hook emits
+ * with cbak removed and rolls back with it present.
+ *
+ * Now sized for the WORST case (with callback): 132 + 138 = 270. Costs 22 bytes of stack and makes
+ * the macro correct for both shapes instead of only one, undocumented, at deploy time. */
+#define XAHC_PAYMENT_SIZE 270U
 
 /* Build a simple XAH payment into a caller-provided buffer.
  * `buf` MUST be at least XAHC_PAYMENT_SIZE bytes — checked at compile time when
@@ -111,9 +126,12 @@ static inline uint32_t xahc_build_payment(
  * (SetHook_test.cpp:4285 `etxn_details(115)==TOO_SMALL`, :4290 `(116)==116`). So the buffer
  * must be >= 172 + 116 = 288. (Was 287 -> etxn_details got only 115 -> TOO_SMALL -> every IOU
  * emit rolled back on-chain. Off-by-one fixed 2026-07-18, caught by xahc-prover.)
- * NOTE: a hook that registers an ACTIVE callback needs etxn_details >= 138 (+22B sfEmitCallback);
- * such a hook must use a larger buffer than this no-callback macro provides. */
-#define XAHC_PAYMENT_IOU_SIZE 288U
+ * 2026-07-29: sized for the WORST case instead. A hook that exports `cbak` needs
+ * etxn_details >= 138 (+22B sfEmitCallback), so the buffer must be 172 + 138 = 310. At 288 such a
+ * hook got 116 and rolled back silently — the same defect the native path had, and the reason this
+ * note existed without being acted on. Enforcing it by SIZE is better than documenting a
+ * restriction the compiler cannot check. */
+#define XAHC_PAYMENT_IOU_SIZE 310U
 
 /* Build an issued-amount payment. The Amount field is serialized by the
  * float_sto host fn from (xfl, currency20, issuer20) — xahaud does the STAmount
