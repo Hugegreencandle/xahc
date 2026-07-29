@@ -120,6 +120,26 @@ pub fn lint(wasm: &[u8]) -> Result<Vec<Finding>> {
         f.extend(check_guards(&m, g));
     }
 
+    // 4b. Guard BYTE-ADJACENCY — the property xahaud actually checks (Guard.h:386): the guard's
+    //     literal bytes must sit immediately after the `loop` opcode. Rule 4 above reasons about
+    //     reachability, which a guard written in a `for` condition satisfies while clang hoists it
+    //     out of the body. `xahc build` gates on this, but only for a module it just produced; a
+    //     hook you are about to SUBMIT is exactly the module you want to check. Fails closed.
+    match crate::guardpass::verify_byte_adjacency(wasm) {
+        Ok(bad) => {
+            for b in &bad {
+                f.push(Finding::error("GUARD_NOT_ADJACENT", format!(
+                    "func[{}] loop at offset {}: the guard is not byte-adjacent to the `loop` \
+                     opcode (found {} instead of i32.const/i32.const/call _g) — SetHook rejects \
+                     this with temMALFORMED. Write the guard as the first statement INSIDE the \
+                     loop body. See docs/GUARD_PLACEMENT.md.",
+                    b.func, b.offset, b.found)));
+            }
+        }
+        Err(e) => f.push(Finding::error("GUARD_ADJACENCY_UNDECIDABLE", format!(
+            "could not verify guard byte-adjacency, failing closed: {e}"))),
+    }
+
     // 5. Stack budget: hooks have no heap; deep/large stack frames overflow.
     f.extend(check_stack(&m));
 
@@ -632,6 +652,30 @@ mod tests {
     const G: &str = r#"(import "env" "_g" (func (param i32 i32) (result i64)))"#;
     const ACCEPT: &str = r#"(import "env" "accept" (func (param i32 i32 i64) (result i64)))"#;
     const HOOK: &str = r#"(func (export "hook") (param i32) (result i64) (i64.const 0))"#;
+
+    /// A guard hoisted out of the loop body must be flagged by LINT, not only by build.
+    /// `xahc lint` is the only way to check a module you did not just compile -- e.g. the exact
+    /// bytes you are about to submit in a SetHook.
+    #[test]
+    fn lint_flags_a_guard_that_is_not_byte_adjacent() {
+        let f = lint_wat(&format!(
+            r#"(module {G} {ACCEPT}
+                 (func (export "hook") (param i32) (result i64)
+                   (loop (drop (local.get 0)))
+                   (i64.const 0)))"#));
+        assert!(has(&f, "GUARD_NOT_ADJACENT"), "expected GUARD_NOT_ADJACENT, got {:?}", ids(&f));
+    }
+
+    /// The correct form must not be flagged -- a false positive here blocks a valid deploy.
+    #[test]
+    fn lint_accepts_a_body_head_guard() {
+        let f = lint_wat(&format!(
+            r#"(module {G} {ACCEPT}
+                 (func (export "hook") (param i32) (result i64)
+                   (loop (drop (call 0 (i32.const 1) (i32.const 21))))
+                   (i64.const 0)))"#));
+        assert!(!has(&f, "GUARD_NOT_ADJACENT"), "false positive: {:?}", ids(&f));
+    }
 
     #[test]
     fn clean_hook_has_no_findings() {
