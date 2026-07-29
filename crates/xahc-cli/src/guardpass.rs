@@ -377,6 +377,65 @@ pub fn verify_byte_adjacency(wasm: &[u8]) -> Result<Vec<Misplaced>> {
 // fixture would therefore be testing clang, not this pass. The WAT below encodes
 // the exact shapes observed on-chain — see docs/GUARD_PLACEMENT.md and the C
 // originals in tests/fixtures/loop{A,B,C,D}.c.
+/// One `call` to a function the module defines itself.
+pub struct IllegalCall {
+    pub func: u32,
+    pub offset: usize,
+    pub callee: u32,
+}
+
+// A hook may call ONLY imported host functions. xahaud `Guard.h:495-509`:
+//
+//     if (callee_idx > last_import_idx)
+//         GUARDLOG(hook::log::CALL_ILLEGAL)
+//             << "Hook calls a function outside of the whitelisted imports ";
+//         return {};
+//
+// which fails validateGuards -> SetHook preflight -> temMALFORMED.
+//
+// This bites through the OPTIMISER, not the source. A `static inline` helper is a hint clang may
+// decline for a large function once there is more than one call site, so the same source installs
+// with one emit and is refused with two. Nothing at the C level shows it; only the emitted module
+// does. (Fixed in the shipped headers in 1.11.1 by forcing always_inline — this rule catches the
+// same shape in any hook, including hand-written helpers.)
+
+/// Verify the module calls only imported functions. Returns the offending calls, or an Err if the
+/// module cannot be decoded (FAIL CLOSED: an undecodable module is never "fine").
+pub fn verify_no_user_calls(wasm: &[u8]) -> Result<Vec<IllegalCall>> {
+    use wasmparser::{Parser, Payload, Operator};
+    // Imported functions occupy the low indices; anything at or above this count is defined by
+    // the module itself.
+    let mut imported_funcs: u32 = 0;
+    for payload in Parser::new(0).parse_all(wasm) {
+        if let Payload::ImportSection(r) = payload.context("decode imports")? {
+            for imp in r {
+                let imp = imp.context("import")?;
+                if let wasmparser::TypeRef::Func(_) = imp.ty {
+                    imported_funcs += 1;
+                }
+            }
+        }
+    }
+    let mut bad = Vec::new();
+    let mut fidx: u32 = imported_funcs;
+    for payload in Parser::new(0).parse_all(wasm) {
+        let payload = payload.context("decode wasm")?;
+        if let Payload::CodeSectionEntry(body) = payload {
+            let mut ops = body.get_operators_reader().context("operators")?;
+            while !ops.eof() {
+                let (op, off) = ops.read_with_offset().context("read op")?;
+                if let Operator::Call { function_index } = op {
+                    if function_index >= imported_funcs {
+                        bad.push(IllegalCall { func: fidx, offset: off, callee: function_index });
+                    }
+                }
+            }
+            fidx += 1;
+        }
+    }
+    Ok(bad)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -484,6 +543,69 @@ mod tests {
     fn module_without_loops_is_accepted() {
         let m = module(GUARD);
         assert!(verify_byte_adjacency(&m).unwrap().is_empty());
+    }
+
+    /// A hook may call ONLY imported host functions. This is the shape that made every
+    /// multi-emit hook uninstallable before 1.11.1: the helper exists because clang declined
+    /// an `inline` hint, and nothing in the C source shows it.
+    #[test]
+    fn a_call_to_a_module_defined_function_is_caught() {
+        let wat = r#"(module
+             (import "env" "_g" (func $g (param i32 i32) (result i32)))
+             (func $helper (result i32) (i32.const 7))
+             (func (export "hook") (param i32) (result i64)
+               (drop (call $helper))
+               (i64.const 0)))"#;
+        let m = wat::parse_str(wat).unwrap();
+        let bad = verify_no_user_calls(&m).unwrap();
+        assert_eq!(bad.len(), 1, "expected the call to $helper to be flagged");
+        assert_eq!(bad[0].callee, 1, "callee should be the first module-defined function");
+    }
+
+    /// Calls to imported host functions are the whole point and must never be flagged.
+    #[test]
+    fn calls_to_imports_are_not_flagged() {
+        let wat = r#"(module
+             (import "env" "_g" (func $g (param i32 i32) (result i32)))
+             (import "env" "accept" (func $a (param i32 i32 i64) (result i64)))
+             (func (export "hook") (param i32) (result i64)
+               (drop (call $g (i32.const 1) (i32.const 2)))
+               (drop (call $a (i32.const 0) (i32.const 0) (i64.const 0)))
+               (i64.const 0)))"#;
+        let m = wat::parse_str(wat).unwrap();
+        assert!(verify_no_user_calls(&m).unwrap().is_empty());
+    }
+
+    /// Every offending call is reported, not just the first — the real case had two and three.
+    #[test]
+    fn every_illegal_call_is_reported() {
+        let wat = r#"(module
+             (import "env" "_g" (func $g (param i32 i32) (result i32)))
+             (func $helper (result i32) (i32.const 7))
+             (func (export "hook") (param i32) (result i64)
+               (drop (call $helper))
+               (drop (call $helper))
+               (drop (call $helper))
+               (i64.const 0)))"#;
+        let m = wat::parse_str(wat).unwrap();
+        assert_eq!(verify_no_user_calls(&m).unwrap().len(), 3);
+    }
+
+    /// A module that defines a helper but never CALLS it is legal — only calls are rejected.
+    #[test]
+    fn an_uncalled_module_defined_function_is_fine() {
+        let wat = r#"(module
+             (import "env" "_g" (func $g (param i32 i32) (result i32)))
+             (func $unused (result i32) (i32.const 7))
+             (func (export "hook") (param i32) (result i64) (i64.const 0)))"#;
+        let m = wat::parse_str(wat).unwrap();
+        assert!(verify_no_user_calls(&m).unwrap().is_empty());
+    }
+
+    #[test]
+    fn undecodable_module_is_an_error_for_the_call_check_too() {
+        assert!(verify_no_user_calls(b"not wasm at all").is_err());
+        assert!(verify_no_user_calls(b"\0asm\x01\x00\x00\x00\xff\xff\xff").is_err());
     }
 
     /// FAIL CLOSED: an undecodable module is never "fine". Returning Ok(vec![])

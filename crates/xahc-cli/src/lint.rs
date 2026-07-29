@@ -125,6 +125,27 @@ pub fn lint(wasm: &[u8]) -> Result<Vec<Finding>> {
     //     reachability, which a guard written in a `for` condition satisfies while clang hoists it
     //     out of the body. `xahc build` gates on this, but only for a module it just produced; a
     //     hook you are about to SUBMIT is exactly the module you want to check. Fails closed.
+    // 4c. ILLEGAL CALL — a hook may call ONLY imported host functions (xahaud Guard.h:495-509).
+    //     A helper the module defines itself makes the whole thing temMALFORMED at SetHook. This
+    //     is an optimiser-level defect: `static inline` is a hint clang declines for a large
+    //     function once there is more than one call site, so the same source installs with one
+    //     emit and is refused with two. Only the emitted module shows it. Fails closed.
+    match crate::guardpass::verify_no_user_calls(wasm) {
+        Ok(bad) => {
+            for b in &bad {
+                f.push(Finding::error("CALL_USER_FUNCTION", format!(
+                    "func[{}] at offset {}: calls function {}, which this module defines itself \
+                     — a hook may only call imported host functions, so SetHook rejects this with \
+                     temMALFORMED. Force the helper inline (`static inline \
+                     __attribute__((always_inline))`); at -Oz clang declines a plain `inline` hint \
+                     for a large function with more than one call site.",
+                    b.func, b.offset, b.callee)));
+            }
+        }
+        Err(e) => f.push(Finding::error("CALL_CHECK_UNDECIDABLE", format!(
+            "could not verify calls against the import list, failing closed: {e}"))),
+    }
+
     match crate::guardpass::verify_byte_adjacency(wasm) {
         Ok(bad) => {
             for b in &bad {

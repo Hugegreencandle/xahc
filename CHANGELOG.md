@@ -3,6 +3,36 @@
 All notable changes to xahc are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); versioning is [SemVer](https://semver.org/).
 
+## [1.11.2] - 2026-07-29
+
+Adds the check that would have caught the 1.11.1 defect before it reached a ledger.
+
+### Added
+
+- **`CALL_USER_FUNCTION` — lint and build now reject a hook that calls a function it defines
+  itself.** xahaud allows a hook to call **only imported host functions**: `Guard.h:495-509`
+  refuses any `call` whose callee index exceeds the last import, which fails `validateGuards` and
+  returns `temMALFORMED` at `SetHook`. Until now nothing local caught it, so a module could pass
+  every check here and be refused on-chain.
+
+  This is an **optimiser-level** defect, which is what makes it worth a rule. `static inline` is a
+  hint clang may decline for a large function once there is more than one call site, so the same C
+  source compiles to an installable hook with one emit and an uninstallable one with two. Nothing
+  in the source shows it; only the emitted module does. 1.11.1 fixed the shipped headers — this
+  catches the same shape in anyone's own helpers.
+
+  `CALL_CHECK_UNDECIDABLE` is reported if the module cannot be decoded. Fails closed: an
+  undecodable module is never "fine".
+
+- Five regression tests over `verify_no_user_calls`, in WAT so they test the pass rather than
+  clang's inlining decisions: a call to a module-defined function is flagged; calls to imports are
+  not; all offending calls are reported rather than the first; a helper that is defined but never
+  *called* is legal, since only calls are rejected; and an undecodable module errors.
+
+Verified against the real artifact: the pre-1.11.1 `revenue_split_ok`, which returned
+`temMALFORMED` on testnet, is flagged with both of its calls at the right offsets; the fixed build
+and the other primitives are clean; all eleven examples still build.
+
 ## [1.11.1] - 2026-07-29
 
 **If your hook emits more than once, rebuild it — it could not be installed.** A hook that calls a

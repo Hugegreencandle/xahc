@@ -106,6 +106,30 @@ pub fn run(input: &Path, output: &Path, extra_includes: &[PathBuf], do_lint: boo
     // a `for` condition is reachable-first yet clang hoists it, so the bytes are not adjacent and
     // SetHook returns temMALFORMED. escrow_ok and multisig_ok were never installable while this tool
     // reported "no issues". Verify the ACTUAL property on the ACTUAL emitted bytes, and fail closed.
+    // ILLEGAL-CALL GATE. A hook may call ONLY imported host functions (xahaud Guard.h:495-509);
+    // a helper the module defines itself is temMALFORMED at SetHook. Same class as the adjacency
+    // gate below: invisible in the source, visible only in the emitted module.
+    match crate::guardpass::verify_no_user_calls(&guarded) {
+        Ok(bad) if !bad.is_empty() => {
+            for b in &bad {
+                eprintln!(
+                    "{} func[{}] at offset {}: calls function {}, which this module defines itself.",
+                    "error".red(), b.func, b.offset, b.callee
+                );
+            }
+            eprintln!(
+                "         A hook may call ONLY imported host functions — SetHook rejects anything \
+else\n         with temMALFORMED. Force the helper inline:\n           \
+  static inline __attribute__((always_inline)) ...\n         \
+A plain `inline` is only a hint, and at -Oz clang declines it for a large function once\n         \
+there is more than one call site. See docs/GUARD_PLACEMENT.md."
+            );
+            anyhow::bail!("hook calls {} function(s) it defines itself", bad.len());
+        }
+        Ok(_) => {}
+        Err(e) => anyhow::bail!("could not verify calls against the import list (failing closed): {e}"),
+    }
+
     match crate::guardpass::verify_byte_adjacency(&guarded) {
         Ok(bad) if !bad.is_empty() => {
             for b in &bad {
