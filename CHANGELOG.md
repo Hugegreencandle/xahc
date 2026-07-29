@@ -3,6 +3,64 @@
 All notable changes to xahc are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); versioning is [SemVer](https://semver.org/).
 
+## [1.11.0] - 2026-07-29
+
+**If you have ever built a hook containing a loop, rebuild it and check it still builds.** A hook
+could pass `xahc build` completely clean and be **impossible to install** — `SetHook` returns
+`temMALFORMED`. Six of this repo's own eleven examples were in that state. If your hook builds
+clean on 1.11.0 it was never affected; if it now fails, it could never have been deployed and the
+error says exactly which loop to fix.
+
+### Fixed
+
+- **Guard placement is now verified on the emitted bytes (CRITICAL).** xahaud requires the guard's
+  literal bytes — `0x41 <id> 0x41 <maxiter> 0x10 <_g>` — immediately after every `loop` opcode and
+  its blocktype byte (`Guard.h:386-390`). Anything else fails `validateGuards`, then `SetHook.cpp`
+  preflight, then **temMALFORMED**. Every check `guardpass` had reasoned about **reachability**
+  instead, which is a strictly weaker and different property: a guard written in the `for` condition
+  *is* reachable before anything else in the loop, so it passed, while clang hoisted it out of the
+  body so the bytes were not adjacent and the ledger refused the module. `verify_byte_adjacency`
+  decodes the module xahc is about to write and checks the property the ledger actually checks. It
+  derives `_g`'s index from the emitted import section rather than trusting walrus's numbering, and
+  **fails closed on a module it cannot decode**.
+
+- **Six of eleven shipped examples were never installable.** `agent_guardrail`,
+  `agent_guardrail_stateful`, `big_stack` and the three planted-bug twins all failed the new check.
+  The other five used the **identical** source idiom and built to adjacent bytes. Same form,
+  opposite verdict — whether clang hoists depends on the loop body, so the condition form cannot be
+  judged from the source, which is why the check has to run on the emitted module. Every loop in
+  `examples/` is now written with the guard first inside the body.
+
+- **`xahc new` no longer teaches the fragile idiom.** Both scaffold templates used the condition
+  form. The emitter archetype happened to build to adjacent bytes, so scaffolded hooks were not
+  broken — but every new user was handed the form that broke six of ours.
+
+- **The reported function index skipped no imports.** `verify_byte_adjacency` numbered code-section
+  entries from 0, so every finding was reported as `func[0]` regardless of which function it was in.
+
+### Added
+
+- `docs/GUARD_PLACEMENT.md` — the rule, the mechanism with the xahaud source, the byte sequences,
+  and the four-fixture evidence. Replaces `docs/KNOWN_ISSUE_guard_in_condition.md`.
+- `tests/fixtures/loop{A,B,C,D}.c` — the four hooks that root-caused this, differing only in guard
+  position, each with its testnet verdict predicted from the bytes beforehand (4/4 correct).
+  `loopD` is the decisive one: it keeps loopA's hoisted guard, adds a body-head guard, and installs.
+- Eleven regression tests over `verify_byte_adjacency`, written in WAT so they test this pass rather
+  than clang's optimiser.
+
+### Changed
+
+- `include/xahc/guard.h` documents where the guard goes, ahead of the budget semantics. Its `+1`
+  rationale is corrected: it described the trailing crossing of a **condition-placed** guard, i.e.
+  it justified the macro by the placement this release rejects. A body-head guard is crossed exactly
+  N times. The `+1` remains as spare headroom.
+
+### Note on 1.10.0
+
+1.10.0 was never tagged or released; its entry below stands as part of this release. Its "Known
+issues" section described the guard defect as reproducible but unexplained, which was accurate when
+written and is superseded by the root cause above.
+
 ## [1.10.0] - 2026-07-29
 
 **If you emit from a hook, upgrade.** `XAHC_EMIT_PAYMENT` and `XAHC_EMIT_PAYMENT_IOU` could never
@@ -37,9 +95,9 @@ emit. Any hook built with them silently failed to send its payment on-ledger.
 
 ### Known issues
 
-- `docs/KNOWN_ISSUE_guard_in_condition.md` — a reproducible case where two hooks differing only in
-  guard placement get opposite `SetHook` verdicts while `xahc build` calls both clean. The
-  reproducer is real; the earlier explanation for it was withdrawn as unproven.
+- A reproducible case where two hooks differing only in guard placement get opposite `SetHook`
+  verdicts while `xahc build` calls both clean. The reproducer is real; the explanation for it was
+  withdrawn as unproven. **Root-caused and fixed in 1.11.0 — see `docs/GUARD_PLACEMENT.md`.**
 
 ### Verified
 
