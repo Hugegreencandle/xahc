@@ -3,6 +3,42 @@
 All notable changes to xahc are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); versioning is [SemVer](https://semver.org/).
 
+## [1.11.1] - 2026-07-29
+
+**If your hook emits more than once, rebuild it — it could not be installed.** A hook that calls a
+function it defines itself is rejected by `SetHook` with `temMALFORMED`, and the emit builders in
+these headers were being compiled into exactly that.
+
+### Fixed
+
+- **Every hook emitting more than once was uninstallable (CRITICAL).** `xahc_build_payment` and
+  `xahc_build_payment_iou` were declared `static inline`, which at `-Oz` is a hint clang is free to
+  decline — and it does decline for a function this size once there is **more than one call site**.
+  The helper was then emitted as a real function and the hook called it, which xahaud forbids:
+  `Guard.h:495-509` rejects any `call` whose callee index exceeds the last import, because a hook
+  may only call imported host functions. Now `__attribute__((always_inline))`, which is a
+  requirement rather than a hint.
+
+  Hooks with a single emit inlined the helper and installed normally, which is why this went
+  unnoticed. Verified against two multi-emit hooks that were `temMALFORMED` before the change and
+  install (`tesSUCCESS`) after, with no change to single-emit bytecode.
+
+  `xahc_otxn_drops` and `xahc_state_u64` get the same treatment. They are small enough to have been
+  inlined in practice, but "in practice" is what failed here.
+
+### Note for anyone upgrading
+
+The version bump matters. Headers are extracted to `~/.cache/xahc/v<version>/include` and only when
+that directory does not already exist, so a fix to a header does not reach an existing install until
+the version changes. `XAHC_INCLUDE` overrides the cache when developing against a working tree.
+
+### Known gap
+
+`xahc lint` does not yet flag a call to a user-defined function. It catches guard byte-adjacency
+(1.11.0) but not this, so a module can still pass every local check and be refused on-chain. The
+check is cheap and local: for each `0x10` call opcode, compare the callee index against the import
+count.
+
 ## [1.11.0] - 2026-07-29
 
 **If you have ever built a hook containing a loop, rebuild it and check it still builds.** A hook

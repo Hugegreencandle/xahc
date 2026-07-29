@@ -25,7 +25,7 @@ extern int64_t state_set(uint32_t read_ptr, uint32_t read_len, uint32_t kread_pt
     state(XAHC_SBUF(v), XAHC_SBUF(k))
 
 /* Get a uint64 under key `k`; if absent, yield `dflt`. */
-static inline uint64_t xahc_state_u64(const uint8_t* k, uint32_t klen, uint64_t dflt) {
+static inline __attribute__((always_inline)) uint64_t xahc_state_u64(const uint8_t* k, uint32_t klen, uint64_t dflt) {
     uint8_t buf[8];
     int64_t rc = state((uint32_t)buf, sizeof(buf), (uint32_t)k, klen);
     if (rc != 8) return dflt;

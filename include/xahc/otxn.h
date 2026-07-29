@@ -38,7 +38,7 @@ extern int64_t otxn_id(uint32_t write_ptr, uint32_t write_len, uint32_t flags);
  *   -2  issued (non-native) amount — use the XFL/slot path instead
  * Encapsulates the 8-byte STAmount native decode that every payment-policing
  * hook would otherwise hand-roll. */
-static inline int64_t xahc_otxn_drops(void)
+static inline __attribute__((always_inline)) int64_t xahc_otxn_drops(void)
 {
     uint8_t amt[8];
     if (otxn_field((uint32_t)amt, 8, sfAmount) != 8) return -1;

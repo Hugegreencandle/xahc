@@ -63,7 +63,12 @@ extern int64_t float_sto(uint32_t write_ptr, uint32_t write_len,
  * dtag/stag : destination / source tags (0 if unused)
  * returns the serialized length.
  */
-static inline uint32_t xahc_build_payment(
+/* always_inline is REQUIRED, not a hint. xahaud (Guard.h:495-509) rejects a hook that calls a
+ * function it defines itself. At -Oz clang declines to inline a function this size across more
+ * than one call site, so `static inline` alone left a real function behind and EVERY hook that
+ * emits more than once was temMALFORMED at SetHook. Verified on revenue_split_ok (2 emits) and
+ * revenue_split3_ok (3). Single-emit hooks were unaffected, which is why this went unnoticed. */
+static inline __attribute__((always_inline)) uint32_t xahc_build_payment(
     uint8_t* buf, const uint8_t* to20, uint64_t drops, uint32_t dtag, uint32_t stag)
 {
     uint8_t* p = buf;
@@ -148,7 +153,7 @@ static inline uint32_t xahc_build_payment(
  * currency20 : 20-byte currency code (160-bit)
  * issuer20   : 20-byte issuer account id
  */
-static inline uint32_t xahc_build_payment_iou(
+static inline __attribute__((always_inline)) uint32_t xahc_build_payment_iou(
     uint8_t* buf, const uint8_t* to20,
     int64_t xfl, const uint8_t* currency20, const uint8_t* issuer20,
     uint32_t dtag, uint32_t stag)
