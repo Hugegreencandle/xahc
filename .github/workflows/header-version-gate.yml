@@ -1,0 +1,87 @@
+name: header-version-gate
+
+# A change to include/ that does not bump the version SILENTLY DOES NOTHING for existing users.
+#
+# xahc extracts its embedded headers to ~/.cache/xahc/v<version>/include and ONLY when that
+# directory does not already exist (crates/xahc-cli/src/build.rs). So an installed copy keeps
+# compiling against the headers it cached the first time. Ship a header fix without bumping the
+# version and every existing install still has the bug, while `xahc --version` and the binary both
+# look correct.
+#
+# This is not hypothetical. On 2026-07-29 a header fix was verified three times against a stale
+# cache and appeared to do nothing; the output was byte-identical each time. The fix was correct
+# and unreachable. v1.11.1 shipped the bump as part of the fix for exactly this reason.
+#
+# Override, when a header change genuinely cannot affect compiled output (a comment, a typo in a
+# doc block): put [skip-header-bump] in the commit message. Explicit and auditable, rather than
+# this job trying to decide which diffs are semantically inert.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  header-version-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0        # need history to diff against the base
+
+      - name: Headers changed => version must change
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE="${{ github.event.pull_request.base.sha }}"
+          else
+            BASE="${{ github.event.before }}"
+          fi
+
+          # First push to a branch, or an unreachable base: nothing to compare against.
+          if [ -z "$BASE" ] || [ "$BASE" = "0000000000000000000000000000000000000000" ] \
+             || ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+            echo "no usable base commit ($BASE) — skipping"
+            exit 0
+          fi
+
+          HEADERS_CHANGED=$(git diff --name-only "$BASE" HEAD -- include/ | wc -l | tr -d ' ')
+          if [ "$HEADERS_CHANGED" -eq 0 ]; then
+            echo "no changes under include/ — nothing to check"
+            exit 0
+          fi
+
+          ver() { git show "$1:Cargo.toml" 2>/dev/null \
+                  | sed -n 's/^version[[:space:]]*=[[:space:]]*"\(.*\)"/\1/p' | head -1; }
+          OLD=$(ver "$BASE"); NEW=$(ver HEAD)
+
+          echo "include/ files changed : $HEADERS_CHANGED"
+          git diff --name-only "$BASE" HEAD -- include/ | sed 's/^/    /'
+          echo "workspace version      : ${OLD:-<none>} -> ${NEW:-<none>}"
+
+          if git log --format=%B "$BASE"..HEAD | grep -qF '[skip-header-bump]'; then
+            echo "::notice::[skip-header-bump] present — override accepted."
+            exit 0
+          fi
+
+          if [ -z "$NEW" ]; then
+            echo "::error::could not read the workspace version from Cargo.toml."
+            exit 1
+          fi
+
+          if [ "$OLD" = "$NEW" ]; then
+            echo "::error::include/ changed but the workspace version is still ${NEW}."
+            echo ""
+            echo "Headers are extracted to ~/.cache/xahc/v<version>/include and only when that"
+            echo "directory does not already exist. Every existing install therefore keeps the"
+            echo "headers it cached under this version, and this change will not reach any of them."
+            echo ""
+            echo "Fix: bump 'version' in Cargo.toml, and add the entry to CHANGELOG.md."
+            echo "If the change genuinely cannot affect compiled output, add [skip-header-bump]"
+            echo "to the commit message."
+            exit 1
+          fi
+
+          echo "version moved ${OLD} -> ${NEW} — the new headers will be extracted."
