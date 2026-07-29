@@ -116,7 +116,14 @@ static inline uint32_t xahc_build_payment(
          * tecHOOK_REJECTED on a minimal emitting hook. */                                       \
         XAHC_TRY(etxn_reserve(1));                                          \
         uint32_t _xahc_len = xahc_build_payment(_xahc_tx, (to20), (drops), (dtag), (stag)); \
-        XAHC_TRY(emit(0, 0, (uint32_t)_xahc_tx, _xahc_len));                \
+        /* emit() REQUIRES a >= 32 byte write buffer for the emitted txn hash:                 \
+         * applyHook.cpp `if (write_len < 32) return TOO_SMALL;`. Passing emit(0, 0, ...) made  \
+         * EVERY emit through this macro fail with TOO_SMALL, and XAHC_TRY rolled back with a   \
+         * line number instead of the errno, so it looked like a builder problem. Confirmed on  \
+         * testnet 2026-07-29: identical hook emits with a real buffer, fails with 0,0.         \
+         * The hash is genuinely useful too — it identifies the emitted txn for a cbak. */      \
+        uint8_t _xahc_emithash[32];                                         \
+        XAHC_TRY(emit((uint32_t)_xahc_emithash, 32, (uint32_t)_xahc_tx, _xahc_len)); \
     } while (0)
 
 /* ---- Issued (IOU / trustline) payment -------------------------------------
@@ -197,7 +204,14 @@ static inline uint32_t xahc_build_payment_iou(
         XAHC_TRY(etxn_reserve(1));                                          \
         uint32_t _xahc_len = xahc_build_payment_iou(                        \
             _xahc_tx, (to20), (xfl), (currency20), (issuer20), (dtag), (stag)); \
-        XAHC_TRY(emit(0, 0, (uint32_t)_xahc_tx, _xahc_len));                \
+        /* emit() REQUIRES a >= 32 byte write buffer for the emitted txn hash:                 \
+         * applyHook.cpp `if (write_len < 32) return TOO_SMALL;`. Passing emit(0, 0, ...) made  \
+         * EVERY emit through this macro fail with TOO_SMALL, and XAHC_TRY rolled back with a   \
+         * line number instead of the errno, so it looked like a builder problem. Confirmed on  \
+         * testnet 2026-07-29: identical hook emits with a real buffer, fails with 0,0.         \
+         * The hash is genuinely useful too — it identifies the emitted txn for a cbak. */      \
+        uint8_t _xahc_emithash[32];                                         \
+        XAHC_TRY(emit((uint32_t)_xahc_emithash, 32, (uint32_t)_xahc_tx, _xahc_len)); \
     } while (0)
 
 #endif /* XAHC_EMIT_PAYMENT_H */
