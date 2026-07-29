@@ -3,6 +3,50 @@
 All notable changes to xahc are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); versioning is [SemVer](https://semver.org/).
 
+## [1.10.0] - 2026-07-29
+
+**If you emit from a hook, upgrade.** `XAHC_EMIT_PAYMENT` and `XAHC_EMIT_PAYMENT_IOU` could never
+emit. Any hook built with them silently failed to send its payment on-ledger.
+
+### Fixed
+
+- **`XAHC_EMIT_PAYMENT` / `_IOU` could NEVER emit (CRITICAL).** Both macros called
+  `emit(0, 0, ...)`. xahaud requires a **≥32-byte write buffer** for the emitted-transaction hash
+  (`applyHook.cpp`: `if (write_len < 32) return TOO_SMALL;`), so every emit returned `TOO_SMALL` and
+  the hook rolled back. `XAHC_TRY` reported a **line number** rather than the errno, so the failure
+  looked like a fault in the payment builder — which is why it went unnoticed. The macros now pass a
+  real `uint8_t _xahc_emithash[32]`; that hash is useful in its own right, since a `cbak` uses it to
+  identify the transaction it is settling.
+
+- **Emit buffers were 22 bytes too small for any hook exporting `cbak` (CRITICAL).**
+  `etxn_details` requires `write_len >= 138` when the hook has a callback and 116 when it does not.
+  `XAHC_PAYMENT_SIZE` was 248 and the builder writes a 132-byte prefix, leaving exactly 116 —
+  correct for a no-callback hook with **zero margin**, and 22 short for a `cbak` one. Sized for the
+  worst case: `XAHC_PAYMENT_SIZE` 248 → **270**, `XAHC_PAYMENT_IOU_SIZE` 288 → **310**. The
+  constraint was already documented in the IOU variant's comment and nothing enforced it; the
+  compiler cannot check a comment, so it is enforced by size now.
+
+- **`etxn_reserve`'s return is now checked** in both macros. It was called bare, so a failed
+  reservation was swallowed and resurfaced later as a rollback inside the builder, pointing at the
+  wrong call entirely.
+
+- **`guardpass` now fails closed.** `guard_already_first` descended into a leading `block` and
+  blessed any guard found there, and `build.rs` never reported that path — so an unrecognised guard
+  shape was indistinguishable from a correct one, in the one tool whose job is to stop you shipping
+  a module the ledger rejects. Placement that cannot be **proved** is now a build error.
+
+### Known issues
+
+- `docs/KNOWN_ISSUE_guard_in_condition.md` — a reproducible case where two hooks differing only in
+  guard placement get opposite `SetHook` verdicts while `xahc build` calls both clean. The
+  reproducer is real; the earlier explanation for it was withdrawn as unproven.
+
+### Verified
+
+All fixes confirmed on Xahau testnet, not just by inspection: an unmodified dead-man-switch hook
+running its full lifecycle (arm → pending → release), emitting exactly one payment of the configured
+amount, with the two-phase grace gate observed on-chain.
+
 ## [1.9.2] - 2026-06-14
 
 ### Added
