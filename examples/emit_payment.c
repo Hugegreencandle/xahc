@@ -19,8 +19,10 @@ int64_t hook(uint32_t reserved)
         XAHC_ACCEPT("not a payment");
 
     uint8_t dest[20];
-    for (int i = 0; XAHC_GUARD(20), i < 20; ++i)
+    for (int i = 0; i < 20; ++i) {
+        XAHC_GUARD(20);
         dest[i] = 0xBB;
+    }
 
     XAHC_EMIT_PAYMENT(dest, EMIT_DROPS, 0, 0);
 

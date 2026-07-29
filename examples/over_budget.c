@@ -13,8 +13,10 @@ int64_t hook(uint32_t reserved)
 {
     XAHC_HOOK_ENTRY();
     /* XAHC_GUARD(3) allows 3 iterations; this loop wants 10 -> guard violation. */
-    for (int i = 0; XAHC_GUARD(3), i < 10; ++i)
+    for (int i = 0; i < 10; ++i) {
+        XAHC_GUARD(3);
         trace_num(0, 0, i);
+    }
     accept(0, 0, 0);
     return 0;
 }

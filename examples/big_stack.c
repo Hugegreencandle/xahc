@@ -11,8 +11,10 @@ int64_t hook(uint32_t reserved)
     XAHC_HOOK_ENTRY();
     int n = (int)(ledger_seq() & 0x7);
     volatile uint8_t buf[90000];              /* >64KB stack frame */
-    for (int i = 0; XAHC_GUARD(90001), i < 90000; ++i)
+    for (int i = 0; i < 90000; ++i) {
+        XAHC_GUARD(90000);
         buf[i] = (uint8_t)i;
+    }
     accept(0, 0, buf[n]);
     return 0;
 }

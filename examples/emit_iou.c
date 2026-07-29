@@ -21,14 +21,14 @@ int64_t hook(uint32_t reserved)
         XAHC_ACCEPT("not a payment");
 
     uint8_t cur[20];
-    for (int i = 0; XAHC_GUARD(20), i < 20; ++i) cur[i] = 0;
+    for (int i = 0; i < 20; ++i) { XAHC_GUARD(20); cur[i] = 0; }
     cur[12] = 'U'; cur[13] = 'S'; cur[14] = 'D';
 
     uint8_t iss[20];
-    for (int i = 0; XAHC_GUARD(20), i < 20; ++i) iss[i] = 0xCC;
+    for (int i = 0; i < 20; ++i) { XAHC_GUARD(20); iss[i] = 0xCC; }
 
     uint8_t dst[20];
-    for (int i = 0; XAHC_GUARD(20), i < 20; ++i) dst[i] = 0xBB;
+    for (int i = 0; i < 20; ++i) { XAHC_GUARD(20); dst[i] = 0xBB; }
 
     int64_t xfl = float_set(-1, 15);   /* 1.5 */
 

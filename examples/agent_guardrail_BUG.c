@@ -1,14 +1,21 @@
 #include "xahc/xahc.h"
 
-/* Agent spending guardrail — install on an autonomous agent's account.
+/* Agent spending guardrail (per-tx cap) — WITH A PLANTED BUG.
  *
- * Enforces, at layer 1, limits an off-chain agent must not exceed:
- *   HookParameter "LIM" (8 bytes, big-endian drops)  REQUIRED — max per-tx spend
- *   HookParameter "DST" (20-byte account-id)          OPTIONAL — lock outgoing to one dest
+ * REFUTATION TWIN for prove_guardrail.py. Identical to agent_guardrail.c EXCEPT
+ * the per-tx cap comparison on line ~44:
  *
- * Policies OUTGOING Payments from this account; passes everything else.
- * Pairs with x402/agentic payments: the agent signs payments off-chain, this
- * Hook bounds them on-chain (see docs/X402-XAHAU.md). */
+ *     REAL:  XAHC_REQUIRE((uint64_t)drops <= limit, "over per-tx spend limit");
+ *     BUG:   XAHC_REQUIRE((uint32_t)drops <= (uint32_t)limit, "over per-tx spend limit");
+ *
+ * The bug truncates both sides to 32 bits — a realistic mistake (a dev casting an
+ * int64 drop amount to int for the compare). A payment whose LOW 32 bits are under
+ * the limit but whose HIGH 32 bits are set (a huge amount) passes the truncated
+ * check. Small-value tests and a naive sim pass; the true amount is far over LIM.
+ *
+ * prove_guardrail.py checks: (accept AND outgoing Payment) => true drops <= LIM,
+ * using the FULL 64-bit decode. So it must return a COUNTEREXAMPLE (a drops value
+ * with high bits set that the truncated check let through). Non-vacuity control. */
 
 int64_t cbak(uint32_t reserved) { return 0; }
 
@@ -19,7 +26,6 @@ int64_t hook(uint32_t reserved)
     if (otxn_type() != XAHC_ttPAYMENT)
         XAHC_ACCEPT("not a payment");
 
-    /* Only police OUTGOING payments (origin == this hook's account). */
     uint8_t origin[20], me[20];
     XAHC_OTXN_ACCOUNT(origin);
     hook_account(XAHC_SBUF(me));
@@ -31,7 +37,6 @@ int64_t hook(uint32_t reserved)
     if (!outgoing)
         XAHC_ACCEPT("incoming");
 
-    /* Per-tx spend cap from hook parameter LIM (8-byte drops). */
     uint8_t lim_key[3] = { 'L', 'I', 'M' };
     uint8_t lim[8];
     XAHC_HOOK_PARAM_REQUIRE(lim, lim_key, 8);
@@ -43,9 +48,9 @@ int64_t hook(uint32_t reserved)
 
     int64_t drops = xahc_otxn_drops();
     XAHC_REQUIRE(drops >= 0, "native amount only");
-    XAHC_REQUIRE((uint64_t)drops <= limit, "over per-tx spend limit");
+    /* ---- PLANTED BUG: 32-bit truncated compare lets a high-bits-set amount through. ---- */
+    XAHC_REQUIRE((uint32_t)drops <= (uint32_t)limit, "over per-tx spend limit");
 
-    /* Optional destination lock from hook parameter DST (20-byte account-id). */
     uint8_t dst_key[3] = { 'D', 'S', 'T' };
     uint8_t allowed[20];
     if (hook_param(XAHC_SBUF(allowed), XAHC_SBUF(dst_key)) == 20) {

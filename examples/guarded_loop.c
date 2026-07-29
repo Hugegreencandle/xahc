@@ -11,8 +11,10 @@ int64_t hook(uint32_t reserved)
 {
     XAHC_HOOK_ENTRY();
     int n = (int)(ledger_seq() & 0x0F);   /* runtime bound */
-    for (int i = 0; XAHC_GUARD(16), i < n; ++i)
+    for (int i = 0; i < n; ++i) {
+        XAHC_GUARD(16);
         trace_num(0, 0, i);
+    }
     accept(0, 0, 0);
     return 0;
 }

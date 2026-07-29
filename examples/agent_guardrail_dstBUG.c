@@ -12,6 +12,10 @@
 
 int64_t cbak(uint32_t reserved) { return 0; }
 
+/* REFUTATION TWIN (dst-lock): the destination compare loop below checks only the
+ * first 4 of 20 account-id bytes — a realistic truncated-compare bug. A destination
+ * that matches the allowed account on bytes [0..3] but differs after is accepted,
+ * violating the dst-lock obligation. prove_guardrail must return a COUNTEREXAMPLE. */
 int64_t hook(uint32_t reserved)
 {
     XAHC_HOOK_ENTRY();
@@ -52,7 +56,7 @@ int64_t hook(uint32_t reserved)
         uint8_t dest[20];
         XAHC_OTXN_DESTINATION(dest);
         int ok = 1;
-        for (int i = 0; i < 20; ++i) {
+        for (int i = 0; i < 4; ++i) {   /* BUG: 4 not 20 */
             XAHC_GUARD(20);
             if (dest[i] != allowed[i]) ok = 0;
         }

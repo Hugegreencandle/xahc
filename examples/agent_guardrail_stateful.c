@@ -59,8 +59,10 @@ int64_t hook(uint32_t reserved)
     XAHC_OTXN_ACCOUNT(origin);
     hook_account(XAHC_SBUF(me));
     int outgoing = 1;
-    for (int i = 0; XAHC_GUARD(20), i < 20; ++i)
+    for (int i = 0; i < 20; ++i) {
+        XAHC_GUARD(20);
         if (origin[i] != me[i]) outgoing = 0;
+    }
     if (!outgoing)
         XAHC_ACCEPT("incoming");
 
@@ -146,8 +148,10 @@ int64_t hook(uint32_t reserved)
         uint8_t dest[20];
         XAHC_OTXN_DESTINATION(dest);
         int ok = 1;
-        for (int i = 0; XAHC_GUARD(20), i < 20; ++i)
+        for (int i = 0; i < 20; ++i) {
+            XAHC_GUARD(20);
             if (dest[i] != allowed[i]) ok = 0;
+        }
         XAHC_REQUIRE(ok, "destination not in policy");
     }
 
