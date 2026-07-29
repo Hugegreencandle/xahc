@@ -79,7 +79,7 @@ the presence of a condition-form guard, and nothing about the loop's semantics.
 `loopC` rules out "reachable at all from the loop header": a guard at the bottom of the body is
 crossed on every iteration and is still rejected.
 
-Sources: `tests/fixtures/loop{A,B,C,D}.c`, also kept in `xahc-prover/hooks/`.
+Sources: `tests/fixtures/loop{A,B,C,D}.c`.
 
 ## What xahc does about it
 
@@ -96,14 +96,20 @@ property: `loopA` satisfies it and the ledger refuses the module anyway.
 
 ## Impact while this was silent
 
-Every affected hook was uninstallable while every tool reported it clean. `escrow_ok` (1 loop) and
-`multisig_ok` (4 loops) in `xahc-prover` used the condition form and had never been deployed; the
-sibling hooks that did deploy (`subscription_ok`, `rate_limit_ok`) install only because they contain
-no loops, so nothing exercised the validator. Both dead-man fixtures carried the same form. One of
-the "6 certified primitives" had been proved seven ways while being impossible to install.
+Every affected hook was uninstallable while every tool reported it clean, and the failure was
+invisible until deployment. Two properties made it easy to miss for a long time:
 
-**PROVEN ≠ INSTALLABLE ≠ INVOKED ≠ RUNS.** A proof binds the semantics of the module; it says
-nothing about whether the ledger will accept its bytes.
+- **A hook with no loops is unaffected**, so a codebase can carry the broken idiom for months and
+  still deploy successfully, as long as the hooks that happened to ship had no loops in them.
+- **A hook that is never deployed is never contradicted.** Analysis, tests and proofs all run
+  happily against a module the ledger would refuse, because none of them submit it.
+
+If you have hooks that were verified but not yet deployed, that combination is worth checking for
+directly: run `xahc lint` over the exact artifacts you intend to submit.
+
+**PROVEN ≠ INSTALLABLE ≠ INVOKED ≠ RUNS.** Analysis of a module — including a machine proof —
+binds its semantics. It says nothing about whether the ledger will accept its bytes. Those are
+separate properties and they need separate checks.
 
 ## Guard budget, with a body-head guard
 
@@ -115,5 +121,5 @@ requirement. It is retained: over-budgeting a guard is safe, under-budgeting is 
 
 ## Related
 
-- `xahc-prover/docs/DEADMAN_TESTNET_SMOKE_2026-07-29.md` — the testnet bisect this came out of.
 - `CHANGELOG.md` [1.11.0].
+- `tests/fixtures/README.md` — the four fixtures and their on-chain verdicts.

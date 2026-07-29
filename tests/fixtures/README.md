@@ -20,6 +20,6 @@ needs a wasm32-capable clang, so the automated regression lives in
 tests this pass rather than testing clang's optimiser. These C sources are kept as the on-chain
 provenance for the rule.
 
-Full write-up: `docs/GUARD_PLACEMENT.md`. Copies also live in `xahc-prover/hooks/`.
+Full write-up: `docs/GUARD_PLACEMENT.md`.
 
 `unguarded_loop.c` is unrelated: a loop with no guard at all, for the lint rule that requires one.
