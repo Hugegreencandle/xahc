@@ -93,7 +93,7 @@ fn reverify(args: &[String]) -> Result<i32> {
     let hook_hash = report.get("hook_hash").and_then(|v| v.as_str()).unwrap_or("");
     if status != "PROVEN" {
         println!("{}  {}…  ({})", "○ NOTHING TO REVERIFY".yellow().bold(),
-            &hook_hash.chars().take(16).collect::<String>(), status);
+            hook_hash.chars().take(16).collect::<String>(), status);
         println!("  {}", report.get("detail").and_then(|v| v.as_str()).unwrap_or("not PROVEN on record"));
         return Ok(2);
     }
@@ -106,7 +106,7 @@ fn reverify(args: &[String]) -> Result<i32> {
 
     // 2) Re-derive each registered proof by re-running the prover on THIS bytecode.
     println!("reverifying {} proof(s) for hook {}… by re-running the prover\n",
-        proofs.len(), &hook_hash.chars().take(16).collect::<String>());
+        proofs.len(), hook_hash.chars().take(16).collect::<String>());
     let mut all_match = true;
     let fail = "✗ DID NOT REPRODUCE".red().bold().to_string();
     for p in proofs {
