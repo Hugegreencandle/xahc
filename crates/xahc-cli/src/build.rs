@@ -82,6 +82,25 @@ pub fn run(input: &Path, output: &Path, extra_includes: &[PathBuf], do_lint: boo
             "warn".yellow(), grep.skipped
         );
     }
+    // FAIL CLOSED (2026-07-29). A guard the pass cannot PROVE sits at the loop head is an ERROR,
+    // not a note. This exact shape — a guard written in the `for` condition — built clean and was
+    // then rejected by SetHook with temMALFORMED, because the old check descended into a leading
+    // block and blessed it. Shipping a module the ledger refuses is the worst outcome this tool
+    // has, so it must not be possible to reach it with a green build.
+    if grep.unverified > 0 {
+        eprintln!(
+            "{} {} loop(s) contain a guard this pass could NOT prove runs first at the loop head.\n         \
+             xahaud requires `_g` to be the FIRST branch after the loop instruction, and rejects the \n         \
+             module at SetHook with temMALFORMED otherwise. The usual cause is a guard written in the\n         \
+             `for` CONDITION:\n           \
+               for (int i = 0; XAHC_GUARD(20), i < 20; ++i)      // REJECTED by the ledger\n           \
+               for (int i = 0; i < 20; ++i) {{ XAHC_GUARD(20); }} // correct\n         \
+             Move the guard to be the first statement INSIDE the loop body.\n         \
+             See docs/KNOWN_ISSUE_guard_in_condition.md",
+            "error".red(), grep.unverified
+        );
+        anyhow::bail!("guard placement could not be verified for {} loop(s)", grep.unverified);
+    }
 
     // clean
     let (cleaned, removed) = clean::clean_bytes(&guarded)?;

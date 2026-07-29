@@ -23,6 +23,13 @@ pub struct Report {
     /// loops whose guard args weren't plain literals → left in place (may be
     /// mispositioned; surfaced so it isn't silent).
     pub skipped: usize,
+    /// FAIL-CLOSED (2026-07-29): loops that DO contain a `_g` somewhere, but where this pass could
+    /// not PROVE it is the first branch at the loop head — e.g. a guard written in the `for`
+    /// CONDITION, which clang compiles into a nested block. These previously counted as
+    /// `already_ok` and were reported as nothing at all, so `xahc build` said "lint no issues" for a
+    /// module SetHook then rejected with temMALFORMED. An unrecognised guard shape must never be
+    /// indistinguishable from a correct one. See docs/KNOWN_ISSUE_guard_in_condition.md.
+    pub unverified: usize,
 }
 
 pub fn reposition(wasm: &[u8]) -> Result<(Vec<u8>, Report)> {
@@ -32,11 +39,11 @@ pub fn reposition(wasm: &[u8]) -> Result<(Vec<u8>, Report)> {
         None => {
             // No guard import at all → no loops to guard (or an unguarded hook,
             // which lint catches separately). Pass through unchanged.
-            return Ok((m.emit_wasm(), Report { repositioned: 0, already_ok: 0, unguarded_loops: 0, skipped: 0 }));
+            return Ok((m.emit_wasm(), Report { repositioned: 0, already_ok: 0, unguarded_loops: 0, skipped: 0, unverified: 0 }));
         }
     };
 
-    let mut rep = Report { repositioned: 0, already_ok: 0, unguarded_loops: 0, skipped: 0 };
+    let mut rep = Report { repositioned: 0, already_ok: 0, unguarded_loops: 0, skipped: 0, unverified: 0 };
 
     let func_ids: Vec<FunctionId> = m
         .funcs
@@ -66,6 +73,7 @@ pub fn reposition(wasm: &[u8]) -> Result<(Vec<u8>, Report)> {
                 Hoist::Moved => rep.repositioned += 1,
                 Hoist::NoGuard => rep.unguarded_loops += 1,
                 Hoist::Skip => rep.skipped += 1, // non-literal args: left in place, surfaced by build
+                Hoist::Unverified => rep.unverified += 1,
             }
         }
     }
@@ -106,6 +114,9 @@ enum Hoist {
     Moved,
     NoGuard,
     Skip,
+    /// A `_g` exists somewhere in this loop, but not at the top level where we can prove it runs
+    /// first. We will NOT silently bless it.
+    Unverified,
 }
 
 /// True if a `_g` call is ALREADY provably the first branch on entry to `seq`,
@@ -129,6 +140,42 @@ fn guard_already_first(lf: &walrus::LocalFunction, seq: InstrSeqId, g: FunctionI
                 }
             }
             _ if is_branch(instr) => return false,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Guard is provably first ONLY if it appears at this sequence's own top level before any other
+/// branch. Deliberately does NOT descend into a leading `block`: xahaud requires `_g` to be the
+/// first branch after the loop instruction, and a guard buried in a nested block is exactly the
+/// shape the ledger rejected while this pass called it fine.
+fn guard_first_at_top_level(lf: &walrus::LocalFunction, seq: InstrSeqId, g: FunctionId) -> bool {
+    for (instr, _) in lf.block(seq).instrs.iter() {
+        match instr {
+            Instr::Call(c) if c.func == g => return true,
+            _ if is_branch(instr) => return false,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Does a `_g` call appear anywhere inside this sequence's NESTED blocks?
+fn seq_contains_guard_nested(lf: &walrus::LocalFunction, seq: InstrSeqId, g: FunctionId) -> bool {
+    for (instr, _) in lf.block(seq).instrs.iter() {
+        match instr {
+            Instr::Call(c) if c.func == g => return true,
+            Instr::Block(b) => {
+                if seq_contains_guard_nested(lf, b.seq, g) { return true; }
+            }
+            Instr::Loop(l) => {
+                if seq_contains_guard_nested(lf, l.seq, g) { return true; }
+            }
+            Instr::IfElse(ie) => {
+                if seq_contains_guard_nested(lf, ie.consequent, g)
+                    || seq_contains_guard_nested(lf, ie.alternative, g) { return true; }
+            }
             _ => {}
         }
     }
@@ -163,7 +210,10 @@ fn hoist_guard_in_seq(lf: &mut walrus::LocalFunction, seq: InstrSeqId, g: Functi
     // If the guard is already provably first on entry — including the case where
     // it lives inside a leading unconditional `block` — there is nothing to move.
     // Skipping here prevents churning (or double-hoisting) an already-correct hook.
-    if guard_already_first(lf, seq, g) {
+    // PROOF, not assumption: the guard must be reachable-first at THIS sequence's top level.
+    // The old check descended into a leading `block`, which is how a for-condition guard was
+    // blessed as AlreadyHead and then rejected by the ledger.
+    if guard_first_at_top_level(lf, seq, g) {
         return Hoist::AlreadyHead;
     }
 
@@ -174,7 +224,16 @@ fn hoist_guard_in_seq(lf: &mut walrus::LocalFunction, seq: InstrSeqId, g: Functi
         .position(|(i, _)| matches!(i, Instr::Call(c) if c.func == g))
     {
         Some(ci) => ci,
-        None => return Hoist::NoGuard,
+        None => {
+            // No `_g` at this sequence's top level. Distinguish "there is no guard at all" from
+            // "there IS one, nested where we cannot hoist or prove it" — the latter is the
+            // for-condition shape and must be surfaced, not passed through as unguarded-or-fine.
+            return if seq_contains_guard_nested(lf, seq, g) {
+                Hoist::Unverified
+            } else {
+                Hoist::NoGuard
+            };
+        }
     };
 
     // The guard takes two literal args (id, maxiter): two i32.const immediately

@@ -30,7 +30,20 @@ built /tmp/lA.wasm
 No `guard repositioned`, no `warn`, no error. Verified on testnet: loopA `temMALFORMED`, loopB
 installs.
 
-## Why this is a real defect, not a missing lint
+## ⚠️ CORRECTION 2026-07-29 — the MECHANISM below is NOT established
+
+The two observations stand and are reproducible on testnet: `loopA` is rejected with `temMALFORMED`,
+`loopB` installs, and `xahc build` reports both as clean. **What is NOT established is WHY.**
+
+This document originally asserted the cause was guard placement violating xahaud's "first branch
+after a loop" rule. Subsequent evidence does not support that: both modules contain a loop, both call
+`_g`, and a fail-closed top-level check added to `guardpass.rs` proves the guard reachable-first in
+**both**. So the guard position is not obviously the discriminator, and the real cause is unknown.
+
+Treat the reproducer as a real, open defect and the explanation as withdrawn. It was a correlation
+between two source forms, promoted to a mechanism without proof.
+
+## Why the build being silent is a real defect regardless
 
 `crates/xahc-cli/src/guardpass.rs` exists **precisely** to stop this. Its own doc comment says
 clang's loop rotation moves the guard to the bottom of the loop, "violates the rule and gets the
