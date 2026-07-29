@@ -162,7 +162,7 @@ pub fn resolve<'a>(intent: &str) -> Result<&'a Archetype> {
         .map(|a| (a.keywords.iter().filter(|k| matches_keyword(&lc, k)).count(), a))
         .filter(|(n, _)| *n > 0)
         .collect();
-    scored.sort_by(|a, b| b.0.cmp(&a.0));
+    scored.sort_by_key(|a| std::cmp::Reverse(a.0));
     match scored.as_slice() {
         [] => bail!(
             "could not map intent to a known archetype.\n  intents I understand: {}\n  \

@@ -90,9 +90,10 @@ walrus's numbering, returns no findings when the module imports no guard at all,
 if the module cannot be decoded** — an undecodable module is never "fine". `build.rs` turns any
 finding into a build error naming the function, the byte offset, and the operator found instead.
 
-The older `reposition` / `guard_already_first` passes reason about reachability and are kept as a
-first line of reporting, but they are not what makes the build safe. Reachability was the wrong
-property: `loopA` satisfies it and the ledger refuses the module anyway.
+The older `reposition` pass reasons about reachability and is kept as a first line of reporting,
+but it is not what makes the build safe. Reachability was the wrong property: `loopA` satisfies it
+and the ledger refuses the module anyway. (The reachability helpers that only served that older
+check were removed once they became unreachable code; this doc previously named one of them.)
 
 ## Impact while this was silent
 

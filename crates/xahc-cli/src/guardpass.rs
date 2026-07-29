@@ -119,32 +119,6 @@ enum Hoist {
     Unverified,
 }
 
-/// True if a `_g` call is ALREADY provably the first branch on entry to `seq`,
-/// descending in execution order through any leading unconditional `block`
-/// (the shape clang -O2 can emit). Mirrors lint::first_branch_is_guard so the
-/// hoist does not "fix" a guard that is already correct (e.g. one nested inside
-/// a leading block) — which would either double-hoist or churn a valid hook.
-///
-/// Conservative on purpose: a `block` body is always entered, so a guard first
-/// inside a leading block is genuinely first; an `if`/`else` or any other branch
-/// reached before the guard is NOT treated as guard-first.
-fn guard_already_first(lf: &walrus::LocalFunction, seq: InstrSeqId, g: FunctionId) -> bool {
-    for (instr, _) in lf.block(seq).instrs.iter() {
-        match instr {
-            Instr::Call(c) if c.func == g => return true,
-            Instr::Block(b) => {
-                // A leading block is always entered. If it contains a branch we
-                // can decide here; if it has no branch, continue scanning after it.
-                if seq_has_branch(lf, b.seq) {
-                    return guard_already_first(lf, b.seq, g);
-                }
-            }
-            _ if is_branch(instr) => return false,
-            _ => {}
-        }
-    }
-    false
-}
 
 /// Guard is provably first ONLY if it appears at this sequence's own top level before any other
 /// branch. Deliberately does NOT descend into a leading `block`: xahaud requires `_g` to be the
@@ -172,21 +146,15 @@ fn seq_contains_guard_nested(lf: &walrus::LocalFunction, seq: InstrSeqId, g: Fun
             Instr::Loop(l) => {
                 if seq_contains_guard_nested(lf, l.seq, g) { return true; }
             }
-            Instr::IfElse(ie) => {
+            Instr::IfElse(ie)
                 if seq_contains_guard_nested(lf, ie.consequent, g)
-                    || seq_contains_guard_nested(lf, ie.alternative, g) { return true; }
-            }
+                    || seq_contains_guard_nested(lf, ie.alternative, g) => return true,
             _ => {}
         }
     }
     false
 }
 
-/// Whether a sequence contains any branch instruction at its top level (used to
-/// decide if a leading `block` is "decisive" for the guard-first check).
-fn seq_has_branch(lf: &walrus::LocalFunction, seq: InstrSeqId) -> bool {
-    lf.block(seq).instrs.iter().any(|(i, _)| is_branch(i))
-}
 
 /// A control-transfer / call instruction (kept in sync with lint::is_branch).
 fn is_branch(instr: &Instr) -> bool {
@@ -340,8 +308,8 @@ pub fn verify_byte_adjacency(wasm: &[u8]) -> Result<Vec<Misplaced>> {
                     let ok = match (want, &op) {
                         (0, Operator::I32Const { .. }) => { want = 1; true }
                         (1, Operator::I32Const { .. }) => { want = 2; true }
-                        (2, Operator::Call { function_index }) => {
-                            if *function_index == guard_idx { pending = None; true } else { false }
+                        (2, Operator::Call { function_index }) if *function_index == guard_idx => {
+                            pending = None; true
                         }
                         _ => false,
                     };
@@ -359,8 +327,8 @@ pub fn verify_byte_adjacency(wasm: &[u8]) -> Result<Vec<Misplaced>> {
                     want = 0;
                 }
             }
-            if pending.is_some() {
-                bad.push(Misplaced { func: fidx, offset: pending.unwrap(), found: "end-of-body".into() });
+            if let Some(off) = pending {
+                bad.push(Misplaced { func: fidx, offset: off, found: "end-of-body".into() });
             }
             fidx += 1;
         }

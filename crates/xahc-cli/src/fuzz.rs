@@ -155,11 +155,11 @@ pub fn run(wasm: &Path, o: &Opts) -> Result<FuzzReport> {
         };
         // For policed/authz invariants, exercise the owner path most of the time.
         let account_is_owner = matches!(o.invariant, "authz" | "guardrail")
-            && (rng.next() % 4 != 0);
+            && !rng.next().is_multiple_of(4);
         let mut destination = [0u8; 20];
         // half the time use the allowed DST, half a random one (to probe the dst lock).
         if let Some(d) = dst {
-            if rng.next() % 2 == 0 {
+            if rng.next().is_multiple_of(2) {
                 destination = d;
             } else {
                 for b in destination.iter_mut() {
