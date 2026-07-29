@@ -2364,6 +2364,7 @@ dependencies = [
  "toml 0.8.23",
  "ureq",
  "walrus",
+ "wasmparser 0.214.0",
  "wasmtime",
  "wat",
 ]

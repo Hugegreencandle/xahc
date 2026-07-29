@@ -266,3 +266,102 @@ fn hoist_guard_in_seq(lf: &mut walrus::LocalFunction, seq: InstrSeqId, g: Functi
     }
     Hoist::Moved
 }
+
+// ---------------------------------------------------------------------------
+// BYTE-ADJACENCY VERIFICATION (2026-07-29)
+// ---------------------------------------------------------------------------
+// xahaud does NOT check that the guard is reachable-first. It checks that the
+// guard's BYTES sit immediately after the `loop` opcode + blocktype byte
+// (include/xrpl/hook/Guard.h:386):
+//
+//     if (wasm[i] != 0x41U)
+//         GUARD_ERROR("Missing first i32.const after loop instruction");
+//
+// i.e. exactly `0x41 <sleb id> 0x41 <uleb maxiter> 0x10 <uleb guard_idx>`.
+// Failing that, SetHook rejects the module with temMALFORMED.
+//
+// The walrus-IR checks above reason about REACHABILITY, which is a different
+// and weaker property: a guard written in a `for` condition is reachable-first
+// (only loads precede it) yet clang hoists it out of the loop body, so the
+// bytes are not adjacent and the ledger refuses the hook. That gap is why
+// escrow_ok and multisig_ok were never installable while `xahc lint` reported
+// "no issues". This verifies the ACTUAL property, on the ACTUAL emitted bytes.
+//
+// Fixtures: xahc-prover hooks/loopA.c + loopC.c (must FAIL), loopB.c + loopD.c
+// (must PASS).
+
+/// One loop whose guard bytes are not adjacent to its `loop` opcode.
+pub struct Misplaced {
+    pub func: u32,
+    pub offset: usize,
+    pub found: String,
+}
+
+/// Verify every `loop` in the emitted module is immediately followed by the
+/// guard byte sequence. Returns the offending loops, or an Err if the module
+/// cannot be decoded (FAIL CLOSED: an undecodable module is never "fine").
+pub fn verify_byte_adjacency(wasm: &[u8]) -> Result<Vec<Misplaced>> {
+    use wasmparser::{Parser, Payload, Operator};
+    // Derive the guard's function index from the emitted module itself: `env._g` is an import, and
+    // imported functions occupy the low indices in order. Taking it from the bytes we are about to
+    // ship avoids any mismatch with walrus's own numbering.
+    let mut guard_idx: Option<u32> = None;
+    {
+        let mut n: u32 = 0;
+        for payload in Parser::new(0).parse_all(wasm) {
+            if let Payload::ImportSection(r) = payload.context("decode imports")? {
+                for imp in r {
+                    let imp = imp.context("import")?;
+                    if let wasmparser::TypeRef::Func(_) = imp.ty {
+                        if imp.module == "env" && imp.name == "_g" { guard_idx = Some(n); }
+                        n += 1;
+                    }
+                }
+            }
+        }
+    }
+    // No guard import at all -> no loops to check against it; nothing to verify.
+    let guard_idx = match guard_idx { Some(g) => g, None => return Ok(Vec::new()) };
+    let mut bad = Vec::new();
+    let mut fidx: u32 = 0;
+    for payload in Parser::new(0).parse_all(wasm) {
+        let payload = payload.context("decode wasm")?;
+        if let Payload::CodeSectionEntry(body) = payload {
+            let mut ops = body.get_operators_reader().context("operators")?;
+            // Walk (operator, byte-offset) pairs; when we see `Loop`, the next
+            // three operators must be i32.const / i32.const / call guard_idx.
+            let mut pending: Option<usize> = None;
+            let mut want: u8 = 0;
+            while !ops.eof() {
+                let (op, off) = ops.read_with_offset().context("read op")?;
+                if let Some(loop_off) = pending {
+                    let ok = match (want, &op) {
+                        (0, Operator::I32Const { .. }) => { want = 1; true }
+                        (1, Operator::I32Const { .. }) => { want = 2; true }
+                        (2, Operator::Call { function_index }) => {
+                            if *function_index == guard_idx { pending = None; true } else { false }
+                        }
+                        _ => false,
+                    };
+                    if !ok {
+                        bad.push(Misplaced {
+                            func: fidx,
+                            offset: loop_off,
+                            found: format!("{:?}", op),
+                        });
+                        pending = None;
+                    }
+                }
+                if matches!(op, Operator::Loop { .. }) {
+                    pending = Some(off);
+                    want = 0;
+                }
+            }
+            if pending.is_some() {
+                bad.push(Misplaced { func: fidx, offset: pending.unwrap(), found: "end-of-body".into() });
+            }
+            fidx += 1;
+        }
+    }
+    Ok(bad)
+}

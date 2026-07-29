@@ -17,6 +17,7 @@ path = "src/main.rs"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 walrus = "0.23"
+wasmparser = "0.214"
 owo-colors = "4"
 wasmtime = "45"
 serde = { version = "1", features = ["derive"] }

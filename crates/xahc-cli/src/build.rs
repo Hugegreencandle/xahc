@@ -101,6 +101,32 @@ pub fn run(input: &Path, output: &Path, extra_includes: &[PathBuf], do_lint: boo
         );
         anyhow::bail!("guard placement could not be verified for {} loop(s)", grep.unverified);
     }
+    // BYTE-ADJACENCY GATE (2026-07-29). The checks above reason about REACHABILITY; xahaud checks
+    // that the guard BYTES sit immediately after the `loop` opcode (Guard.h:386). A guard written in
+    // a `for` condition is reachable-first yet clang hoists it, so the bytes are not adjacent and
+    // SetHook returns temMALFORMED. escrow_ok and multisig_ok were never installable while this tool
+    // reported "no issues". Verify the ACTUAL property on the ACTUAL emitted bytes, and fail closed.
+    match crate::guardpass::verify_byte_adjacency(&guarded) {
+        Ok(bad) if !bad.is_empty() => {
+            for b in &bad {
+                eprintln!(
+                    "{} func[{}] loop at offset {}: the guard is NOT byte-adjacent to the `loop` \
+opcode (found {} instead of i32.const/i32.const/call _g).",
+                    "error".red(), b.func, b.offset, b.found
+                );
+            }
+            eprintln!(
+                "         xahaud requires the literal bytes 0x41 <id> 0x41 <maxiter> 0x10 <_g> \
+immediately\n         after `loop`, and rejects the module at SetHook with temMALFORMED otherwise.\n         \
+Write the guard as the FIRST STATEMENT INSIDE the loop body:\n           \
+  for (int i = 0; i < N; ++i) {{ XAHC_GUARD(N); ... }}   // correct\n           \
+  for (int i = 0; XAHC_GUARD(N), i < N; ++i) ...         // clang hoists it -> REJECTED"
+            );
+            anyhow::bail!("guard not byte-adjacent to the loop opcode in {} loop(s)", bad.len());
+        }
+        Ok(_) => {}
+        Err(e) => anyhow::bail!("could not verify guard byte-adjacency (failing closed): {e}"),
+    }
 
     // clean
     let (cleaned, removed) = clean::clean_bytes(&guarded)?;
