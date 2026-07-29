@@ -65,6 +65,6 @@ persisted spent' = 18446744073709551613  >  PLM = 18446744073441115136
 ## Artifacts
 - `agent_guardrail_stateful.c` / `.wasm` — the real hook.
 - `agent_guardrail_stateful_BUG.c` / `.wasm` — the refutation twin (this pair's control).
-- `~/Desktop/xahc-prover/src/prove_period_budget.py` — the inductive-step driver (fail-closed).
+- the prover's period-budget driver — the inductive-step driver (fail-closed).
 
 Status: LOCAL, uncommitted — release decision is Dane's (product IP; keep-private lens).

@@ -21,7 +21,7 @@ off-ledger consensus app that *uses* Xahau (and Hooks) for payments, leasing, an
 
 ## Sources (cite, don't guess)
 - Evernode docs: https://docs.evernode.org (HotPocket model, SDKs, host setup)
-- Reference §16: `~/Desktop/xahc-prover/docs/XAHAU-DEV-REFERENCE.md` (grep "Evernode")
+- Reference §16: `<xahc-prover>/docs/XAHAU-DEV-REFERENCE.md` (grep "Evernode")
 - SDKs: `hpdevkit` (local dev cluster), `evdevkit` (deploy to Evernode), HotPocket SDK, All-in-One.
 - For the on-ledger settlement Hook: use `xahau-hook` (write) + `xahau-audit` (prove it safe).
 
@@ -36,7 +36,7 @@ off-ledger consensus app that *uses* Xahau (and Hooks) for payments, leasing, an
    contract entry (handle client inputs, NPL messages, persist state under consensus). Keep
    anything that must be DETERMINISTIC across nodes free of wall-clock/RNG/unseeded entropy/
    host-specific IO/locale — the same determinism discipline Hooks require (the prover's
-   banned-entropy rules: `~/Desktop/xahc-prover/CLAUDE.md` + the canonicalizer spec).
+   banned-entropy rules: `<xahc-prover>/CLAUDE.md` + the canonicalizer spec).
 4. **Wire the Xahau settlement layer.** If the dApp takes payments / leases / governs on-ledger,
    author that Hook with `xahau-hook` and PROVE it with `xahau-audit` (e.g. payment limits,
    authz, conservation). The dApp trusts the proven Hook for its money rules.

@@ -38,7 +38,7 @@ The facilitator's two security-critical entry points behave correctly against th
 ## The installed Hook
 
 - **Hook:** `agent_guardrail` (`examples/agent_guardrail.c`), prebuilt wasm at
-  `~/Desktop/xahc-prover/hooks/agent_guardrail.wasm`.
+  `<xahc-prover>/hooks/agent_guardrail.wasm`.
 - **Fires on:** `Payment` (outgoing only).
 - **HookParameters** (set at install via `xahc install-tx --param`):
   - `LIM` (name hex `4C494D`) = `00000000004C4B40` = **5 000 000 drops (5 XAH)** per-tx spend cap.

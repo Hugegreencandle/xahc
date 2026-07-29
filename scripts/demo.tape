@@ -2,7 +2,7 @@
 # Produces the launch GIF. Pairs with the plain-English opener:
 #   "What this actually does, minus the jargon: a Hook is a tiny program
 #    that controls money on Xahau — xahc checks it before a cent moves."
-Output "/Users/danebrown/Desktop/xahc-demo.gif"
+Output "xahc-demo.gif"
 
 Set Shell zsh
 Set FontSize 20
@@ -14,7 +14,7 @@ Set TypingSpeed 45ms
 
 # --- hidden setup: repo, wasm-LLVM + binary on PATH, clean prompt ---
 Hide
-Type "cd ~/Desktop/xahc"
+Type "cd xahc"
 Enter
 Type `export PATH="/opt/homebrew/opt/llvm/bin:$PWD/target/release:$PATH"`
 Enter

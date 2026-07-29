@@ -24,7 +24,7 @@ input — show it) · `3 INCONCLUSIVE` (fail-closed; not a pass).
 
 1. **Get the Hook as `.wasm`.** If given C, build it first (see the `xahau-hook` skill, or:
    `export PATH="/opt/homebrew/opt/llvm/bin:$PATH"; CC=/opt/homebrew/opt/llvm/bin/clang \
-   ~/Desktop/xahc/target/release/xahc build <f>.c -o <f>.wasm` — Apple clang lacks wasm32).
+   <xahc>/target/release/xahc build <f>.c -o <f>.wasm` — Apple clang lacks wasm32).
 
 2. **Map the intent → invariant(s).** Pick from the 23 (run several if the intent spans more):
    - "can't overspend / per-tx cap" → `limit` (native) / `limit-iou` (IOU) / `guardrail` (cap+dst)
@@ -41,13 +41,13 @@ input — show it) · `3 INCONCLUSIVE` (fail-closed; not a pass).
    - "every failable state_set/emit return is checked" → `unchecked-return`
    - "boot blob == pinned hash" → `bootloader` · "commit root == hash(state)" → `commitment`
    - "a wallet's pre-sign PREVIEW matches execution" → `preview-faithfulness`
-   (Full meanings: `~/Desktop/xahc-prover/CLAUDE.md`. Don't invent invariant names — list them with
+   (Full meanings: the prover's own CLAUDE.md. Don't invent invariant names — list them with
    `xahc prove --help` or read the dispatch table.)
 
-3. **Run it.** `export XAHC_PROVER_DIR=~/Desktop/xahc-prover` then
-   `~/Desktop/xahc/target/release/xahc prove <hook>.wasm --invariant <name> [-- <extra args>]`
+3. **Run it.** `export XAHC_PROVER_DIR=<xahc-prover>` then
+   `<xahc>/target/release/xahc prove <hook>.wasm --invariant <name> [-- <extra args>]`
    (the `-- --field ...` tail forwards to the driver). Or directly:
-   `cd ~/Desktop/xahc-prover && . .venv/bin/activate && python src/prove_<name>.py <hook>.wasm`.
+   `cd <xahc-prover> && . .venv/bin/activate && python src/prove_<name>.py <hook>.wasm`.
 
 4. **Interpret HONESTLY.** For PROVEN: state the invariant + the prover's scope line. For
    COUNTEREXAMPLE: show the concrete failing values the prover printed. For N/A: explain the property

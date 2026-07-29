@@ -5,9 +5,9 @@ first leg of the trifecta: **xahc (write) → xahau-mcp (simulate one) → xahc-
 "Xahau Hooks, Checked."
 
 ## Reference docs (read before Xahau protocol questions — don't guess from training)
-- `~/Desktop/xahc-prover/docs/XAHAU-DEV-REFERENCE.md` — host fns, return codes, sfcodes,
-  guard/XFL/emit semantics, SetHook, TSH, amendments (live-scraped).
-- `~/Desktop/xahc-prover/docs/XAHAU-RESOURCES.md` — repos/tools/libs/standards.
+- The prover checkout's `docs/XAHAU-DEV-REFERENCE.md` — host fns, return codes, sfcodes,
+  guard/XFL/emit semantics, SetHook, TSH, amendments (live-scraped) — and its
+  `docs/XAHAU-RESOURCES.md` (repos/tools/libs/standards). Resolve it via `XAHC_PROVER_DIR`.
 - Ground truth: `Xahau/xahaud` + `XRPLF/hook-macros` (hookapi.h). xahc's own `include/xahc/*.h`
   wrap these — keep them in sync with hookapi.h.
 

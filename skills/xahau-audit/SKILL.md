@@ -15,11 +15,11 @@ invariant under which scope*. INCONCLUSIVE / N/A are **not** passes. Always stat
 (what was NOT proven). Fuzz finding no counterexample is **not** a proof.
 
 ## Toolchain (read first)
-- Binary: `~/Desktop/xahc/target/release/xahc` (build: `~/.cargo/bin/cargo build --release`).
-- `export XAHC_PROVER_DIR=~/Desktop/xahc-prover` (prove/fuzz/registry need it).
+- Binary: `<xahc>/target/release/xahc` (build: `~/.cargo/bin/cargo build --release`).
+- `export XAHC_PROVER_DIR=<xahc-prover>` (prove/fuzz/registry need it).
 - C→wasm needs brew LLVM (Apple clang lacks wasm32):
   `export PATH="/opt/homebrew/opt/llvm/bin:$PATH"; CC=/opt/homebrew/opt/llvm/bin/clang`.
-- Protocol facts: cite `~/Desktop/xahc-prover/docs/XAHAU-DEV-REFERENCE.md` (use `xahau-ref`).
+- Protocol facts: cite `<xahc-prover>/docs/XAHAU-DEV-REFERENCE.md` (use `xahau-ref`).
 
 ## Sequence
 
@@ -35,7 +35,7 @@ invariant under which scope*. INCONCLUSIVE / N/A are **not** passes. Always stat
 
 4. **Prove** the mapped invariants (the core): map each safety property → invariant(s) and run
    `xahc prove <hook>.wasm --invariant <name> [-- --field ...]`. (Invariant map: see `xahau-prove`
-   / `~/Desktop/xahc-prover/CLAUDE.md`.) Record each verdict: PROVEN (0) / N/A (1) /
+   / `<xahc-prover>/CLAUDE.md`.) Record each verdict: PROVEN (0) / N/A (1) /
    COUNTEREXAMPLE (2, show the input) / INCONCLUSIVE (3). Run all invariants the intent spans.
 
 5. **Fuzz the gaps.** For every invariant that came back INCONCLUSIVE (and that fuzz supports —

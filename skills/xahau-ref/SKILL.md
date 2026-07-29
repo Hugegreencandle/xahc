@@ -15,9 +15,9 @@ look it up here and CITE it. If the reference doesn't cover it, say so and point
 source — never fabricate a code or a signature.
 
 ## Sources (in priority order)
-1. `~/Desktop/xahc-prover/docs/XAHAU-DEV-REFERENCE.md` — host fns, return codes, sfcodes,
+1. `<xahc-prover>/docs/XAHAU-DEV-REFERENCE.md` — host fns, return codes, sfcodes,
    guard/XFL/emit semantics, SetHook, TSH, amendments (the mirror; quote it).
-2. `~/Desktop/xahc-prover/docs/XAHAU-RESOURCES.md` — curated upstream repos/tools/standards.
+2. `<xahc-prover>/docs/XAHAU-RESOURCES.md` — curated upstream repos/tools/standards.
 3. Ground truth (when the mirror is silent or possibly stale):
    - `hookapi.h` / macros: https://github.com/XRPLF/hook-macros (sfcodes, keylets, field-id scheme)
    - host-fn behaviour + VM: https://github.com/Xahau/xahaud
@@ -26,7 +26,7 @@ source — never fabricate a code or a signature.
 
 ## Sequence
 1. **Grep the reference first:**
-   `grep -in "<term>" ~/Desktop/xahc-prover/docs/XAHAU-DEV-REFERENCE.md` (try host-fn name,
+   `grep -in "<term>" <xahc-prover>/docs/XAHAU-DEV-REFERENCE.md` (try host-fn name,
    sfcode label, error code, amendment name). Read the matched section.
 2. **Answer with the cite:** quote the exact line + `file:line`. For a code/signature, give it
    verbatim (e.g. `state(write_ptr,write_len,kread_ptr,kread_len)`, `-34 NOT_AUTHORIZED`).

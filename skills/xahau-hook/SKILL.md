@@ -10,11 +10,11 @@ description: Author a Xahau Hook (C → WASM) end-to-end with the user's toolcha
 `.wasm`. This skill takes a Hook from idea to proven.
 
 ## Toolchain + the wasm32 gotcha (read first)
-- Binary: `~/Desktop/xahc/target/release/xahc` (build with `~/.cargo/bin/cargo build --release` if
+- Binary: `<xahc>/target/release/xahc` (build with `~/.cargo/bin/cargo build --release` if
   missing; ~8-10 min). `xahc doctor` checks the toolchain.
 - **Apple clang CANNOT target wasm32.** Use brew LLVM:
   `export PATH="/opt/homebrew/opt/llvm/bin:$PATH"` and pass `CC=/opt/homebrew/opt/llvm/bin/clang`.
-- Safe headers live in `~/Desktop/xahc/include/xahc/` (guard.h, check.h, otxn.h, param.h, state.h,
+- Safe headers live in `<xahc>/include/xahc/` (guard.h, check.h, otxn.h, param.h, state.h,
   emit/payment.h, sfcodes.h). Use the `XAHC_*` macros — they wrap the raw hookapi correctly:
   `XAHC_HOOK_ENTRY`, `XAHC_ACCEPT`, `XAHC_REQUIRE`, `XAHC_GUARD`, `XAHC_SBUF`, `XAHC_OTXN_ACCOUNT`,
   `XAHC_HOOK_PARAM_REQUIRE`, `XAHC_STATE_SET`/`XAHC_STATE_GET`, `XAHC_EMIT_PAYMENT`, `xahc_otxn_drops`.
@@ -28,9 +28,9 @@ description: Author a Xahau Hook (C → WASM) end-to-end with the user's toolcha
    `"xahc/xahc.h"`. Patterns: read otxn fields (`otxn_type`, `XAHC_OTXN_ACCOUNT`, `xahc_otxn_drops`),
    read params (`XAHC_HOOK_PARAM_REQUIRE`), gate with `XAHC_REQUIRE`, persist with `XAHC_STATE_SET`,
    accept/rollback with `XAHC_ACCEPT`/`rollback`. Every loop needs a guard (`XAHC_GUARD(n)`). Model
-   new hooks on `~/Desktop/xahc-prover/hooks/agent_guardrail.c`.
+   new hooks on `<xahc-prover>/hooks/agent_guardrail.c`.
 
-3. **Build → clean → lint.** `CC=/opt/homebrew/opt/llvm/bin/clang ~/Desktop/xahc/target/release/xahc
+3. **Build → clean → lint.** `CC=/opt/homebrew/opt/llvm/bin/clang <xahc>/target/release/xahc
    build <name>.c -o <name>.wasm` (build runs clean + lint: export/import allowlist, guard presence,
    stack budget, semantic safety). Fix any `rule_id` findings — they're stable, real safety lints.
 
@@ -44,7 +44,7 @@ description: Author a Xahau Hook (C → WASM) end-to-end with the user's toolcha
    simulate alone.
 
 6. **(Optional) install tx.** `xahc install-tx <name>.wasm` emits an unsigned SetHook; sign +
-   submit per `~/Desktop/xahc-prover/CLAUDE.md` "Testnet validation" (NetworkID 21338, faucet
+   submit per `<xahc-prover>/CLAUDE.md` "Testnet validation" (NetworkID 21338, faucet
    xahau-test.net). Hooked-account Payments need a higher fee (else `telINSUF_FEE_P`); Xahau rippled
    speaks WS api_version 1.
 
@@ -52,5 +52,5 @@ description: Author a Xahau Hook (C → WASM) end-to-end with the user's toolcha
 - Conventions: commit by name (never `git add -A` — hook-blocked); Conventional-commit style; end
   commit messages with the Co-Authored-By Claude line.
 - When proposing a hook is "safe", always say which invariant under which scope (per xahau-prove).
-- Reference for protocol Qs (host fns, sfcodes, return codes): `~/Desktop/xahc-prover/docs/
+- Reference for protocol Qs (host fns, sfcodes, return codes): `<xahc-prover>/docs/
   XAHAU-DEV-REFERENCE.md` — cite it, don't guess.

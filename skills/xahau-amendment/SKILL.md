@@ -20,9 +20,9 @@ is a node query or the amendments page. State the source + as-of time.
 - Live status (authoritative): query a node `feature` / the amendments page
   https://xahau.network/docs/features/amendments
 - Semantics of a named amendment + what it touches:
-  `grep -in "<amendment>" ~/Desktop/xahc-prover/docs/XAHAU-DEV-REFERENCE.md`, then xahaud
+  `grep -in "<amendment>" <xahc-prover>/docs/XAHAU-DEV-REFERENCE.md`, then xahaud
   (https://github.com/Xahau/xahaud) for the actual behavioural change.
-- Hook proofs to re-run: `~/Desktop/xahc-prover` (the prover) + `xahau-prove` / `xahau-audit`.
+- Hook proofs to re-run: `<xahc-prover>` (the prover) + `xahau-prove` / `xahau-audit`.
 
 ## Sequence
 1. **Identify the amendment(s).** Name + what subsystem they change (host fn, transactor, field,
