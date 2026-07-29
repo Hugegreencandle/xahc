@@ -74,8 +74,13 @@ int64_t hook(uint32_t reserved)
         XAHC_ACCEPT("not a payment");
 
     uint8_t dest[20];
-    for (int i = 0; XAHC_GUARD(20), i < 20; ++i)
+    /* The guard MUST be the first statement inside the loop body. In the `for`
+       condition clang may hoist it out and SetHook rejects the hook with
+       temMALFORMED. See docs/GUARD_PLACEMENT.md. */
+    for (int i = 0; i < 20; ++i) {
+        XAHC_GUARD(20);
         dest[i] = 0xBB; /* TODO: real 20-byte destination account-id */
+    }
 
     XAHC_EMIT_PAYMENT(dest, EMIT_DROPS, 0, 0);
     XAHC_ACCEPT("emitted");
@@ -211,8 +216,11 @@ int64_t hook(uint32_t reserved)
     XAHC_OTXN_ACCOUNT(origin);
     hook_account(XAHC_SBUF(me));
     int outgoing = 1;
-    for (int i = 0; XAHC_GUARD(20), i < 20; ++i)
+    /* Guard FIRST inside the body — never in the `for` condition. docs/GUARD_PLACEMENT.md */
+    for (int i = 0; i < 20; ++i) {
+        XAHC_GUARD(20);
         if (origin[i] != me[i]) outgoing = 0;
+    }
     if (!outgoing)
         XAHC_ACCEPT("incoming");
 
@@ -237,8 +245,10 @@ int64_t hook(uint32_t reserved)
         uint8_t dest[20];
         XAHC_OTXN_DESTINATION(dest);
         int ok = 1;
-        for (int i = 0; XAHC_GUARD(20), i < 20; ++i)
+        for (int i = 0; i < 20; ++i) {
+            XAHC_GUARD(20);
             if (dest[i] != allowed[i]) ok = 0;
+        }
         XAHC_REQUIRE(ok, "destination not in policy");
     }
 
