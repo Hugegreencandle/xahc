@@ -24,7 +24,7 @@ pub const HOOK_API: &[&str] = &[
     "hook_account", "hook_again", "hook_hash", "hook_param", "hook_param_set",
     "hook_pos", "hook_skip",
     "ledger_keylet", "ledger_last_hash", "ledger_last_time", "ledger_nonce",
-    "ledger_seq", "meta_slot",
+    "ledger_seq", "meta_slot", "xpop_slot",
     "otxn_burden", "otxn_field", "otxn_field_txt", "otxn_generation", "otxn_id",
     "otxn_param", "otxn_slot", "otxn_type",
     "rollback",
