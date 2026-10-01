@@ -1,58 +1,181 @@
 name: release
 
+# Builds prebuilt `xahc` binaries for a version tag and attaches them to the GitHub Release.
+#
+#   trigger : push of a tag matching v*.*.* (e.g. v1.12.0)
+#   secrets : none — only the default GITHUB_TOKEN (contents: write, release job only)
+#   actions : every third-party action is pinned by full commit SHA (tag in the trailing comment)
+#
+# Assets per target: xahc-<version>-<target>.tar.gz (.zip on Windows) + .sha256, plus one
+# combined SHA256SUMS. Each archive holds the binary, LICENSE, README.md and CHANGELOG.md.
+#
+# crates.io publishing is NOT done here — it is a manual `cargo publish` by the maintainer.
+
 on:
   push:
-    tags: ["v*"]
+    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
 
 permissions:
-  contents: write
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
+  check-version:
+    name: tag matches Cargo.toml
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: v
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          ver=$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\(.*\)"/\1/p' Cargo.toml | head -1)
+          echo "tag=${tag} Cargo.toml=${ver}"
+          if [ "$tag" != "$ver" ]; then
+            echo "::error::tag v${tag} does not match Cargo.toml version ${ver}"
+            exit 1
+          fi
+          echo "version=${ver}" >> "$GITHUB_OUTPUT"
+
   build:
+    name: build ${{ matrix.target }}
+    needs: check-version
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            name: xahc-linux-x86_64
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            name: xahc-macos-arm64
+          - target: aarch64-apple-darwin
+            os: macos-14
+          - target: x86_64-apple-darwin
+            os: macos-14            # cross-compiled from arm64; Xcode clang targets both
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-24.04
+            musl: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm    # native arm64 runner; no cross linker needed
+            musl: true
+          - target: x86_64-pc-windows-msvc
+            os: windows-2022
     runs-on: ${{ matrix.os }}
+    env:
+      VERSION: ${{ needs.check-version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
 
-      - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }} -p xahc-cli
+      - name: Install musl tools
+        if: matrix.musl
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
 
-      - name: Package
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Smoke test (native targets only)
+        if: matrix.target != 'x86_64-apple-darwin'
+        shell: bash
         run: |
+          set -euo pipefail
           bin="target/${{ matrix.target }}/release/xahc"
-          tar -czf "${{ matrix.name }}.tar.gz" -C "$(dirname "$bin")" xahc
-          shasum -a 256 "${{ matrix.name }}.tar.gz" > "${{ matrix.name }}.tar.gz.sha256"
+          [ -f "$bin" ] || bin="$bin.exe"
+          "$bin" --version
+          "$bin" --version | grep -qF "xahc ${VERSION}"
 
-      - name: Upload to release
-        uses: softprops/action-gh-release@v2
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="xahc-${VERSION}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp "target/${{ matrix.target }}/release/xahc" LICENSE README.md CHANGELOG.md "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          (cd dist && shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256")
+          cat "dist/$name.tar.gz.sha256"
+
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="xahc-${VERSION}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp "target/${{ matrix.target }}/release/xahc.exe" LICENSE README.md CHANGELOG.md "dist/$name/"
+          (cd dist && 7z a -tzip "$name.zip" "$name" > /dev/null)
+          (cd dist && sha256sum "$name.zip" > "$name.zip.sha256")
+          cat "dist/$name.zip.sha256"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
+          name: xahc-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+
+  release:
+    name: publish GitHub Release
+    needs: [check-version, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: xahc-*
+          path: dist
+          merge-multiple: true
+
+      - name: Combined SHA256SUMS
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum xahc-*.tar.gz xahc-*.zip > SHA256SUMS
+          cat SHA256SUMS
+          # each per-file .sha256 must agree with the combined list
+          for f in *.sha256; do sha256sum -c "$f"; done
+
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          fail_on_unmatched_files: true
           files: |
-            ${{ matrix.name }}.tar.gz
-            ${{ matrix.name }}.tar.gz.sha256
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256
+            dist/SHA256SUMS
           body: |
             xahc ${{ github.ref_name }} — Xahau Hooks, Checked.
 
-            Authoring/compile toolchain for C Hooks (pairs with xahau-mcp).
+            Toolchain for Xahau C Hooks: build, clean, lint, simulate. See CHANGELOG.md for what changed.
 
-            **Install (macOS arm64 / Linux x86_64):**
+            **Install from crates.io:** `cargo install xahc --locked`
+
+            **Or download a prebuilt binary** for your platform below, check it against
+            `SHA256SUMS`, and put `xahc` on your PATH:
             ```sh
-            tar -xzf xahc-<platform>.tar.gz && sudo mv xahc /usr/local/bin/
+            shasum -a 256 -c xahc-<version>-<target>.tar.gz.sha256
+            tar -xzf xahc-<version>-<target>.tar.gz
+            sudo mv xahc-<version>-<target>/xahc /usr/local/bin/
             ```
-            Compiling hooks also needs a wasm-capable LLVM (`brew install llvm lld`,
-            or `apt install clang lld`). See the README.
+            The macOS binaries are not notarized; if Gatekeeper blocks the binary, run
+            `xattr -d com.apple.quarantine /usr/local/bin/xahc`.
 
-            Pre-alpha. Not audited — confirm financial hooks on testnet before mainnet.
+            Compiling hooks also needs a wasm-capable LLVM (`brew install llvm lld`, or
+            `apt install clang lld`); `xahc doctor` checks it.
+
+            Not audited — confirm financial hooks on testnet before mainnet.
