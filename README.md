@@ -68,7 +68,7 @@ destinations, enforced by the ledger — the control x402/app-layer flows lack.
 
 ```
 include/xahc/      Layer 0 — header-only safe C lib (guard, check, otxn, param, state, emit, sfcodes)
-crates/xahc-cli/   Layer 1 — Rust CLI (headers embedded): build · clean · lint · sim · test · install-tx · prove · doctor · new
+src/               Layer 1 — Rust CLI (headers embedded): build · clean · lint · sim · test · install-tx · verify · prove · author · fuzz · compose · registry · doctor · new
 scripts/           verify-emit.mjs · verify-emit-vm.mjs — codec/VM round-trips
 examples/          *.c hooks + *.test.toml suites
 ```
@@ -87,7 +87,9 @@ prover is resolved via `XAHC_PROVER_DIR` or a sibling checkout. Invariants (must
 prover's drivers):
 
 ```
-limit · guardrail · termination · monotonic · nospend · conservation · limit-iou · authz · validate · overflow
+limit · guardrail · termination · monotonic · nospend · conservation · limit-iou · authz · validate ·
+overflow · foreign-authz · reserve · time-nonce · emission · period-budget · reentrancy ·
+unchecked-return · validate-range · bootloader · resource-conservation
 ```
 
 A PROVEN verdict is bounded to the prover's modeled scope (it fails closed to INCONCLUSIVE
@@ -95,17 +97,30 @@ otherwise) — see the [xahc-prover scope note](https://github.com/Hugegreencand
 
 ## Install
 
-Download a binary from [Releases](https://github.com/Hugegreencandle/xahc/releases)
-(macOS arm64 / Linux x86_64) and drop it on your PATH:
+**From crates.io** (needs a Rust toolchain, 1.93 or newer):
 
 ```sh
-tar -xzf xahc-<platform>.tar.gz && sudo mv xahc /usr/local/bin/
+cargo install xahc --locked
 ```
 
-or build from source: `cargo build --release` (binary at `target/release/xahc`).
+**Prebuilt binaries.** Each [GitHub Release](https://github.com/Hugegreencandle/xahc/releases)
+carries archives for macOS (arm64, x86_64), Linux (x86_64, arm64; statically linked musl) and
+Windows (x86_64), each with a `.sha256` file and a combined `SHA256SUMS`:
 
-The headers are **embedded in the binary** — no repo checkout needed. Compiling
-hooks also needs a wasm-capable LLVM:
+```sh
+shasum -a 256 -c xahc-<version>-<target>.tar.gz.sha256
+tar -xzf xahc-<version>-<target>.tar.gz
+sudo mv xahc-<version>-<target>/xahc /usr/local/bin/
+```
+
+The macOS binaries are not notarized; if Gatekeeper blocks one, run
+`xattr -d com.apple.quarantine /usr/local/bin/xahc`.
+
+**From source:** `cargo build --release` (binary at `target/release/xahc`).
+
+The headers are **embedded in the binary** — no repo checkout needed. On first use they are
+extracted to `~/.cache/xahc/v<version>/include` (or `$XDG_CACHE_HOME/xahc/…`). Compiling
+hooks also needs a wasm-capable LLVM; Apple's bundled clang has no wasm32 target:
 
 ```sh
 brew install llvm lld      # macOS  (add their bin dirs to PATH)
@@ -115,14 +130,42 @@ xahc doctor                # verify the toolchain
 
 ## Quick start
 
+Scaffold a hook, build it (compile → clean → lint), lint the result on its own, and run its
+test suite:
+
 ```sh
-xahc doctor                          # check clang/wasm-ld
+xahc doctor                          # check clang + wasm-ld
 xahc new myhook                      # scaffold a project (firewall archetype)
 cd myhook
 xahc build myhook.c -o myhook.wasm   # compile -> clean -> lint
-xahc test myhook.test.toml           # run the assertions
-xahc install-tx myhook.wasm --account <rYourAccount> --on Payment   # unsigned SetHook
+xahc lint myhook.wasm                # lint the built module again, standalone
+xahc test myhook.test.toml           # run the scaffolded assertions
+xahc install-tx myhook.wasm --account <rYourAccount> --on Payment   # print an UNSIGNED SetHook
 ```
+
+Or straight from a checkout of this repo:
+
+```sh
+xahc build examples/firewall.c -o firewall.wasm
+xahc lint firewall.wasm
+xahc sim firewall.wasm --tt 0 --drops 5000000    # -> ROLLBACK (below the 10 XAH floor), exit 2
+```
+
+## What xahc touches
+
+- **No keys, no signing, no submitting.** The xahc binary never signs or submits a transaction
+  and never connects to a Xahau node. `install-tx` prints an **unsigned** SetHook for you to sign
+  elsewhere.
+- **Network:** in the xahc binary, only `xahc verify` makes a request: it POSTs the hook to the
+  simulator URL you pass (`--remote` / `XAHC_SIM_URL`). Commands that hand off to xahc-prover
+  (below) run that project's code, so check its README for what it does.
+- **Files:** it writes the outputs you ask for (`-o`, `new`), the header cache above, and
+  scratch builds under the system temp dir (`doctor`, `test`).
+- **External programs:** `build` and `doctor` run `clang`. `prove`, `author`, `compose` and
+  `registry` run the separate [xahc-prover](https://github.com/Hugegreencandle/xahc-prover)
+  (Python) checkout, found via `XAHC_PROVER_DIR`. Its proof registry can sign registry entries
+  with an Ed25519 attester key you supply (`registry add --key`, `author --register --key`);
+  that is a key for proof records, not a ledger account key.
 
 ## Commands
 
@@ -137,6 +180,11 @@ xahc install-tx myhook.wasm --account <rYourAccount> --on Payment   # unsigned S
 | `test <suite.toml>` | Declarative asserted test suite over sim |
 | `install-tx <wasm> --account r…` | Emit an UNSIGNED SetHook (HookOn/namespace/params) |
 | `verify <wasm> [--tt --drops]` | Differential check: local sim vs an xahau-mcp `/execute` VM **you point it at** (`--remote`/`XAHC_SIM_URL`) — flags disagreement |
+| `prove <wasm\|c> --invariant <name>` | Run xahc-prover on one invariant; exit 0 PROVEN · 2 COUNTEREXAMPLE · 3 INCONCLUSIVE (needs the prover checkout) |
+| `author "<intent>"` | Map a plain-English intent to a proven archetype, build it, prove it; emits nothing unless every invariant is PROVEN (needs the prover) |
+| `fuzz <wasm\|c> --invariant <name>` | Boundary-biased concrete fuzzing over sim; finds counterexamples, never proves (limit / overflow / authz / guardrail) |
+| `compose <chain.toml>` | Prove each hook in an account's hook chain, then check the stateful hooks don't share a state namespace (needs the prover) |
+| `registry <subcommand>` | Proof registry passthrough to the prover: add / get / check / verify / list / head / keygen / reverify |
 
 Add `--json` to `build`/`lint`/`sim`/`test`/`clean` for a stable result envelope on
 stdout (diagnostics stay on stderr) — pipeable into CI, the web funnel, or xahau-mcp:
@@ -193,8 +241,7 @@ xahau-mcp; xahc does not chase it.
   "big array on the stack" overflow before deploy
 - **emit-verify** ✅ two paths: offline codec round-trip (`scripts/verify-emit.mjs`, native)
   and VM round-trip (`scripts/verify-emit-vm.mjs`, needs a xahau-mcp checkout — for XFL/IOU)
-- **next** — more typed `otxn`/`state` accessors; richer scaffolds; publish to a
-  registry. Loop-guard *dominance* and full VM fidelity are **xahau-mcp's** lane —
+- **next** — more typed `otxn`/`state` accessors; richer scaffolds. Loop-guard *dominance* and full VM fidelity are **xahau-mcp's** lane —
   not duplicated here.
 
 ### Testing
@@ -271,7 +318,7 @@ failing assertion points straight at the line that fired.
 
 ## Status
 
-**v1.4.0.** Self-contained binary (embedded headers), clean clippy + unit tests,
+**v1.12.0.** Self-contained binary (embedded headers), clean clippy + unit tests,
 green CI. Both emit builders are verified: **native XAH** round-trips through
 xahau-mcp's chain-validated codec to exactly `Amount: "1000000"` (1 XAH);
 **issued/IOU** executes in xahau-mcp's VM (real XFL) and emits

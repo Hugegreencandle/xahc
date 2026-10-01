@@ -3,6 +3,38 @@
 All notable changes to xahc are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); versioning is [SemVer](https://semver.org/).
 
+## [1.12.0] - Unreleased
+
+Packaging release: xahc becomes installable with `cargo install xahc`, and tagged releases carry
+prebuilt binaries for five targets. No change to the headers or to compiled hook output.
+
+### Changed
+
+- **The crate is now named `xahc`** (was `xahc-cli`, never published) and lives at the repository
+  root (`src/`, was `crates/xahc-cli/src/`). The binary name is unchanged. The move is what makes a
+  crates.io package possible: the embedded `include/` headers and `hookon-vectors.json` were outside
+  the old crate directory, so a published `xahc-cli` package could not have compiled.
+- Package metadata for crates.io: `rust-version = "1.93"` (wasmtime 45's minimum), homepage,
+  documentation, and an explicit `include` list, so the package ships only the sources, the
+  headers, the HookOn test vectors and the docs files — not `examples/`, `x402-xahau/`, `skills/`,
+  `scripts/` or `CLAUDE.md`.
+- `release.yml` rewritten: it checks that the tag matches `Cargo.toml`, builds macOS arm64 and
+  x86_64, Linux x86_64 and arm64 (static musl), and Windows x86_64, smoke-tests `--version` on the
+  native targets, and uploads `.tar.gz`/`.zip` archives with a `.sha256` each plus a combined
+  `SHA256SUMS`. Every action is pinned by commit SHA; it uses only the default `GITHUB_TOKEN`.
+
+### Fixed
+
+- **`xpop_slot` is now an allowed host import.** It is a real Hook API function (xahaud
+  `HookAPI.cpp`, registered in `applyHook.cpp`), and lint was rejecting any hook that imported it.
+
+### Docs
+
+- README: install from crates.io or a prebuilt binary; a quickstart; a "What xahc touches" section
+  (no signing or submitting; `verify` is the only network call in the binary; which commands run
+  clang or xahc-prover); the `author`, `fuzz`, `compose` and `registry` commands and the full
+  `prove` invariant list, which had fallen behind the code.
+
 ## [1.11.2] - 2026-07-29
 
 Adds the check that would have caught the 1.11.1 defect before it reached a ledger.
