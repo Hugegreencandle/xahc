@@ -83,7 +83,7 @@ Sources: `tests/fixtures/loop{A,B,C,D}.c`.
 
 ## What xahc does about it
 
-`crates/xahc-cli/src/guardpass.rs::verify_byte_adjacency` decodes the **emitted** module with
+`src/guardpass.rs::verify_byte_adjacency` decodes the **emitted** module with
 wasmparser and, for every `loop`, requires the next three operators to be `i32.const`, `i32.const`,
 `call <_g>`. It derives `_g`'s function index from the emitted import section rather than trusting
 walrus's numbering, returns no findings when the module imports no guard at all, and **fails closed

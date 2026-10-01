@@ -3,7 +3,7 @@ name: header-version-gate
 # A change to include/ that does not bump the version SILENTLY DOES NOTHING for existing users.
 #
 # xahc extracts its embedded headers to ~/.cache/xahc/v<version>/include and ONLY when that
-# directory does not already exist (crates/xahc-cli/src/build.rs). So an installed copy keeps
+# directory does not already exist (src/build.rs). So an installed copy keeps
 # compiling against the headers it cached the first time. Ship a header fix without bumping the
 # version and every existing install still has the bug, while `xahc --version` and the binary both
 # look correct.

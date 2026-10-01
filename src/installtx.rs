@@ -267,7 +267,7 @@ mod tests {
     /// implementations stay coupled without either importing the other.
     #[test]
     fn hookon_shared_vectors() {
-        let raw = include_str!("../../../hookon-vectors.json");
+        let raw = include_str!("../hookon-vectors.json");
         let v: serde_json::Value = serde_json::from_str(raw).expect("parse hookon-vectors.json");
         let vectors = v["vectors"].as_array().expect("vectors array");
         assert!(!vectors.is_empty());

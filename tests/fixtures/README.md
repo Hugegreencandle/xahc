@@ -16,7 +16,7 @@ still carrying the hoisted condition guard, and it installs. Adjacency is the di
 
 `xahc build` must FAIL on `loopA` and `loopC` and SUCCEED on `loopB` and `loopD`. Building them
 needs a wasm32-capable clang, so the automated regression lives in
-`crates/xahc-cli/src/guardpass.rs::tests` and encodes the same four shapes directly in WAT — that
+`src/guardpass.rs::tests` and encodes the same four shapes directly in WAT — that
 tests this pass rather than testing clang's optimiser. These C sources are kept as the on-chain
 provenance for the rule.
 

@@ -12,7 +12,7 @@ use crate::{clean, lint};
 
 /// The safe-header library, embedded in the binary so an installed `xahc`
 /// (cargo install / release tarball) is fully self-contained — no repo checkout.
-static HEADERS: Dir = include_dir!("$CARGO_MANIFEST_DIR/../../include");
+static HEADERS: Dir = include_dir!("$CARGO_MANIFEST_DIR/include");
 
 pub fn run(input: &Path, output: &Path, extra_includes: &[PathBuf], do_lint: bool) -> Result<()> {
     let raw = output.with_extension("raw.wasm");

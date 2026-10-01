@@ -12,7 +12,7 @@ first leg of the trifecta: **xahc (write) → xahau-mcp (simulate one) → xahc-
   wrap these — keep them in sync with hookapi.h.
 
 ## Layout
-- `crates/xahc-cli/src/` — the CLI. Subcommand → module: `build.rs`, `clean.rs`, `lint.rs`,
+- `src/` — the CLI (package `xahc`, repo root). Subcommand → module: `build.rs`, `clean.rs`, `lint.rs`,
   `sim.rs`, `test.rs`, `installtx.rs`, `verify.rs`, `prove.rs`, `doctor.rs`, `scaffold.rs`,
   `guardpass.rs`. Dispatch + `--json` envelopes in `main.rs`.
 - `include/xahc/` — the safe hook headers (guard.h, check.h, otxn.h, param.h, state.h,
