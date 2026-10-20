@@ -1,10 +1,10 @@
 [package]
 name = "xahc"
-version = "1.12.0"
+version = "1.12.1"
 edition = "2021"
 rust-version = "1.93"
 license = "MIT"
-description = "Xahau Hooks, Checked: build, clean, lint and simulate Xahau C Hooks (C -> WASM), with embedded safe headers"
+description = "Xahau Hooks, Checked: build, clean, lint and simulate Xahau C Hooks (C -> WASM), with embedded hook headers"
 repository = "https://github.com/Hugegreencandle/xahc"
 homepage = "https://github.com/Hugegreencandle/xahc"
 documentation = "https://github.com/Hugegreencandle/xahc#readme"

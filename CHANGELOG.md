@@ -3,6 +3,22 @@
 All notable changes to xahc are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); versioning is [SemVer](https://semver.org/).
 
+## [1.12.1] - 2026-10-20
+
+Simulator update for the Xahau amendments fix20261005 and fix20260929 (both active on mainnet
+since 2026-10-19/20). No change to the headers or to compiled hook output.
+
+### Fixed
+
+- **`xahc sim`: `accept` / `rollback` with an out-of-bounds reason pointer.** A non-zero reason
+  pointer whose bytes (capped at 256) fall outside wasm memory now ends the hook as a ROLLBACK
+  with code -1 (OUT_OF_BOUNDS), matching xahaud `Macro.h` `HOOK_EXIT` under fix20260929
+  (2026.10.13-release+4119, lines 247-253). Before, the sim recorded an accept with the hook's code.
+
+### Changed
+
+- Package description: "embedded safe headers" is now "embedded hook headers".
+
 ## [1.12.0] - Unreleased
 
 Packaging release: xahc becomes installable with `cargo install xahc`, and tagged releases carry
