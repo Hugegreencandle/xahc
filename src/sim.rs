@@ -66,6 +66,15 @@ fn mem_of(caller: &mut Caller<'_, Ctx>) -> wasmtime::Result<Memory> {
         .ok_or_else(|| wasmtime::format_err!("hook exports no memory"))
 }
 
+/// xahaud HOOK_EXIT bounds check: ptr != 0 and [ptr, ptr+min(len,256)) not inside memory.
+fn reason_out_of_bounds(caller: &mut Caller<'_, Ctx>, p: i32, l: i32) -> wasmtime::Result<bool> {
+    let ptr = p as u32 as u64;
+    if ptr == 0 { return Ok(false); }
+    let len = (l as u32 as u64).min(256);
+    let size = mem_of(caller)?.data_size(&*caller) as u64;
+    Ok(ptr >= size || ptr + len > size)
+}
+
 /// (outcome, emitted txn blobs, state writes key->value).
 pub type SimResult = (Outcome, Vec<Vec<u8>>, HashMap<Vec<u8>, Vec<u8>>);
 
@@ -115,12 +124,17 @@ fn run_inner(path: &Path, tx: TxFixture) -> wasmtime::Result<SimResult> {
     })?;
 
     // Terminal calls: record outcome, then trap to stop execution (mirrors on-chain).
-    linker.func_wrap("env", "accept", |mut c: Caller<'_, Ctx>, _p: i32, _l: i32, code: i64| -> wasmtime::Result<i64> {
-        c.data_mut().outcome = Some(Outcome::Accept(code));
+    // A non-zero reason pointer outside wasm memory (reason capped at 256 bytes) ends the
+    // hook as a ROLLBACK with OUT_OF_BOUNDS (-1) under fix20260929 (xahaud Macro.h:247-253),
+    // live on Xahau mainnet from ledger 26655745.
+    linker.func_wrap("env", "accept", |mut c: Caller<'_, Ctx>, p: i32, l: i32, code: i64| -> wasmtime::Result<i64> {
+        let out = if reason_out_of_bounds(&mut c, p, l)? { Outcome::Rollback(-1) } else { Outcome::Accept(code) };
+        c.data_mut().outcome = Some(out);
         Err(Halt.into())
     })?;
-    linker.func_wrap("env", "rollback", |mut c: Caller<'_, Ctx>, _p: i32, _l: i32, code: i64| -> wasmtime::Result<i64> {
-        c.data_mut().outcome = Some(Outcome::Rollback(code));
+    linker.func_wrap("env", "rollback", |mut c: Caller<'_, Ctx>, p: i32, l: i32, code: i64| -> wasmtime::Result<i64> {
+        let out = if reason_out_of_bounds(&mut c, p, l)? { Outcome::Rollback(-1) } else { Outcome::Rollback(code) };
+        c.data_mut().outcome = Some(out);
         Err(Halt.into())
     })?;
 
@@ -245,4 +259,36 @@ fn run_inner(path: &Path, tx: TxFixture) -> wasmtime::Result<SimResult> {
     let emitted = store.data().emitted.clone();
     let state = store.data().state.clone();
     Ok((outcome, emitted, state))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn exit_outcome(func: &str, ptr: i32, len: i32) -> Outcome {
+        let wat = format!(r#"(module
+            (import "env" "{func}" (func $exit (param i32 i32 i64) (result i64)))
+            (memory (export "memory") 1)
+            (func (export "hook") (param i32) (result i64)
+              (call $exit (i32.const {ptr}) (i32.const {len}) (i64.const 42))))"#);
+        let dir = std::env::temp_dir().join(format!("xahc-sim-exit-{}-{func}-{ptr}-{len}", std::process::id()));
+        std::fs::write(&dir, wat::parse_str(&wat).expect("valid wat")).unwrap();
+        let r = run(&dir, TxFixture::default()).expect("sim runs").0;
+        let _ = std::fs::remove_file(&dir);
+        r
+    }
+
+    #[test]
+    fn exit_reason_out_of_bounds_is_rollback_minus_one() {
+        assert_eq!(exit_outcome("accept", 70_000, 4), Outcome::Rollback(-1));
+        assert_eq!(exit_outcome("accept", 65_534, 4), Outcome::Rollback(-1));
+        assert_eq!(exit_outcome("rollback", 70_000, 4), Outcome::Rollback(-1));
+    }
+
+    #[test]
+    fn exit_reason_in_bounds_or_null_keeps_the_code() {
+        assert_eq!(exit_outcome("accept", 65_532, 4), Outcome::Accept(42));
+        assert_eq!(exit_outcome("accept", 0, 9_999), Outcome::Accept(42));
+        assert_eq!(exit_outcome("rollback", 0, 0), Outcome::Rollback(42));
+    }
 }
