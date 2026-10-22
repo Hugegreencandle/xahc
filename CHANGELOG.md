@@ -5,31 +5,67 @@ All notable changes to xahc are documented here. Format follows
 
 ## [Unreleased]
 
-The local simulator now models twelve more Hook API host functions instead of trapping on them,
-ported from xahaud `rc-c63ee8c` with a file:line citation at each rule. Prompted by a field report
-by Khorhito: Invoke paths of a real 25 KB hook trapped in `xahc sim` on these imports.
+## [1.13.0] - 2026-10-22
+
+Fixes from a field report by **Khorhito**, who ran the full xahc pipeline on a real 25 KB
+gift-box hook (build, lint, sim, fuzz, prove, install-tx) and wrote up every place it fell short.
+Thank you. No change to the embedded headers or to compiled output for existing xahc-header hooks.
 
 ### Added
 
-- **`xahc sim` / `fuzz` / `test`: `otxn_id`, `otxn_param`, `slot`, `slot_set`, `slot_subfield`,
-  `slot_type`, `meta_slot`, `sto_subfield`, `sto_subarray`, `util_keylet`, `util_sha512h`,
-  `util_verify`** (plus `slot_clear`, `slot_count`, `slot_size`, `slot_subarray`, which share the
-  slot table). Return codes, bounds checks, the 255-slot table with xahaud's numbering and
-  free-list reuse, the STI_ACCOUNT VL-prefix strip, and the `sto_*` offset/length encoding follow
-  xahaud. `util_verify` does real ed25519 and secp256k1 (message hashed with SHA-512Half)
-  verification. `util_keylet` computes 25 keylet types and returns INVALID_ARGUMENT for TICKET and
-  the types xahaud leaves unimplemented, as xahaud does; DID, ORACLE, AMM and MANIFEST (whose
-  amendment status on Xahau xahc has not verified) stop the run with
-  "xahc sim does not model keylet type N yet" instead of returning a guess.
+- **`xahc sim` / `fuzz` / `test` model twelve more Hook API host functions** instead of trapping
+  on them: `otxn_id`, `otxn_param`, `slot`, `slot_set`, `slot_subfield`, `slot_type`, `meta_slot`,
+  `sto_subfield`, `sto_subarray`, `util_keylet`, `util_sha512h`, `util_verify` (plus `slot_clear`,
+  `slot_count`, `slot_size`, `slot_subarray`, which share the slot table). Ported from xahaud
+  `rc-c63ee8c` with a file:line citation at each rule: return codes, bounds checks, the 255-slot
+  table with xahaud's numbering and reuse, the STI_ACCOUNT VL-prefix strip, and the `sto_*`
+  offset/length encoding. `util_verify` does real ed25519 and secp256k1 (SHA-512Half) verification.
+  `util_keylet` computes 25 keylet types and returns INVALID_ARGUMENT where xahaud does; DID,
+  ORACLE, AMM and MANIFEST stop the run with "xahc sim does not model keylet type N yet" rather
+  than return a guess.
 - Fixture inputs for them: `TxFixture` gains `otxn_params`, `otxn_id`, `ledger_objects`, `txns`,
   `callback`, `meta` and `rules`; `xahc test` TOML cases accept `otxn_params`, `otxn_id`,
-  `ledger_objects`, `callback` and `meta`.
+  `ledger_objects`, `callback` and `meta`. The default amendment set matches Xahau mainnet on
+  2026-10-22 (fix20260929, fix20261005, fixHookAPI20251128, HooksUpdate1, Cron on;
+  HookAPISerializedType240 off).
+- **`xahc build --cflag <flag>`** (repeatable) appends extra clang flags after xahc's own.
+- **`xahc prove --timeout <secs>`** stops the prover at the limit and reports INCONCLUSIVE
+  (exit 3, `--json` verdict `inconclusive`) with a message saying it is neither PROVEN nor a
+  counterexample. A prover killed from outside (an outer `timeout`, OOM) is reported the same way
+  instead of exiting with no output.
+- **`xahc prove` progress:** the prover prints a progress line on stderr every 30 s
+  (xahc-prover with the progress heartbeat; older provers ignore it; set `XAHC_PROVER_PROGRESS`
+  to change the interval).
+- **`xahc fuzz` says NOT APPLICABLE** when a hook never reads the hook parameters an oracle
+  assumes (`limit`/`guardrail`: LIM; `overflow`: LIM+TIP). Such counterexamples describe a
+  different kind of hook and are dropped. `authz` now states its assumption (only the hook account
+  may cause an ACCEPT), and `guardrail` warns when no outgoing transaction was ever accepted, so a
+  pass would be vacuous. `--json` gains `applicable` and `notes`.
+- **`xahc install-tx` warns on an all-zeros HookNamespace.** A hook first installed under its own
+  namespace sees empty state if reinstalled with the default; pass `--namespace` or
+  `--namespace-label`.
+
+### Changed
+
+- **`xahc build` with the classic `hookapi.h`:** sources that include it now build on clang >= 15.
+  Its `extern.h` takes pointers as `uint32_t`, which new clang makes a `-Wint-conversion` error;
+  xahc adds `-Wno-error=int-conversion` for those sources only and says so (harmless on wasm32).
+- **`xahc fuzz` exit codes:** NOT APPLICABLE exits 1 (same as `xahc prove` N/A: not a pass).
+  CI that treated any non-2 exit as success should check for 1.
 
 ### Fixed
 
 - **`xahc sim`: DOESNT_EXIST is -5.** `otxn_field`, `hook_param` and `state` returned -29
-  (EXPONENT_UNDERSIZED in xahaud's `Enum.h`) for a missing value. Hooks testing `< 0` are
-  unaffected; hooks testing `== DOESNT_EXIST` now behave as on chain.
+  (EXPONENT_UNDERSIZED in xahaud) for a missing value. Hooks testing `< 0` are unaffected; hooks
+  testing `== DOESNT_EXIST` now behave as on chain.
+
+### Known limits
+
+- Slot contents are the fixture bytes as given; xahaud re-serializes objects canonically, so the
+  two match only for canonical fixtures.
+- The `cbak` entry point is not run; `callback` only enables `meta_slot`.
+- `util_verify` uses ed25519-dalek; edge cases (non-canonical or small-order keys) may differ from
+  xahaud's ed25519-donna.
 
 ## [1.12.1] - 2026-10-20
 
