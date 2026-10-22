@@ -162,6 +162,15 @@ pub fn run(wasm: &Path, o: &Opts) -> Result<String> {
         (None, Some(label)) => sha256_hex(label),
         (None, None) => "0".repeat(64),
     };
+    // The all-zeros namespace is shared by every hook on the account that also uses it, and a
+    // hook first installed under its own namespace sees EMPTY state if reinstalled with zeros.
+    if namespace.bytes().all(|b| b == b'0') {
+        eprintln!(
+            "warn: HookNamespace is all zeros (the default). Hooks on this account that share it share state, \
+             and a hook installed earlier under another namespace will not see its old state. \
+             Pass --namespace <64 hex> (e.g. the namespace of the existing install) or --namespace-label <name>."
+        );
+    }
 
     // HookParameters from "nameHex=valueHex" pairs.
     let mut params_json = Vec::new();

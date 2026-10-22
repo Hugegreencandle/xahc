@@ -15,6 +15,22 @@ use crate::{clean, lint};
 static HEADERS: Dir = include_dir!("$CARGO_MANIFEST_DIR/include");
 
 pub fn run(input: &Path, output: &Path, extra_includes: &[PathBuf], do_lint: bool) -> Result<()> {
+    run_with(input, output, extra_includes, &[], do_lint)
+}
+
+/// True when the source includes the classic Hooks API header (`hookapi.h`, XRPLF/hook-macros).
+/// Its `extern.h` passes pointers as `uint32_t`; clang >= 15 makes that `-Wint-conversion` an
+/// error, while the older Hooks Builder clang only warned. On wasm32 pointers are 32-bit, so the
+/// conversion is harmless.
+pub(crate) fn uses_classic_hookapi(src: &str) -> bool {
+    src.lines().any(|l| {
+        let t = l.trim_start();
+        t.starts_with("#include") && (t.contains("\"hookapi.h\"") || t.contains("<hookapi.h>"))
+    })
+}
+
+/// `run` plus extra clang flags (`xahc build --cflag ...`), appended after xahc's own flags.
+pub fn run_with(input: &Path, output: &Path, extra_includes: &[PathBuf], cflags: &[String], do_lint: bool) -> Result<()> {
     let raw = output.with_extension("raw.wasm");
 
     let mut cmd = Command::new("clang");
@@ -45,6 +61,14 @@ pub fn run(input: &Path, output: &Path, extra_includes: &[PathBuf], do_lint: boo
     for inc in extra_includes {
         cmd.arg(format!("-I{}", inc.display()));
     }
+    if std::fs::read_to_string(input).map(|s| uses_classic_hookapi(&s)).unwrap_or(false) {
+        cmd.arg("-Wno-error=int-conversion");
+        println!(
+            "{} classic hookapi.h detected: adding -Wno-error=int-conversion (its extern.h passes pointers as uint32_t; harmless on wasm32)",
+            "note".cyan()
+        );
+    }
+    cmd.args(cflags);
     cmd.arg(input).arg("-o").arg(&raw);
 
     let status = cmd
@@ -204,4 +228,17 @@ fn cache_root() -> PathBuf {
         return PathBuf::from(h).join(".cache");
     }
     std::env::temp_dir()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::uses_classic_hookapi;
+
+    #[test]
+    fn detects_classic_hookapi_include() {
+        assert!(uses_classic_hookapi("#include \"hookapi.h\"\nint64_t hook(uint32_t r){}"));
+        assert!(uses_classic_hookapi("  #include <hookapi.h>"));
+        assert!(!uses_classic_hookapi("#include \"xahc/guard.h\""));
+        assert!(!uses_classic_hookapi("// see hookapi.h for details"));
+    }
 }

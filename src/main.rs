@@ -116,6 +116,9 @@ enum Cmd {
         /// Skip lint (not recommended)
         #[arg(long)]
         no_lint: bool,
+        /// Extra clang flag, appended after xahc's own (repeatable), e.g. --cflag=-DDEBUG
+        #[arg(long = "cflag", allow_hyphen_values = true)]
+        cflags: Vec<String>,
     },
     /// Strip illegal exports from a .wasm (Rust reimpl of hook-cleaner).
     Clean {
@@ -272,9 +275,9 @@ enum Cmd {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Build { input, out, includes, no_lint } => {
+        Cmd::Build { input, out, includes, no_lint, cflags } => {
             let out = out.unwrap_or_else(|| input.with_extension("wasm"));
-            build::run(&input, &out, &includes, !no_lint)?;
+            build::run_with(&input, &out, &includes, &cflags, !no_lint)?;
             if cli.json {
                 let bytes = std::fs::read(&out)?;
                 let findings = lint::lint(&bytes)?;
