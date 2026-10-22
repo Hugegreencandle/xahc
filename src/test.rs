@@ -55,6 +55,20 @@ struct Case {
     /// Optional install-time hook parameters: ASCII name -> hex value.
     #[serde(default)]
     hook_params: HashMap<String, String>,
+    /// Optional originating-txn HookParameters (for otxn_param): ASCII name -> hex value.
+    #[serde(default)]
+    otxn_params: HashMap<String, String>,
+    /// Optional explicit originating txn id (64 hex chars) for otxn_id.
+    otxn_id: Option<String>,
+    /// Optional ledger objects for slot_set: keylet key (64 hex chars, or a 68-hex 34-byte
+    /// keylet whose 2 type bytes are ignored) -> hex serialized STObject (with sfLedgerEntryType).
+    #[serde(default)]
+    ledger_objects: HashMap<String, String>,
+    /// Post-apply run (callback / weak): enables meta_slot.
+    #[serde(default)]
+    callback: bool,
+    /// Optional provisional metadata (hex STObject) for meta_slot; needs `callback = true`.
+    meta: Option<String>,
 }
 
 /// Run the suite and collect results. Printing + exit code live in the caller
@@ -104,6 +118,22 @@ pub fn run(path: &Path) -> Result<TestSummary> {
             // value is hex.
             let bytes = parse_hex(v).with_context(|| format!("case `{}`: bad hex for hook_param `{}`", c.name, k))?;
             fixture.hook_params.insert(k.as_bytes().to_vec(), bytes);
+        }
+        for (k, v) in &c.otxn_params {
+            let bytes = parse_hex(v).with_context(|| format!("case `{}`: bad hex for otxn_param `{}`", c.name, k))?;
+            fixture.otxn_params.push((k.as_bytes().to_vec(), bytes));
+        }
+        if let Some(id) = &c.otxn_id {
+            fixture.otxn_id = Some(parse_h256(id).with_context(|| format!("case `{}`: bad otxn_id", c.name))?);
+        }
+        for (k, v) in &c.ledger_objects {
+            let key = parse_h256(k).with_context(|| format!("case `{}`: bad ledger_objects key `{}`", c.name, k))?;
+            let obj = parse_hex(v).with_context(|| format!("case `{}`: bad hex for ledger object `{}`", c.name, k))?;
+            fixture.ledger_objects.insert(key, obj);
+        }
+        fixture.callback = c.callback;
+        if let Some(m) = &c.meta {
+            fixture.meta = Some(parse_hex(m).with_context(|| format!("case `{}`: bad hex for meta", c.name))?);
         }
 
         let result = sim::run(&wasm_path, fixture);
@@ -193,6 +223,17 @@ fn parse_hex(s: &str) -> Result<Vec<u8>> {
         .collect()
 }
 
+/// A 32-byte value from 64 hex chars, or the key half of a 34-byte keylet (68 hex chars).
+fn parse_h256(s: &str) -> Result<[u8; 32]> {
+    let b = parse_hex(s)?;
+    let key = match b.len() {
+        32 => &b[..],
+        34 => &b[2..],
+        n => bail!("expected 32 bytes (or a 34-byte keylet), got {}", n),
+    };
+    Ok(key.try_into().expect("32 bytes"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -218,6 +259,14 @@ mod tests {
     fn hex_roundtrip() {
         assert_eq!(parse_hex("0AfF").unwrap(), vec![0x0a, 0xff]);
         assert_eq!(parse_hex("0x00").unwrap(), vec![0]);
+    }
+
+    #[test]
+    fn h256_accepts_key_or_keylet() {
+        let k = "11".repeat(32);
+        assert_eq!(parse_h256(&k).unwrap(), [0x11; 32]);
+        assert_eq!(parse_h256(&format!("0061{k}")).unwrap(), [0x11; 32]);
+        assert!(parse_h256("1122").is_err());
     }
 
     #[test]

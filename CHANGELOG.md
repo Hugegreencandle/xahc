@@ -3,6 +3,34 @@
 All notable changes to xahc are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); versioning is [SemVer](https://semver.org/).
 
+## [Unreleased]
+
+The local simulator now models twelve more Hook API host functions instead of trapping on them,
+ported from xahaud `rc-c63ee8c` with a file:line citation at each rule. Prompted by a field report
+by Khorhito: Invoke paths of a real 25 KB hook trapped in `xahc sim` on these imports.
+
+### Added
+
+- **`xahc sim` / `fuzz` / `test`: `otxn_id`, `otxn_param`, `slot`, `slot_set`, `slot_subfield`,
+  `slot_type`, `meta_slot`, `sto_subfield`, `sto_subarray`, `util_keylet`, `util_sha512h`,
+  `util_verify`** (plus `slot_clear`, `slot_count`, `slot_size`, `slot_subarray`, which share the
+  slot table). Return codes, bounds checks, the 255-slot table with xahaud's numbering and
+  free-list reuse, the STI_ACCOUNT VL-prefix strip, and the `sto_*` offset/length encoding follow
+  xahaud. `util_verify` does real ed25519 and secp256k1 (message hashed with SHA-512Half)
+  verification. `util_keylet` computes 25 keylet types and returns INVALID_ARGUMENT for TICKET and
+  the types xahaud leaves unimplemented, as xahaud does; DID, ORACLE, AMM and MANIFEST (whose
+  amendment status on Xahau xahc has not verified) stop the run with
+  "xahc sim does not model keylet type N yet" instead of returning a guess.
+- Fixture inputs for them: `TxFixture` gains `otxn_params`, `otxn_id`, `ledger_objects`, `txns`,
+  `callback`, `meta` and `rules`; `xahc test` TOML cases accept `otxn_params`, `otxn_id`,
+  `ledger_objects`, `callback` and `meta`.
+
+### Fixed
+
+- **`xahc sim`: DOESNT_EXIST is -5.** `otxn_field`, `hook_param` and `state` returned -29
+  (EXPONENT_UNDERSIZED in xahaud's `Enum.h`) for a missing value. Hooks testing `< 0` are
+  unaffected; hooks testing `== DOESNT_EXIST` now behave as on chain.
+
 ## [1.12.1] - 2026-10-20
 
 Simulator update for the Xahau amendments fix20261005 and fix20260929 (both active on mainnet

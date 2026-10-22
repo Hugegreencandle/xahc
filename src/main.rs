@@ -9,11 +9,13 @@ mod fuzz;
 mod doctor;
 mod guardpass;
 mod installtx;
+mod keylet;
 mod lint;
 mod prove;
 mod registry;
 mod scaffold;
 mod sim;
+mod sto;
 mod test;
 mod verify;
 
