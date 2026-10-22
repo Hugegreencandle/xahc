@@ -441,10 +441,15 @@ fn main() -> Result<()> {
                 eprintln!("{} accept path never hit — fuzz is weak; widen inputs or check params",
                     "warning:".yellow().bold());
             }
+            for n in &rep.notes {
+                eprintln!("{} {}", "note:".yellow().bold(), n);
+            }
             if cli.json {
                 print_json(&rep);
             } else {
-                let verdict = if rep.disproven() {
+                let verdict = if !rep.applicable {
+                    "– NOT APPLICABLE".yellow().bold().to_string()
+                } else if rep.disproven() {
                     "✗ DISPROVEN".red().bold().to_string()
                 } else {
                     "no counterexample".yellow().bold().to_string()
@@ -456,7 +461,9 @@ fn main() -> Result<()> {
                     println!("  {} {}  [drops={} tip={} owner={} dst={}]",
                         "CEX:".red().bold(), c.why, c.drops, c.tip, c.account_is_owner, c.destination_hex);
                 }
-                if rep.disproven() {
+                if !rep.applicable {
+                    println!("  -> NOT APPLICABLE: `{}` does not describe this hook (see note). Not a pass, not a failure.", rep.invariant);
+                } else if rep.disproven() {
                     println!("  -> DISPROVEN: {} counterexample(s). The hook violates `{}`.",
                         rep.counterexamples.len(), rep.invariant);
                 } else {
@@ -465,6 +472,9 @@ fn main() -> Result<()> {
             }
             if rep.disproven() {
                 std::process::exit(2);
+            }
+            if !rep.applicable {
+                std::process::exit(1); // N/A, same code as `xahc prove`: not a pass
             }
         }
         Cmd::Compose { chain } => {

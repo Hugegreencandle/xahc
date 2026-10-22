@@ -50,6 +50,12 @@ pub struct FuzzReport {
     pub counterexamples: Vec<Counterexample>,
     /// True only if the accept path was exercised at least once (else the fuzz is weak).
     pub exercised_accept: bool,
+    /// False when the oracle assumes something this hook never does (e.g. the `limit` oracle
+    /// assumes a LIM parameter the hook never reads). Counterexamples are then dropped: they
+    /// would describe a different kind of hook, not a bug in this one.
+    pub applicable: bool,
+    /// Why the result is not applicable or may be vacuous, when it is.
+    pub notes: Vec<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -64,7 +70,17 @@ pub struct Counterexample {
 
 impl FuzzReport {
     pub fn disproven(&self) -> bool {
-        !self.counterexamples.is_empty()
+        self.applicable && !self.counterexamples.is_empty()
+    }
+}
+
+/// Hook parameters each oracle assumes the hook reads. If the hook never reads them, the
+/// oracle describes a different kind of hook (a payment-limit hook), so its result does not apply.
+fn required_params(invariant: &str) -> &'static [&'static [u8]] {
+    match invariant {
+        "limit" | "guardrail" => &[b"LIM"],
+        "overflow" => &[b"LIM", b"TIP"],
+        _ => &[],
     }
 }
 
@@ -140,7 +156,11 @@ pub fn run(wasm: &Path, o: &Opts) -> Result<FuzzReport> {
         returned: 0,
         counterexamples: Vec::new(),
         exercised_accept: false,
+        applicable: true,
+        notes: Vec::new(),
     };
+    let mut params_read: std::collections::HashSet<Vec<u8>> = Default::default();
+    let mut owner_accepts = 0u64;
 
     for _ in 0..o.runs {
         // drops is read via sfAmount (62-bit native range) — mask so the hook and the
@@ -184,11 +204,15 @@ pub fn run(wasm: &Path, o: &Opts) -> Result<FuzzReport> {
             tx.hook_params.insert(b"DST".to_vec(), d.to_vec());
         }
 
-        let (outcome, _emit, _state) = sim::run(wasm, tx)?;
+        let ((outcome, _emit, _state), trace) = sim::run_traced(wasm, tx)?;
+        params_read.extend(trace.params_read);
         match &outcome {
             Outcome::Accept(_) => {
                 rep.accepts += 1;
                 rep.exercised_accept = true;
+                if account_is_owner {
+                    owner_accepts += 1;
+                }
                 if let Some(why) = oracle(o, drops, run_tip, account_is_owner, &destination, dst) {
                     rep.counterexamples.push(Counterexample {
                         why,
@@ -204,6 +228,42 @@ pub fn run(wasm: &Path, o: &Opts) -> Result<FuzzReport> {
             Outcome::GuardViolation(_) => rep.guard_violations += 1,
             Outcome::Returned(_) => rep.returned += 1,
         }
+    }
+
+    let missing: Vec<String> = required_params(o.invariant)
+        .iter()
+        .filter(|p| !params_read.contains(**p))
+        .map(|p| String::from_utf8_lossy(p).into_owned())
+        .collect();
+    if o.runs > 0 && !missing.is_empty() {
+        rep.applicable = false;
+        rep.notes.push(format!(
+            "NOT APPLICABLE: the `{}` oracle assumes a payment-limit hook that reads hook parameter(s) {}, \
+             but this hook never read {} in {} runs. {} counterexample(s) were dropped: they describe that \
+             other kind of hook, not a bug in this one.",
+            o.invariant,
+            required_params(o.invariant).iter().map(|p| String::from_utf8_lossy(p).into_owned()).collect::<Vec<_>>().join("+"),
+            missing.join("+"),
+            o.runs,
+            rep.counterexamples.len()
+        ));
+        rep.counterexamples.clear();
+    }
+    if o.invariant == "authz" && rep.applicable {
+        rep.notes.push(
+            "ASSUMPTION: the `authz` oracle assumes only the hook account may cause an ACCEPT. \
+             Hooks that accept incoming transactions from anyone by design will show counterexamples \
+             that are not bugs."
+                .into(),
+        );
+    }
+    if o.invariant == "guardrail" && rep.applicable && owner_accepts == 0 && o.runs > 0 {
+        rep.notes.push(
+            "VACUOUS: no outgoing (owner) transaction was ever accepted, so the guardrail was never \
+             tested on the path it polices. The local sim has no account balance or ledger objects; \
+             hooks that check those fail closed here."
+                .into(),
+        );
     }
     Ok(rep)
 }
@@ -279,6 +339,27 @@ mod tests {
         let o = opts("guardrail", 100, 0);
         assert!(oracle(&o, 999, 0, false, &[0; 20], None).is_none()); // incoming: not policed
         assert!(oracle(&o, 999, 0, true, &[0; 20], None).is_some()); // outgoing over limit
+    }
+
+    #[test]
+    fn oracles_declare_the_params_they_assume() {
+        assert_eq!(required_params("limit"), &[b"LIM" as &[u8]]);
+        assert_eq!(required_params("overflow"), &[b"LIM" as &[u8], b"TIP"]);
+        assert!(required_params("authz").is_empty());
+    }
+
+    #[test]
+    fn not_applicable_is_never_disproven() {
+        let rep = FuzzReport {
+            invariant: "limit".into(), runs: 1, seed: 1, accepts: 1, rollbacks: 0,
+            guard_violations: 0, returned: 0,
+            counterexamples: vec![Counterexample {
+                why: "x".into(), drops: 1, tip: 0, account_is_owner: false,
+                destination_hex: String::new(), outcome: "ACCEPT".into(),
+            }],
+            exercised_accept: true, applicable: false, notes: vec![],
+        };
+        assert!(!rep.disproven());
     }
 
     #[test]

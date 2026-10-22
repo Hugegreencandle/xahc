@@ -45,6 +45,15 @@ struct Ctx {
     outcome: Option<Outcome>,
     /// per-guard-id crossing counts, for `_g` budget enforcement
     guards: HashMap<i32, u32>,
+    /// names of install-time hook parameters the hook asked for via `hook_param`
+    params_read: std::collections::HashSet<Vec<u8>>,
+}
+
+/// What a run touched, beyond its outcome. Lets callers (fuzz) tell whether an oracle that
+/// assumes a parameter (e.g. LIM) even describes this hook.
+#[derive(Default, Clone, Debug)]
+pub struct Trace {
+    pub params_read: std::collections::HashSet<Vec<u8>>,
 }
 
 const SF_AMOUNT: u32 = (6 << 16) + 1;
@@ -79,6 +88,11 @@ fn reason_out_of_bounds(caller: &mut Caller<'_, Ctx>, p: i32, l: i32) -> wasmtim
 pub type SimResult = (Outcome, Vec<Vec<u8>>, HashMap<Vec<u8>, Vec<u8>>);
 
 pub fn run(path: &Path, tx: TxFixture) -> Result<SimResult> {
+    run_traced(path, tx).map(|(r, _)| r)
+}
+
+/// `run`, plus a [`Trace`] of what the hook read.
+pub fn run_traced(path: &Path, tx: TxFixture) -> Result<(SimResult, Trace)> {
     // wasmtime 45's Error doesn't impl std::error::Error, so it can't cross into
     // anyhow via `?`. Keep the wasmtime work in run_inner (wasmtime::Result) and
     // convert once here.
@@ -102,12 +116,12 @@ fn ensure_memory_export(wasm: &[u8]) -> wasmtime::Result<Vec<u8>> {
     Ok(m.emit_wasm())
 }
 
-fn run_inner(path: &Path, tx: TxFixture) -> wasmtime::Result<SimResult> {
+fn run_inner(path: &Path, tx: TxFixture) -> wasmtime::Result<(SimResult, Trace)> {
     let engine = Engine::default();
     let raw = std::fs::read(path).map_err(|e| wasmtime::format_err!("read {}: {e}", path.display()))?;
     let bytes = ensure_memory_export(&raw)?;
     let module = Module::from_binary(&engine, &bytes).with_context(|| format!("load {}", path.display()))?;
-    let mut store = Store::new(&engine, Ctx { tx, state: HashMap::new(), emitted: vec![], outcome: None, guards: HashMap::new() });
+    let mut store = Store::new(&engine, Ctx { tx, state: HashMap::new(), emitted: vec![], outcome: None, guards: HashMap::new(), params_read: Default::default() });
     let mut linker: Linker<Ctx> = Linker::new(&engine);
 
     // Guard: enforce the per-id loop budget. `_g(id, maxiter)` is crossed once per
@@ -185,6 +199,7 @@ fn run_inner(path: &Path, tx: TxFixture) -> wasmtime::Result<SimResult> {
         let mem = mem_of(&mut c)?;
         let mut key = vec![0u8; rlen.max(0) as usize];
         mem.read(&c, rptr as usize, &mut key)?;
+        c.data_mut().params_read.insert(key.clone());
         let val = match c.data().tx.hook_params.get(&key) {
             Some(v) => v.clone(),
             None => return Ok(-29), // DOESNT_EXIST
@@ -258,7 +273,8 @@ fn run_inner(path: &Path, tx: TxFixture) -> wasmtime::Result<SimResult> {
     };
     let emitted = store.data().emitted.clone();
     let state = store.data().state.clone();
-    Ok((outcome, emitted, state))
+    let trace = Trace { params_read: store.data().params_read.clone() };
+    Ok(((outcome, emitted, state), trace))
 }
 
 #[cfg(test)]
