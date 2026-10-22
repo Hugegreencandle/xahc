@@ -152,6 +152,11 @@ pub fn run(input: &Path, opts: &Opts) -> Result<i32> {
 
     let mut cmd = Command::new(&py);
     cmd.arg(dir.join("src").join(script)).arg(&wasm).args(opts.rest);
+    // Ask the prover for a progress line on stderr every 30 s (xahc-prover >= 8125029; older
+    // provers ignore it). A user-set XAHC_PROVER_PROGRESS wins.
+    if std::env::var_os("XAHC_PROVER_PROGRESS").is_none() {
+        cmd.env("XAHC_PROVER_PROGRESS", "30");
+    }
     let mut child = cmd
         .spawn()
         .with_context(|| format!("failed to run the prover ({})", py.display()))?;
