@@ -170,7 +170,7 @@ pub fn run(chain_file: &Path) -> Result<ComposeReport> {
         // Prove each claimed invariant for this hook (the real engine, not a claim).
         let mut inv_proofs = Vec::new();
         for inv in &h.invariants {
-            let code = crate::prove::run(&wasm_path, &crate::prove::Opts { invariant: inv, rest: &[] })?;
+            let code = crate::prove::run(&wasm_path, &crate::prove::Opts { invariant: inv, rest: &[], timeout_secs: None })?;
             let verdict = match code {
                 0 => "PROVEN",
                 2 => "COUNTEREXAMPLE",

@@ -122,7 +122,7 @@ fn reverify(args: &[String]) -> Result<i32> {
             continue;
         }
         let argnote = if rest.is_empty() { String::new() } else { format!(" [{}]", rest.join(" ")) };
-        match crate::prove::run(&wasm, &crate::prove::Opts { invariant: inv, rest: &rest }) {
+        match crate::prove::run(&wasm, &crate::prove::Opts { invariant: inv, rest: &rest, timeout_secs: None }) {
             // The registry only holds PROVEN; reproduction means re-running yields PROVEN (exit 0).
             Ok(0) => println!("  {} {}{}  (re-ran prover, exit 0)", "✓ REPRODUCED".green().bold(), inv, argnote),
             Ok(code) => {

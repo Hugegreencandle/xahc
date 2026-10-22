@@ -191,6 +191,9 @@ enum Cmd {
         /// Invariant: limit | guardrail | termination | monotonic | nospend | conservation | limit-iou | authz | validate | overflow | foreign-authz | reserve | time-nonce | emission | period-budget | reentrancy | unchecked-return | validate-range | bootloader | resource-conservation
         #[arg(long, default_value = "termination")]
         invariant: String,
+        /// Stop after this many seconds and report INCONCLUSIVE (exit 3) instead of running on
+        #[arg(long)]
+        timeout: Option<u64>,
         /// Extra args forwarded to the prover (e.g. a max_drops bound)
         #[arg(last = true)]
         rest: Vec<String>,
@@ -524,8 +527,8 @@ fn main() -> Result<()> {
             eprintln!("{} UNSIGNED — sign offline (xaman / xrpl-accountlib). Set Fee/Sequence at signing.",
                 "note:".yellow().bold());
         }
-        Cmd::Prove { input, invariant, rest } => {
-            let code = prove::run(&input, &prove::Opts { invariant: &invariant, rest: &rest })?;
+        Cmd::Prove { input, invariant, timeout, rest } => {
+            let code = prove::run(&input, &prove::Opts { invariant: &invariant, rest: &rest, timeout_secs: timeout })?;
             if cli.json {
                 // Machine signal: the prover only speaks via exit code, so the
                 // envelope derives the verdict from it. The human prose the prover

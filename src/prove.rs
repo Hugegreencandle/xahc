@@ -21,7 +21,13 @@ impl Drop for TempFileGuard {
 pub struct Opts<'a> {
     pub invariant: &'a str,
     pub rest: &'a [String],
+    /// Wall-clock limit in seconds. On expiry the prover is stopped and the result is
+    /// INCONCLUSIVE (exit 3) with a message, instead of being killed with no output.
+    pub timeout_secs: Option<u64>,
 }
+
+/// Exit code for a run stopped at `--timeout`: INCONCLUSIVE, never a pass.
+pub const EXIT_INCONCLUSIVE: i32 = 3;
 
 /// invariant name -> prover driver script
 const INVARIANTS: &[(&str, &str)] = &[
@@ -146,10 +152,43 @@ pub fn run(input: &Path, opts: &Opts) -> Result<i32> {
 
     let mut cmd = Command::new(&py);
     cmd.arg(dir.join("src").join(script)).arg(&wasm).args(opts.rest);
-    let status = cmd
-        .status()
+    let mut child = cmd
+        .spawn()
         .with_context(|| format!("failed to run the prover ({})", py.display()))?;
-    Ok(status.code().unwrap_or(1))
+    let started = std::time::Instant::now();
+    let status = loop {
+        if let Some(st) = child.try_wait().context("wait for the prover")? {
+            break st;
+        }
+        if let Some(limit) = opts.timeout_secs {
+            if started.elapsed().as_secs() >= limit {
+                let _ = child.kill();
+                let _ = child.wait();
+                eprintln!(
+                    "TIMEOUT: invariant '{}' stopped after {} s with no verdict. This is INCONCLUSIVE: \
+                     not PROVEN and not a counterexample. Symbolic execution may not finish on large hooks \
+                     (many guarded loops, slot/sto parsing); try a longer --timeout, a narrower invariant, \
+                     or a smaller harness around the code path you care about.",
+                    opts.invariant, limit
+                );
+                return Ok(EXIT_INCONCLUSIVE);
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    match status.code() {
+        Some(c) => Ok(c),
+        None => {
+            // Killed by a signal (e.g. an outer `timeout`, OOM). Say so rather than exit silently.
+            eprintln!(
+                "prover for '{}' was terminated by a signal after {} s with no verdict (INCONCLUSIVE). \
+                 Use `xahc prove --timeout <secs>` to get a clean INCONCLUSIVE result instead.",
+                opts.invariant,
+                started.elapsed().as_secs()
+            );
+            Ok(EXIT_INCONCLUSIVE)
+        }
+    }
 }
 
 /// A non-predictable temp .wasm filename. PID alone is predictable and reused

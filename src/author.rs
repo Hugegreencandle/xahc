@@ -215,7 +215,7 @@ pub fn run(opts: &Opts) -> Result<AuthorReport> {
     let mut results = Vec::new();
     let mut certified = true;
     for inv in arch.invariants {
-        let code = crate::prove::run(&wasm, &crate::prove::Opts { invariant: inv, rest: &[] })?;
+        let code = crate::prove::run(&wasm, &crate::prove::Opts { invariant: inv, rest: &[], timeout_secs: None })?;
         let verdict = match code {
             0 => "PROVEN",
             2 => "COUNTEREXAMPLE",
