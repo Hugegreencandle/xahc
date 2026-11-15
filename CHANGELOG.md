@@ -5,6 +5,14 @@ All notable changes to xahc are documented here. Format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **`sto_subfield` / `sto_subarray` now default to the post-`HookAPISerializedType240` parser.** The
+  amendment went live on Xahau mainnet on 2026-11-15 (enabled on xahau.network and xahau.org at ledger
+  27261865). Field types up to `STI_CURRENCY` are now walked, and a `PathSet` is parsed step by step
+  instead of as a length-prefixed blob (xahaud `HookAPI.cpp` `get_stobject_length`, dev @ 2e91ec2).
+  To model a ledger without the amendment, set `rules.hookapi_serialized_type240 = false` in a fixture.
+
 ## [1.13.0] - 2026-10-22
 
 Fixes from a field report by **Khorhito**, who ran the full xahc pipeline on a real 25 KB

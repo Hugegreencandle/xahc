@@ -67,7 +67,8 @@ pub struct Rules {
     /// fixHookAPI20251128 (sto_subarray 2-byte array header unwrap). Default: on.
     pub fix_hookapi_20251128: bool,
     /// featureHookAPISerializedType240 (STI types above Vector256 in the light walker,
-    /// PathSet parsed natively). Default: off (not enabled on mainnet as of 2026-10).
+    /// PathSet parsed natively). Default: on — enabled on Xahau mainnet 2026-11-15 (feature RPC
+    /// enabled=true on xahau.network + xahau.org at ledger 27261865); set false to model an older ledger.
     pub hookapi_serialized_type240: bool,
     /// fix20261005 (slot_set refuses 32-byte txn-id lookups). Default: on — active on mainnet
     /// since 2026-10-19/20 per CHANGELOG 1.12.1; set false to model a ledger without it.
@@ -83,7 +84,7 @@ impl Default for Rules {
         Rules {
             fix20260929: true,
             fix_hookapi_20251128: true,
-            hookapi_serialized_type240: false,
+            hookapi_serialized_type240: true,
             fix20261005: true,
             hooks_update1: true,
             cron: true,
