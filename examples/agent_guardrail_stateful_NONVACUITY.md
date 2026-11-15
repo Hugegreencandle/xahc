@@ -1,5 +1,18 @@
 # Proven Agent Budget — non-vacuity controls (2 of 3 primitives)
 
+> **Correction (2026-11-15).** An internal soundness review of the prover found that `prove_period_budget`
+> (xahc-prover, commit 8125029) returns PROVEN on five planted-bug hooks that really overspend when run
+> (for example, a hook that never adds the payment to its stored spend). What that driver establishes is
+> narrower than this text said: after each accepted payment, the stored spend is at most PLM. It does
+> **not** establish that the total accepted within a period stays under PLM. The companion `prove_guardrail`
+> also returns PROVEN on a stateful hook that skips its destination check on a fresh account, and neither
+> driver looks at transactions a hook emits. The guardrail is installed for Payment transactions only, so
+> other value-moving transactions (Remit, EscrowCreate, OfferCreate, ...) are not policed by it.
+> The reference hooks were not found unsafe: `agent_guardrail_stateful` passed an independent replay (5,000
+> random payment sequences checked against its spec) and every attack in the review. A strengthened driver
+> is in progress; until it passes, read "cannot overspend" below as "each accepted Payment is within LIM,
+> goes to DST when set, and leaves the stored spend at most PLM".
+
 **2026-07-07.** "Proven Agent Budget" proves an agent spending-authority Hook cannot overspend — the
 "hard ceiling at the network level" that x402 / AP2 / policy-wallets lack. A proof is only worth anything
 if it can FAIL, so each primitive pairs the REAL hook (must PROVE) with a planted-bug twin (must be

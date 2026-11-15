@@ -1,9 +1,22 @@
 ---
 name: x402-xahau
-description: Stand up and drive the x402-xahau facilitator — the provable spending-authority / agent-governance layer for x402 payments on Xahau. An AI agent's budget becomes an on-chain rule (a proven xahc guardrail Hook), readable live via GET /policy/:account, so the agent provably cannot overspend. Use when the user says "/x402-xahau", "agentic payments on Xahau", "provable agent budget / spending cap", "run the x402 facilitator", "x402 verify/settle on Xahau", or wants an AI agent that can pay but can't overspend. Pairs with xahau-hook (write the guardrail), xahau-prove (prove it), xahau-audit.
+description: Stand up and drive the x402-xahau facilitator — the provable spending-authority / agent-governance layer for x402 payments on Xahau. An AI agent's budget becomes an on-chain rule (a proven xahc guardrail Hook), readable live via GET /policy/:account, so each accepted Payment is checked against the cap (see the 2026-11-15 correction in this file). Use when the user says "/x402-xahau", "agentic payments on Xahau", "provable agent budget / spending cap", "run the x402 facilitator", "x402 verify/settle on Xahau", or wants an AI agent that can pay but can't overspend. Pairs with xahau-hook (write the guardrail), xahau-prove (prove it), xahau-audit.
 ---
 
 # x402-xahau — provable spending authority for agentic payments
+
+> **Correction (2026-11-15).** An internal soundness review of the prover found that `prove_period_budget`
+> (xahc-prover, commit 8125029) returns PROVEN on five planted-bug hooks that really overspend when run
+> (for example, a hook that never adds the payment to its stored spend). What that driver establishes is
+> narrower than this text said: after each accepted payment, the stored spend is at most PLM. It does
+> **not** establish that the total accepted within a period stays under PLM. The companion `prove_guardrail`
+> also returns PROVEN on a stateful hook that skips its destination check on a fresh account, and neither
+> driver looks at transactions a hook emits. The guardrail is installed for Payment transactions only, so
+> other value-moving transactions (Remit, EscrowCreate, OfferCreate, ...) are not policed by it.
+> The reference hooks were not found unsafe: `agent_guardrail_stateful` passed an independent replay (5,000
+> random payment sequences checked against its spec) and every attack in the review. A strengthened driver
+> is in progress; until it passes, read "cannot overspend" below as "each accepted Payment is within LIM,
+> goes to DST when set, and leaves the stored spend at most PLM".
 
 x402-xahau is a reference **x402 facilitator** for Xahau whose job is NOT throughput — it's
 **governance**: it makes an AI agent's budget an *on-chain rule*. The agent's account runs an
@@ -49,12 +62,12 @@ The agent's provable budget is a Hook — build + prove it with the other skills
    `agent-guardrail`). Two variants: per-tx (`LIM` + optional `DST` allowlist) or stateful
    period-budget (`LIM` + `PLM` + `PER`).
 2. **prove** it with `xahau-prove` (invariants: `guardrail`, `limit`, `period-budget`, `dst-lock`)
-   — so "the agent can't overspend" is proven for ALL inputs, not asserted.
+   — so "each accepted Payment is within LIM and goes to DST" is proven for ALL inputs, not asserted (corrected 2026-11-15: not "the agent can't overspend"; see the note above).
 3. **install** it (`xahc install-tx`) on the agent's account; `GET /policy/:account` then surfaces
    the proven policy live.
 
 ## Honesty
-- Provable BUDGET, not throughput. Say "the agent provably cannot exceed its cap," never "fast."
+- Provable BUDGET, not throughput. Say "each Payment the agent makes is checked against its cap on-ledger," never "fast" (corrected 2026-11-15: not "provably cannot exceed its cap").
 - `/policy` and `/settle` **fail transparent / fail closed** — a node read that fails never
   fabricates a budget or a settlement; surface the error.
 - "Proven" means a specific invariant under xahc-prover — name it (e.g. "guardrail PROVEN: accept
