@@ -5,6 +5,12 @@ All notable changes to xahc are documented here. Format follows
 
 ## [Unreleased]
 
+### Security
+
+- **wasmtime 45.0.1 → 48.0.8** (used by `xahc sim` / `fuzz` / `test`). Fixes RUSTSEC-2026-0269,
+  RUSTSEC-2026-0327 and RUSTSEC-2026-0379. No code change was needed; all unit tests and every
+  `examples/*.test.toml` suite pass on the new version.
+
 ### Changed
 
 - **`sto_subfield` / `sto_subarray` now default to the post-`HookAPISerializedType240` parser.** The
